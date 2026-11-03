@@ -65,21 +65,59 @@ def _is_single_first_episode(meta: Any, season: int) -> bool:
     return getattr(meta, "begin_episode", None) == 1 and getattr(meta, "end_episode", None) in (None, 1)
 
 
-def resource_candidate(context: Any, season: int, seen_at: str) -> Optional[dict[str, Any]]:
+def _episode_numbers(meta: Any) -> list[int]:
     """
-    从一个搜索结果生成安全的 E01 候选快照。
+    只保留识别结果中明确的正整数集数。
+    """
+    episodes = getattr(meta, "episode_list", None) or []
+    return sorted({item for item in episodes if isinstance(item, int) and not isinstance(item, bool) and item > 0})
+
+
+def _single_target_season(meta: Any, season: int) -> bool:
+    """
+    排除跨季包与目标季不一致的候选。
+    """
+    seasons = getattr(meta, "season_list", None) or [1]
+    return seasons == [season] and getattr(meta, "begin_season", None) in (None, season) \
+        and getattr(meta, "end_season", None) in (None, season)
+
+
+def _candidate_kind(meta: Any, title: str, season: int, total_episode: Optional[int]) -> Optional[str]:
+    """
+    区分识别集数覆盖全集、疑似全集和单集 E01。
+    """
+    if not _single_target_season(meta, season):
+        return None
+    episodes = _episode_numbers(meta)
+    if isinstance(total_episode, int) and not isinstance(total_episode, bool) and total_episode > 0:
+        if set(range(1, total_episode + 1)).issubset(episodes):
+            return "full_season"
+    if re.search(r"全集|全季|完结|\bCOMPLETE\b|\bSEASON[ ._-]?PACK\b|\bS\d{1,2}[ ._-]?(?:PACK|COMPLETE)\b", title, re.I):
+        return "suspected_full"
+    return "first_episode" if _is_single_first_episode(meta, season) else None
+
+
+def resource_candidate(
+    context: Any, season: int, seen_at: str, total_episode: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    从搜索结果生成安全的 E01 或完整季候选快照。
 
     :param context: 宿主返回的资源上下文
     :param season: 订阅季数
     :param seen_at: 本轮扫描的 UTC 时间
-    :return: 可保存的候选字段；非单集 E01 返回空
+    :param total_episode: 订阅目标季的总集数；未知时全集只标记为疑似
+    :return: 可保存的候选字段；不符合目标季的资源返回空
     """
     meta = getattr(context, "meta_info", None)
     torrent = getattr(context, "torrent_info", None)
-    if torrent is None or not _is_single_first_episode(meta, season):
+    if torrent is None or meta is None:
         return None
     title = _short(getattr(torrent, "title", None), 240)
     if not title:
+        return None
+    kind = _candidate_kind(meta, title, season, total_episode)
+    if kind is None:
         return None
     site = getattr(torrent, "site", None)
     site_id = site if isinstance(site, int) and site > 0 else None
@@ -98,6 +136,9 @@ def resource_candidate(context: Any, season: int, seen_at: str) -> Optional[dict
     include = re.escape(include_word) if include_word else None
     return {
         "id": digest,
+        "kind": kind,
+        "episodes": _episode_numbers(meta),
+        "total_episode": total_episode if isinstance(total_episode, int) and total_episode > 0 else None,
         "title": title,
         "site_id": site_id,
         "site_name": _short(getattr(torrent, "site_name", None), 80),
@@ -151,7 +192,12 @@ def merge_candidates(
         if previous:
             candidate["first_seen"] = previous.get("first_seen") or candidate["first_seen"]
         merged[candidate["id"]] = candidate
-    return sorted(merged.values(), key=lambda item: item.get("last_seen") or "", reverse=True)[:limit]
+    kind_order = {"full_season": 2, "suspected_full": 1, "first_episode": 0}
+    return sorted(
+        merged.values(),
+        key=lambda item: (kind_order.get(item.get("kind"), 0), item.get("last_seen") or ""),
+        reverse=True,
+    )[:limit]
 
 
 def is_complete_season_download(event_data: Any, subscribe: Any) -> bool:

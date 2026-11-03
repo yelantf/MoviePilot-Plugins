@@ -32,8 +32,10 @@ def plugin_host(monkeypatch):
     jobs = {}
     search_results = []
     search_calls = []
+    downloads = []
 
-    for name in ("app", "app.chain", "app.db", "app.db.oper", "app.schemas", "app.sdk"):
+    for name in ("app", "app.application", "app.application.torrent", "app.chain",
+                 "app.db", "app.db.oper", "app.schemas", "app.sdk"):
         package = ModuleType(name)
         package.__path__ = []
         monkeypatch.setitem(sys.modules, name, package)
@@ -114,6 +116,55 @@ def plugin_host(monkeypatch):
             """
             search_calls.append({"subscription_search": kwargs})
 
+        @staticmethod
+        def get_params(subscribe):
+            """
+            返回当前订阅的基础正则筛选参数。
+            """
+            return {name: getattr(subscribe, name, None) for name in (
+                "quality", "resolution", "effect", "include", "exclude",
+            )}
+
+        @staticmethod
+        def get_subscribe_source_keyword(subscribe):
+            """
+            为明确选中的回刷资源保留订阅来源。
+            """
+            return "Subscribe|" + json.dumps({"id": subscribe.id})
+
+    class TorrentHelper:
+        """
+        用与宿主相同的字段顺序模拟当前规则拒绝原因。
+        """
+
+        @staticmethod
+        def filter_torrent_reason(torrent, params):
+            """
+            返回第一个未满足的基础筛选条件。
+            """
+            content = f"{torrent.title} {torrent.description} {' '.join(torrent.labels)} {torrent.volume_factor}"
+            for key, subject, expected in (
+                ("include", content, True), ("exclude", content, False),
+                ("quality", torrent.title, True), ("resolution", torrent.title, True),
+                ("effect", torrent.title, True),
+            ):
+                pattern = params.get(key)
+                if pattern and bool(re.search(pattern, subject, re.I)) is not expected:
+                    return f"不符合{key}条件"
+            return None
+
+    class DownloadChain:
+        """
+        记录用户明确选择后的单资源下载调用。
+        """
+
+        def download_single(self, context, **kwargs):
+            """
+            保存所选资源、集数和订阅来源。
+            """
+            downloads.append((context, kwargs))
+            return ("fake-hash", None)
+
     def register(_event_type, priority=10):
         """
         保留事件处理器供测试直接调用。
@@ -135,6 +186,8 @@ def plugin_host(monkeypatch):
         jobs.pop(job_id, None)
 
     exports = {
+        "app.application.torrent.download": {"TorrentHelper": TorrentHelper},
+        "app.chain.download": {"DownloadChain": DownloadChain},
         "app.chain.search": {"SearchChain": SearchChain},
         "app.chain.subscribe": {"SubscribeChain": SubscribeChain},
         "app.db.oper.subscribe": {"SubscribeOper": SubscribeOper},
@@ -165,7 +218,7 @@ def plugin_host(monkeypatch):
     spec.loader.exec_module(module)
     return SimpleNamespace(
         module=module, subscriptions=subscriptions, storage=storage, jobs=jobs,
-        search_results=search_results, search_calls=search_calls,
+        search_results=search_results, search_calls=search_calls, downloads=downloads,
     )
 
 
@@ -193,6 +246,7 @@ def _context(title, episodes=(1,), enclosure="https://secret.example/torrent"):
         torrent_info=SimpleNamespace(
             title=title, site=5, site_name="样例站", size=1024,
             pubdate="2026-11-02", enclosure=enclosure, site_cookie="cookie-secret",
+            description="", labels=[], volume_factor="",
         ),
     )
 
@@ -249,7 +303,12 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     assert host.search_calls[0]["season"] == 1
 
     choice = _form_items(plugin, "candidate")[0]["value"]
-    plugin.init_plugin({"enabled": True, "candidate": choice, "confirm": True})
+    plugin.init_plugin({"enabled": True, "candidate": choice, "preview": True})
+    assert host.subscriptions[2].state == "S"
+    assert host.subscriptions[2].quality is None
+    assert host.storage["config"]["preview"] is False
+    assert host.storage["config"]["candidate"] == choice
+    plugin.init_plugin({**host.storage["config"], "confirm": True})
     updated = host.subscriptions[2]
     assert updated.state == "R"
     assert updated.quality == r"WEB[- .]?(?:DL|RIP)"
@@ -260,7 +319,7 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     assert host.storage["config"]["confirm"] is False
     assert host.storage["gate_state"]["entries"]["2"]["needs_search"] is True
 
-    after_confirm = _download_event(2)
+    after_confirm = _download_event(2, context=host.search_results[0], episodes={1})
     plugin.intercept_download(after_confirm)
     assert after_confirm.event_data.cancel is False
     assert after_confirm.event_data.source == "原处理器"
@@ -295,7 +354,9 @@ def test_fake_downloader_receives_task_only_after_confirming_a_version(plugin_ho
             return "filtered"
         if subscribe.sites and site_id not in subscribe.sites:
             return "filtered"
-        event = _download_event(42)
+        context = _context(title)
+        context.torrent_info.site = site_id
+        event = _download_event(42, context=context, episodes={1})
         plugin.intercept_download(event)
         if event.event_data.cancel:
             return "blocked"
@@ -325,7 +386,8 @@ def test_fake_downloader_receives_task_only_after_confirming_a_version(plugin_ho
 
     choices = _form_items(plugin, "candidate")
     choice = next(item["value"] for item in choices if "BluRay" in item["title"])
-    plugin.init_plugin({"enabled": True, "candidate": choice, "confirm": True})
+    plugin.init_plugin({"enabled": True, "candidate": choice, "preview": True})
+    plugin.init_plugin({**host.storage["config"], "confirm": True})
     subscribe = host.subscriptions[42]
     assert subscribe.state == "R"
     assert subscribe.quality == r"Blu[- .]?Ray|BluRay"
@@ -403,6 +465,8 @@ def test_failed_resume_keeps_download_gate_closed(plugin_host, monkeypatch):
     host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
     plugin.refresh_candidates()
     candidate_id = host.storage["gate_state"]["entries"]["2"]["candidates"][0]["id"]
+    success, _message, _rules = plugin.preview_candidate(f"2:{candidate_id}")
+    assert success is True
     original_update = plugin._subscribes.update
 
     def fail_resume(sid, payload):
@@ -631,6 +695,8 @@ def test_candidate_approval_can_be_revoked_without_overwriting_manual_edits(plug
     host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
     plugin.refresh_candidates()
     choice = _form_items(plugin, "candidate")[0]["value"]
+    success, _message, _rules = plugin.preview_candidate(choice)
+    assert success is True
     success, _message = plugin.confirm_candidate(choice)
     assert success is True
     subscribe.quality = "REMUX"
@@ -697,3 +763,314 @@ def test_disabled_plugin_does_not_defer_approval_action(plugin_host):
     event = _download_event(2)
     plugin.intercept_download(event)
     assert event.event_data.cancel is True
+
+
+def test_historical_subscriptions_require_explicit_adoption(plugin_host):
+    """
+    旧订阅默认不受影响；手动纳入后仅恢复插件暂停过的订阅。
+    """
+    host = plugin_host
+    active = _subscribe(1)
+    active.state = "R"
+    manually_paused = _subscribe(2)
+    manually_paused.state = "S"
+    host.subscriptions.update({1: active, 2: manually_paused})
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    assert host.storage["gate_state"]["baseline"] == 2
+    assert len(_form_items(plugin, "historical_subscription")) == 2
+
+    before = _download_event(1)
+    plugin.intercept_download(before)
+    assert before.event_data.cancel is False
+
+    success, _message = plugin.adopt_subscription("1")
+    assert success is True
+    assert active.state == "S"
+    pending = _download_event(1)
+    plugin.intercept_download(pending)
+    assert pending.event_data.cancel is True
+    success, _message = plugin.approve_subscription("1")
+    assert success is True
+    assert active.state == "R"
+
+    success, _message = plugin.adopt_subscription("2")
+    assert success is True
+    assert manually_paused.state == "S"
+    success, _message = plugin.approve_subscription("2")
+    assert success is True
+    assert manually_paused.state == "S"
+    assert host.storage["gate_state"]["entries"]["2"]["needs_search"] is False
+
+
+def test_reenable_does_not_adopt_subscriptions_created_while_disabled(plugin_host):
+    """
+    停用期间的新订阅留给用户管理，原待确认记录仍被拦截。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    plugin.init_plugin({"enabled": False})
+    host.subscriptions[3] = _subscribe(3)
+    plugin.init_plugin({"enabled": True})
+
+    assert host.storage["gate_state"]["baseline"] == 3
+    plugin.refresh_candidates()
+    assert "2" in host.storage["gate_state"]["entries"]
+    assert "3" not in host.storage["gate_state"]["entries"]
+    managed = _download_event(2)
+    plugin.intercept_download(managed)
+    assert managed.event_data.cancel is True
+    ignored = _download_event(3)
+    plugin.intercept_download(ignored)
+    assert ignored.event_data.cancel is False
+
+
+def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
+    """
+    核实全集优先，集数不明的全集标疑似，跨季包不纳入候选。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    first = _context("Show.S01E01.1080p.WEB-DL", episodes=(1,))
+    full_1080 = _context("Show.S01.Complete.1080p.WEB-DL", episodes=tuple(range(1, 9)))
+    full_2160 = _context("Show.S01.Complete.2160p.WEB-DL", episodes=tuple(range(1, 9)))
+    suspect = _context("Show.S01.Complete.Unknown", episodes=(1, 2))
+    cross_season = _context("Show.S01-S02.Complete", episodes=tuple(range(1, 9)))
+    cross_season.meta_info.season_list = [1, 2]
+    host.search_results.extend([first, full_1080, full_2160, suspect, cross_season])
+
+    plugin.refresh_candidates()
+    candidates = host.storage["gate_state"]["entries"]["2"]["candidates"]
+    assert [item["kind"] for item in candidates] == [
+        "full_season", "full_season", "suspected_full", "first_episode",
+    ]
+    assert all(item["episodes"] == list(range(1, 9)) for item in candidates[:2])
+    assert "secret.example" not in json.dumps(candidates)
+    assert "集数覆盖全集" in _form_items(plugin, "candidate")[0]["title"]
+
+
+def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
+    """
+    预览仅生成安全快照；无匹配或草稿改变都不能批准。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    chosen = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    rejected = _context("Show.S01E02.2160p.BluRay.DV-GROUP", episodes=(2,))
+    cross_season = _context("Show.S01-S02.1080p.WEB-DL.HDR-TEAM")
+    cross_season.meta_info.end_season = 2
+    unconfirmed_identity = _context("Show.S01E03.1080p.WEB-DL.HDR-TEAM", episodes=(3,))
+    unconfirmed_identity.match_status = "candidate"
+    host.search_results.extend([chosen, rejected, cross_season, unconfirmed_identity])
+    plugin.refresh_candidates()
+    choice = _form_items(plugin, "candidate")[0]["value"]
+
+    success, _message, draft = plugin.preview_candidate(choice)
+    assert success is True
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 1
+    assert preview["rejected_count"] == 1
+    assert preview["rejected"][0]["reason"]
+    assert "secret.example" not in json.dumps(preview)
+    assert host.subscriptions[2].state == "S"
+    assert host.subscriptions[2].quality is None
+    page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "符合当前规则" in page_text
+    assert "排除" in page_text
+    assert "规则预览" in page_text
+
+    success, message = plugin.confirm_candidate(choice, draft.replace("1080", "2160"))
+    assert success is False
+    assert "重新预览" in message
+    assert host.subscriptions[2].state == "S"
+
+    host.search_results.clear()
+    success, _message, _draft = plugin.preview_candidate(choice)
+    assert success is True
+    success, message = plugin.confirm_candidate(choice)
+    assert success is False
+    assert "未通过" in message
+
+
+def test_multiple_full_season_versions_need_narrower_rules(plugin_host):
+    """
+    多个全集版本同时通过时，选择全集模板不能直接放行。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    full_1 = _context("Show.S01.Complete.1080p.WEB-DL.HDR-TEAM.A", episodes=tuple(range(1, 9)))
+    full_2 = _context("Show.S01.Complete.1080p.WEB-DL.HDR-TEAM.B", episodes=tuple(range(1, 9)))
+    host.search_results.extend([full_1, full_2])
+    plugin.refresh_candidates()
+    choice = _form_items(plugin, "candidate")[0]["value"]
+    success, _message, _draft = plugin.preview_candidate(choice)
+    assert success is True
+    success, message = plugin.confirm_candidate(choice)
+    assert success is False
+    assert "多个全集版本" in message
+    assert host.subscriptions[2].state == "S"
+    assert "多个集数覆盖全集" in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+    success, _message, draft = plugin.preview_candidate(choice, r'{"include": "TEAM\\.A"}')
+    assert success is True
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
+    success, _message = plugin.confirm_candidate(choice, draft)
+    assert success is True
+
+
+def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_host):
+    """
+    已批准订阅按当前规则预览，明确指定集数后才提交单资源下载。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.quality = "WEB-DL"
+    subscribe.sites = [5]
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert plugin.approve_subscription("2")[0] is True
+    full = _context("Show.S01.Complete.1080p.WEB-DL.HDR-TEAM", episodes=tuple(range(1, 9)))
+    other = _context("Show.S01E02.2160p.BluRay.DV-GROUP", episodes=(2,))
+    unknown_episodes = _context("Show.S01.Complete.1080p.WEB-DL.HDR-TEAM.Unknown")
+    unknown_episodes.meta_info.episode_list = []
+    unknown_episodes.meta_info.begin_episode = None
+    unknown_episodes.meta_info.end_episode = None
+    host.search_results.extend([other, unknown_episodes, full])
+
+    plugin.init_plugin({"enabled": True, "replace_subscription": "2", "preview_replace": True})
+    preview = host.storage["gate_state"]["entries"]["2"]["replacement_preview"]
+    assert preview["matched_count"] == 1
+    assert preview["rejected_count"] == 2
+    assert any("未明确识别集数" in item["reason"] for item in preview["rejected"])
+    assert "secret.example" not in json.dumps(preview)
+    choice = _form_items(plugin, "replace_resource")[0]["value"]
+    assert "集数覆盖全集" in _form_items(plugin, "replace_resource")[0]["title"]
+    plugin.init_plugin({
+        "enabled": True, "replace_resource": choice, "replace_episodes": "1,3-5", "submit_replace": True,
+    })
+    assert len(host.downloads) == 1
+    context, options = host.downloads[0]
+    assert context is full
+    assert options["episodes"] == {1, 3, 4, 5}
+    assert options["source"] == 'Subscribe|{"id": 2}'
+    assert options["return_detail"] is True
+    assert host.storage["config"]["submit_replace"] is False
+    history = host.storage["gate_state"]["entries"]["2"]["replacement_history"]
+    assert history[0]["episodes"] == [1, 3, 4, 5]
+    assert "secret.example" not in json.dumps(history)
+
+
+def test_replacement_rechecks_rules_resource_and_episode_coverage(plugin_host):
+    """
+    修改订阅、资源消失或缺少指定集数时均不提交下载。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.quality = "WEB-DL"
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert plugin.approve_subscription("2")[0] is True
+    context = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    host.search_results.append(context)
+    assert plugin.preview_replacements("2")[0] is True
+    choice = _form_items(plugin, "replace_resource")[0]["value"]
+
+    assert plugin.submit_replacement(choice, "2")[0] is False
+    assert plugin.submit_replacement(choice, "0")[0] is False
+    host.search_results.clear()
+    assert plugin.submit_replacement(choice, "1")[0] is False
+    host.search_results.extend([context, copy.deepcopy(context)])
+    assert plugin.submit_replacement(choice, "1")[0] is False
+    host.search_results.pop()
+    context.meta_info.episode_list = [True]
+    assert plugin.submit_replacement(choice, "1")[0] is False
+    context.meta_info.episode_list = [1]
+    subscribe.quality = "BluRay"
+    assert plugin.submit_replacement(choice, "1")[0] is False
+    assert not host.downloads
+
+
+def test_replacement_download_failure_and_revocation_keep_state_safe(plugin_host, monkeypatch):
+    """
+    下载器拒绝不记成功；撤销批准会废弃已生成的回刷预览。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert plugin.approve_subscription("2")[0] is True
+    host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
+    assert plugin.preview_replacements("2")[0] is True
+    choice = _form_items(plugin, "replace_resource")[0]["value"]
+    monkeypatch.setattr(host.module.DownloadChain, "download_single", lambda *_args, **_kwargs: (None, "失败"))
+    success, message = plugin.submit_replacement(choice, "1")
+    assert success is False
+    assert "未接受" in message
+    assert "replacement_history" not in host.storage["gate_state"]["entries"]["2"]
+    assert plugin.revoke_approval("2")[0] is True
+    assert "replacement_preview" not in host.storage["gate_state"]["entries"]["2"]
+    assert plugin.submit_replacement(choice, "1")[0] is False
+
+
+def test_expired_previews_and_changed_approved_rules_do_not_release_download(plugin_host):
+    """
+    确认与回刷预览过期后失效；候选批准后的下载仍检查当前规则。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    context = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    host.search_results.append(context)
+    plugin.refresh_candidates()
+    choice = _form_items(plugin, "candidate")[0]["value"]
+    assert plugin.preview_candidate(choice)[0] is True
+    host.storage["gate_state"]["entries"]["2"]["preview"]["searched_ts"] = 0
+    reloaded = host.module.SubscribeOverwatcher()
+    reloaded.init_plugin({"enabled": True})
+    assert reloaded.confirm_candidate(choice)[0] is False
+    assert subscribe.state == "S"
+
+    assert reloaded.preview_candidate(choice)[0] is True
+    assert reloaded.confirm_candidate(choice)[0] is True
+    subscribe.quality = "BluRay"
+    blocked = _download_event(2, context=context, episodes={1})
+    reloaded.intercept_download(blocked)
+    assert blocked.event_data.cancel is True
+    assert "当前规则未匹配" in blocked.event_data.reason
+
+    subscribe.quality = "WEB-DL"
+    assert reloaded.preview_replacements("2")[0] is True
+    replace_choice = _form_items(reloaded, "replace_resource")[0]["value"]
+    host.storage["gate_state"]["entries"]["2"]["replacement_preview"]["searched_ts"] = 0
+    final_reload = host.module.SubscribeOverwatcher()
+    final_reload.init_plugin({"enabled": True})
+    assert final_reload.submit_replacement(replace_choice, "1")[0] is False
+    assert not host.downloads
