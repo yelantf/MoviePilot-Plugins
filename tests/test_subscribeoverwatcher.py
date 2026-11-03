@@ -270,9 +270,9 @@ def _download_event(sid, context=None, episodes=None):
     ))
 
 
-def _form_items(plugin, model):
+def _form_field(plugin, model):
     """
-    根据配置字段读取选择项，避免表单顺序影响行为测试。
+    根据配置字段查找嵌套表单控件，避免依赖布局顺序。
     """
     form, _defaults = plugin.get_form()
 
@@ -281,8 +281,13 @@ def _form_items(plugin, model):
             yield component
             yield from walk(component.get("content", []))
 
-    return next(item["props"]["items"] for item in walk(form)
+    return next(item for item in walk(form)
                 if item.get("props", {}).get("model") == model)
+
+
+def _form_items(plugin, model):
+    """读取指定选择控件的选项。"""
+    return _form_field(plugin, model)["props"]["items"]
 
 
 def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
@@ -318,12 +323,12 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     assert host.search_calls[0]["season"] == 1
 
     choice = _form_items(plugin, "candidate")[0]["value"]
-    plugin.init_plugin({"enabled": True, "candidate": choice, "preview": True})
+    plugin.init_plugin({"enabled": True, "candidate": choice, "operation": "preview"})
     assert host.subscriptions[2].state == "S"
     assert host.subscriptions[2].quality is None
-    assert host.storage["config"]["preview"] is False
+    assert host.storage["config"]["operation"] == "save"
     assert host.storage["config"]["candidate"] == choice
-    plugin.init_plugin({**host.storage["config"], "confirm": True})
+    plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
     updated = host.subscriptions[2]
     assert updated.state == "R"
     assert updated.quality == r"WEB[- .]?(?:DL|RIP)"
@@ -331,7 +336,7 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     assert updated.effect == "HDR"
     assert updated.include == "TEAM"
     assert updated.sites == [5]
-    assert host.storage["config"]["confirm"] is False
+    assert host.storage["config"]["operation"] == "save"
     assert host.storage["gate_state"]["entries"]["2"]["needs_search"] is True
 
     after_confirm = _download_event(2, context=host.search_results[0], episodes={1})
@@ -401,8 +406,8 @@ def test_fake_downloader_receives_task_only_after_confirming_a_version(plugin_ho
 
     choices = _form_items(plugin, "candidate")
     choice = next(item["value"] for item in choices if "BluRay" in item["title"])
-    plugin.init_plugin({"enabled": True, "candidate": choice, "preview": True})
-    plugin.init_plugin({**host.storage["config"], "confirm": True})
+    plugin.init_plugin({"enabled": True, "candidate": choice, "operation": "preview"})
+    plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
     subscribe = host.subscriptions[42]
     assert subscribe.state == "R"
     assert subscribe.quality == r"Blu[- .]?Ray|BluRay"
@@ -707,19 +712,19 @@ def test_direct_approval_preserves_rules_and_can_be_revoked(plugin_host):
         {"title": "#2 样例剧 S01", "value": "2"},
     ]
 
-    plugin.init_plugin({"enabled": True, "direct_subscription": "2", "direct_approve": True})
+    plugin.init_plugin({"enabled": True, "direct_subscription": "2", "operation": "direct_approve"})
     assert subscribe.state == "R"
     assert subscribe.quality == "WEB-DL"
     assert subscribe.sites == [7]
     assert host.storage["gate_state"]["entries"]["2"]["mode"] == "direct"
-    assert host.storage["config"]["direct_approve"] is False
+    assert host.storage["config"]["operation"] == "save"
     assert "search-2" in host.jobs
     event = _download_event(2)
     plugin.intercept_download(event)
     assert event.event_data.cancel is False
 
     subscribe.resolution = "2160p"
-    plugin.init_plugin({"enabled": True, "revoke_subscription": "2", "revoke": True})
+    plugin.init_plugin({"enabled": True, "revoke_subscription": "2", "operation": "revoke"})
     assert subscribe.state == "S"
     assert subscribe.quality == "WEB-DL"
     assert subscribe.resolution == "2160p"
@@ -876,10 +881,103 @@ def test_historical_choices_are_visible_before_first_enable(plugin_host):
     assert [item["value"] for item in _form_items(plugin, "historical_subscription")] == [1]
     assert host.subscriptions[1].state == "N"
 
-    plugin.init_plugin({"enabled": True, "historical_subscription": 1, "adopt": True})
+    plugin.init_plugin({"enabled": True, "historical_subscription": [1], "operation": "adopt"})
     assert host.storage["gate_state"]["baseline"] == 2
     assert host.storage["gate_state"]["entries"]["1"]["source"] == "historical"
     assert host.subscriptions[1].state == "S"
+
+
+def test_multiple_historical_subscriptions_need_one_explicit_operation(plugin_host):
+    """多选只在明确执行纳入时生效；无效选择不造成部分接管。"""
+    host = plugin_host
+    host.subscriptions.update({sid: _subscribe(sid) for sid in (1, 2, 3)})
+    plugin = host.module.SubscribeOverwatcher()
+    assert _form_field(plugin, "historical_subscription")["props"]["multiple"] is True
+    assert plugin.get_form()[1]["operation"] == "save"
+
+    plugin.init_plugin({"enabled": True, "historical_subscription": [1, 2], "operation": "save"})
+    assert host.storage["gate_state"]["entries"] == {}
+    assert host.subscriptions[1].state == "N"
+
+    plugin.init_plugin({
+        "enabled": True, "historical_subscription": [1, 2, 2], "operation": "adopt",
+        "operation_request_id": "adopt-1",
+    })
+    assert set(host.storage["gate_state"]["entries"]) == {"1", "2"}
+    assert all(host.subscriptions[sid].state == "S" for sid in (1, 2))
+    assert host.storage["config"]["operation"] == "save"
+    assert host.storage["config"]["historical_subscription"] == []
+    assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "adopt-1"
+    assert [item["value"] for item in _form_items(plugin, "historical_subscription")] == [3]
+
+    plugin.init_plugin({
+        "enabled": True, "historical_subscription": [3, 99], "operation": "adopt",
+        "operation_request_id": "adopt-2",
+    })
+    assert "3" not in host.storage["gate_state"]["entries"]
+    assert host.storage["gate_state"]["last_confirmation"]["success"] is False
+    assert host.storage["config"]["historical_subscription"] == [3, 99]
+    assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "adopt-2"
+
+
+def test_old_single_history_selection_is_migrated(plugin_host):
+    """升级时将旧版单选值转成多选值，旧操作开关仍可完成本次提交。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+
+    plugin.init_plugin({"enabled": False, "historical_subscription": 1})
+    assert host.storage["config"]["historical_subscription"] == [1]
+    plugin.init_plugin({**host.storage["config"], "enabled": True, "adopt": True})
+    assert host.storage["gate_state"]["entries"]["1"]["source"] == "historical"
+    assert host.storage["config"]["historical_subscription"] == []
+
+
+def test_custom_config_action_returns_result_and_refreshes_choices(plugin_host, monkeypatch):
+    """分区按钮提交后返回真实执行结果，重新取表单可见最新选择项。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    for name in ("app.api", "app.api.dependencies", "app.api.dependencies.plugin"):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    def update(plugin_id, config):
+        assert plugin_id == "SubscribeOverwatcher"
+        plugin.init_plugin(config)
+        return SimpleNamespace(success=True, message="")
+
+    sys.modules["app.api.dependencies.plugin"].get_plugin_config_command = lambda: SimpleNamespace(
+        update=update,
+    )
+    result = plugin.apply_config({
+        "enabled": True, "historical_subscription": [1], "operation": "adopt",
+        "operation_request_id": "ui-adopt-1",
+    })
+    assert result["success"] is True
+    assert "订阅 1 已纳入管理" in result["message"]
+    assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "ui-adopt-1"
+    assert _form_items(plugin, "historical_subscription") == []
+
+    failed = plugin.apply_config({
+        "enabled": True, "historical_subscription": [99], "operation": "adopt",
+        "operation_request_id": "ui-adopt-2",
+    })
+    assert failed["success"] is False
+    assert "99" in failed["message"]
+    assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "ui-adopt-2"
+
+
+def test_custom_interface_bundle_is_ready(plugin_host):
+    """插件市场安装后的 Vue 配置和详情入口都包含在插件目录内。"""
+    plugin = plugin_host.module.SubscribeOverwatcher()
+    mode, relative_path = plugin.get_render_mode()
+    assert mode == "vue"
+    entry = PLUGIN_DIR / relative_path / "remoteEntry.js"
+    assert entry.is_file()
+    assert "Config" in entry.read_text()
+    assert "Page" in entry.read_text()
 
 
 def test_historical_choices_show_progress_and_prioritize_less_completed(plugin_host):
@@ -1096,7 +1194,7 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     unknown_episodes.meta_info.end_episode = None
     host.search_results.extend([other, unknown_episodes, full])
 
-    plugin.init_plugin({"enabled": True, "replace_subscription": "2", "preview_replace": True})
+    plugin.init_plugin({"enabled": True, "replace_subscription": "2", "operation": "preview_replace"})
     preview = host.storage["gate_state"]["entries"]["2"]["replacement_preview"]
     assert preview["matched_count"] == 1
     assert preview["rejected_count"] == 2
@@ -1105,7 +1203,8 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     choice = _form_items(plugin, "replace_resource")[0]["value"]
     assert "集数覆盖全集" in _form_items(plugin, "replace_resource")[0]["title"]
     plugin.init_plugin({
-        "enabled": True, "replace_resource": choice, "replace_episodes": "1,3-5", "submit_replace": True,
+        "enabled": True, "replace_resource": choice, "replace_episodes": "1,3-5",
+        "operation": "submit_replace",
     })
     assert len(host.downloads) == 1
     context, options = host.downloads[0]
@@ -1113,7 +1212,7 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     assert options["episodes"] == {1, 3, 4, 5}
     assert options["source"] == 'Subscribe|{"id": 2}'
     assert options["return_detail"] is True
-    assert host.storage["config"]["submit_replace"] is False
+    assert host.storage["config"]["operation"] == "save"
     history = host.storage["gate_state"]["entries"]["2"]["replacement_history"]
     assert history[0]["episodes"] == [1, 3, 4, 5]
     assert "secret.example" not in json.dumps(history)

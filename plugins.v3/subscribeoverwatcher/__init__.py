@@ -188,7 +188,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.4.2"
+    plugin_version = "1.5.0"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -216,7 +216,12 @@ class SubscribeOverwatcher(_PluginBase):
 
         :param config: 用户保存的插件配置
         """
-        config = config or {}
+        config = dict(config or {})
+        historical_migrated = "historical_subscription" in config \
+            and not isinstance(config["historical_subscription"], list)
+        if historical_migrated:
+            selected = config["historical_subscription"]
+            config["historical_subscription"] = [selected] if selected not in (None, "") else []
         with self._lock:
             saved = self.get_data("gate_state")
             if isinstance(saved, dict):
@@ -244,23 +249,34 @@ class SubscribeOverwatcher(_PluginBase):
         actions = [name for name in (
             "adopt", "preview", "confirm", "direct_approve", "revoke", "preview_replace", "submit_replace",
         ) if config.get(name)]
+        if config.get("operation") not in (None, "", "save"):
+            actions.append(str(config["operation"]))
         if not self._enabled:
             if actions:
+                with self._lock:
+                    self._state["last_confirmation"] = {
+                        "success": False, "message": "请先启用插件，再执行所选操作",
+                        "at": _utc_now(),
+                        "request_id": str(config.get("operation_request_id") or ""),
+                    }
+                    self._save_state()
                 self.update_config({
-                    **config, "adopt": False, "preview": False, "confirm": False,
+                    **config, "operation": "save", "adopt": False, "preview": False, "confirm": False,
                     "direct_approve": False, "revoke": False,
                     "preview_replace": False, "submit_replace": False,
-                    "historical_subscription": "", "candidate": "", "direct_subscription": "",
+                    "historical_subscription": [], "candidate": "", "direct_subscription": "",
                     "revoke_subscription": "", "rule_json": "", "replace_subscription": "",
-                    "replace_resource": "", "replace_episodes": "",
+                    "replace_resource": "", "replace_episodes": "", "operation_request_id": "",
                 })
+            elif historical_migrated:
+                self.update_config(config)
             return
         normalized_rules = ""
         if actions:
             if len(actions) != 1:
                 success, message = False, "一次只能提交一个接管、预览、批准、撤销或回刷操作"
             elif actions[0] == "adopt":
-                success, message = self.adopt_subscription(config.get("historical_subscription"))
+                success, message = self.adopt_subscriptions(config.get("historical_subscription") or [])
             elif actions[0] == "preview":
                 success, message, normalized_rules = self.preview_candidate(
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
@@ -275,13 +291,16 @@ class SubscribeOverwatcher(_PluginBase):
                 success, message = self.revoke_approval(config.get("revoke_subscription"))
             elif actions[0] == "preview_replace":
                 success, message = self.preview_replacements(config.get("replace_subscription"))
-            else:
+            elif actions[0] == "submit_replace":
                 success, message = self.submit_replacement(
                     str(config.get("replace_resource") or ""), str(config.get("replace_episodes") or ""),
                 )
+            else:
+                success, message = False, "未知操作，请重新选择"
             with self._lock:
                 self._state["last_confirmation"] = {
                     "success": success, "message": message, "at": _utc_now(),
+                    "request_id": str(config.get("operation_request_id") or ""),
                 }
                 self._save_state()
             if success:
@@ -289,19 +308,31 @@ class SubscribeOverwatcher(_PluginBase):
             else:
                 logger.warning(f"剧集守门员：{message}")
             updated_config = {
-                **config, "adopt": False, "preview": False, "confirm": False,
+                **config, "operation": "save", "operation_request_id": "",
+                "adopt": False, "preview": False, "confirm": False,
                 "direct_approve": False, "revoke": False, "preview_replace": False, "submit_replace": False,
-                "historical_subscription": "", "direct_subscription": "", "revoke_subscription": "",
             }
             if actions == ["preview"] and success:
                 updated_config["rule_json"] = normalized_rules
-            elif actions != ["preview"]:
-                updated_config["candidate"] = ""
-                updated_config["rule_json"] = ""
-            if actions == ["submit_replace"]:
-                updated_config["replace_resource"] = ""
-                updated_config["replace_episodes"] = ""
+            if success:
+                if actions == ["adopt"]:
+                    updated_config["historical_subscription"] = []
+                elif actions == ["direct_approve"]:
+                    updated_config["direct_subscription"] = ""
+                elif actions == ["revoke"]:
+                    updated_config["revoke_subscription"] = ""
+                elif actions == ["confirm"]:
+                    updated_config["candidate"] = ""
+                    updated_config["rule_json"] = ""
+                elif actions == ["preview_replace"]:
+                    updated_config["replace_resource"] = ""
+                    updated_config["replace_episodes"] = ""
+                elif actions == ["submit_replace"]:
+                    updated_config["replace_resource"] = ""
+                    updated_config["replace_episodes"] = ""
             self.update_config(updated_config)
+        elif historical_migrated:
+            self.update_config(config)
         self._reconcile_pending_states()
         self._schedule_scan()
 
@@ -389,27 +420,41 @@ class SubscribeOverwatcher(_PluginBase):
 
     def adopt_subscription(self, sid_value: Any) -> tuple[bool, str]:
         """
-        用户明确选择后才接管一条已有的剧集订阅。
+        接管一条已有的剧集订阅。
 
         :param sid_value: 订阅 ID
         :return: 是否纳入管理及结果说明
         """
+        return self.adopt_subscriptions([sid_value])
+
+    def adopt_subscriptions(self, sid_values: list[Any]) -> tuple[bool, str]:
+        """
+        一次接管多条历史剧集，先校验全部选择再逐条写入。
+        """
+        if not sid_values:
+            return False, "请先选择历史剧集订阅"
         try:
-            sid = int(sid_value)
+            ids = list(dict.fromkeys(int(value) for value in sid_values))
         except (ValueError, TypeError):
-            return False, "请先选择一条历史剧集订阅"
+            return False, "所选历史剧集订阅无效，请重新选择"
         with self._lock:
-            subscribe = self._subscribes.get(sid)
-            if not subscribe or subscribe.type != MediaType.TV.value or sid > self._state["baseline"]:
-                return False, "这条订阅不是可纳入的历史剧集"
-            if subscribe.state not in {"N", "R", "P", "S"}:
-                return False, "只支持纳入仍在订阅列表中的剧集"
-            if str(sid) in self._state["entries"]:
-                return False, "这条订阅已由插件管理"
-            if not self._ensure_pending(subscribe, force_historical=True):
-                return False, "纳入历史订阅失败"
+            subscriptions = []
+            for sid in ids:
+                subscribe = self._subscribes.get(sid)
+                if not subscribe or subscribe.type != MediaType.TV.value or sid > self._state["baseline"]:
+                    return False, f"订阅 {sid} 不是可纳入的历史剧集"
+                if subscribe.state not in {"N", "R", "P", "S"}:
+                    return False, f"订阅 {sid} 已不在可纳入的订阅列表中"
+                if str(sid) in self._state["entries"]:
+                    return False, f"订阅 {sid} 已由插件管理"
+                subscriptions.append(subscribe)
+            for subscribe in subscriptions:
+                if not self._ensure_pending(subscribe, force_historical=True):
+                    return False, f"订阅 {subscribe.id} 纳入管理失败，请检查已纳入列表"
         self._schedule_scan()
-        return True, f"订阅 {sid} 已纳入管理，原有筛选规则暂未修改"
+        if len(ids) == 1:
+            return True, f"订阅 {ids[0]} 已纳入管理，原有筛选规则暂未修改"
+        return True, f"已纳入管理 {len(ids)} 条历史剧集订阅，原有筛选规则暂未修改"
 
     def _reconcile_pending_states(self) -> None:
         """
@@ -1035,11 +1080,39 @@ class SubscribeOverwatcher(_PluginBase):
         """
         return self._enabled
 
+    @staticmethod
+    def get_render_mode() -> tuple[str, str]:
+        """用插件自己的配置组件展示操作结果并刷新列表。"""
+        return "vue", "dist/assets"
+
     def get_api(self) -> list[dict[str, Any]]:
-        """
-        本插件通过宿主配置页完成确认，无需额外接口。
-        """
-        return []
+        """配置组件通过受管理员权限保护的接口提交当前表单。"""
+        from fastapi import Depends
+        from app.api.dependencies.auth import get_current_active_superuser
+
+        return [{
+            "path": "/apply", "endpoint": self.apply_config, "methods": ["POST"],
+            "auth": "bear", "dependencies": [Depends(get_current_active_superuser)],
+            "summary": "保存剧集守门员设置并执行所选操作",
+        }]
+
+    def apply_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        """沿用宿主配置更新流程，并把一次性操作的实际结果返回给组件。"""
+        from app.api.dependencies.plugin import get_plugin_config_command
+
+        result = get_plugin_config_command().update(self.__class__.__name__, config)
+        if not result.success:
+            return {"success": False, "message": result.message or "配置保存失败"}
+        if config.get("operation") in (None, "", "save"):
+            return {"success": True, "message": "设置已保存"}
+        with self._lock:
+            outcome = copy.deepcopy(self._state.get("last_confirmation") or {})
+        if outcome.get("request_id") != str(config.get("operation_request_id") or ""):
+            return {"success": False, "message": "操作已提交，但未能确认结果，请查看插件详情页"}
+        return {
+            "success": bool(outcome.get("success")),
+            "message": outcome.get("message") or "操作未返回结果",
+        }
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
@@ -1048,6 +1121,7 @@ class SubscribeOverwatcher(_PluginBase):
         with self._lock:
             subscriptions = self._subscribes.list()
             current = {str(item.id): item for item in subscriptions}
+            last_confirmation = copy.deepcopy(self._state.get("last_confirmation"))
             # 首次启用前还没有水位；先展示现有订阅，保存启用配置时再冻结水位。
             historical = [
                 (item, _subscription_progress(item)[0])
@@ -1134,15 +1208,12 @@ class SubscribeOverwatcher(_PluginBase):
             })
 
         def col(component: dict[str, Any], *, cols: int = 12,
-                sm: Optional[int] = None, md: Optional[int] = None,
-                action: bool = False) -> dict[str, Any]:
+                sm: Optional[int] = None, md: Optional[int] = None) -> dict[str, Any]:
             grid: dict[str, Any] = {"cols": cols}
             if sm is not None:
                 grid["sm"] = sm
             if md is not None:
                 grid["md"] = md
-            if action:
-                grid["class"] = "ps-md-6"
             return {"component": "VCol", "props": grid, "content": [component]}
 
         def row(*columns: dict[str, Any]) -> dict[str, Any]:
@@ -1176,10 +1247,10 @@ class SubscribeOverwatcher(_PluginBase):
             ),
             divider,
             row(
-                col(select("historical_subscription", "选择纳入管理的历史剧集（按订阅进度从少到多）",
-                           historical_choices, clearable=True,
-                           **{"no-data-text": "暂无可纳入管理的历史剧集订阅"}), md=8),
-                col(switch("adopt", "纳入历史订阅（保留原规则）"), md=4, action=True),
+                col(select("historical_subscription", "纳入管理的历史剧集（可多选，按进度排序）",
+                           historical_choices, clearable=True, multiple=True, chips=True,
+                           **{"closable-chips": True,
+                              "no-data-text": "暂无可纳入管理的历史剧集订阅"})),
             ),
             divider,
             row(
@@ -1188,18 +1259,13 @@ class SubscribeOverwatcher(_PluginBase):
                     "model": "rule_json", "label": "草稿规则 JSON；留空使用候选规格，可编辑后重新预览",
                     "rows": 3, "auto-grow": True,
                 })),
-                col(switch("preview", "预览规则匹配（不恢复订阅）"), sm=6),
-                col(switch("confirm", "确认已预览规则并恢复订阅"), sm=6),
             ),
             divider,
             row(
-                col(select("direct_subscription", "选择直接批准的订阅", pending_choices,
-                           clearable=True), md=8),
-                col(switch("direct_approve", "直接批准，不回填 E01 规则"), md=4,
-                    action=True),
-                col(select("revoke_subscription", "选择撤销批准的订阅", approved_choices,
-                           clearable=True), md=8),
-                col(switch("revoke", "撤销批准并暂停（保留规则）"), md=4, action=True),
+                col(select("direct_subscription", "直接批准的待确认订阅", pending_choices,
+                           clearable=True), md=6),
+                col(select("revoke_subscription", "撤销批准的订阅", approved_choices,
+                           clearable=True), md=6),
             ),
             divider,
             row(col(info(
@@ -1208,25 +1274,34 @@ class SubscribeOverwatcher(_PluginBase):
             ))),
             row(
                 col(select("replace_subscription", "选择要预览回刷资源的已批准订阅",
-                           approved_choices, clearable=True), md=8),
-                col(switch("preview_replace", "按当前订阅规则预览可回刷资源"), md=4,
-                    action=True),
+                           approved_choices, clearable=True)),
                 col(select("replace_resource", "选择预览通过的回刷资源",
                            replacement_choices, clearable=True), md=8),
                 col(field("VTextField", {
                     "model": "replace_episodes", "label": "重新下载集数（如 1,3-5）",
                 }), md=4),
-                col(switch("submit_replace", "提交所选资源和集数重新下载")),
+            ),
+            divider,
+            row(
+                col(select("operation", "本次保存执行", [
+                    {"title": "只保存配置", "value": "save"},
+                    {"title": "纳入所选历史剧集", "value": "adopt"},
+                    {"title": "预览候选规则", "value": "preview"},
+                    {"title": "确认候选规则并恢复订阅", "value": "confirm"},
+                    {"title": "直接批准订阅（保留原规则）", "value": "direct_approve"},
+                    {"title": "撤销批准并暂停订阅", "value": "revoke"},
+                    {"title": "预览可回刷资源", "value": "preview_replace"},
+                    {"title": "提交所选资源和集数重新下载", "value": "submit_replace"},
+                ])),
             ),
         ]}], {
             "enabled": False, "confirm_full_pack": True, "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
-            "historical_subscription": "", "adopt": False,
-            "candidate": "", "rule_json": "", "preview": False, "confirm": False,
-            "direct_subscription": "", "direct_approve": False,
-            "revoke_subscription": "", "revoke": False,
-            "replace_subscription": "", "preview_replace": False,
-            "replace_resource": "", "replace_episodes": "", "submit_replace": False,
+            "historical_subscription": [], "candidate": "", "rule_json": "",
+            "direct_subscription": "", "revoke_subscription": "",
+            "replace_subscription": "", "replace_resource": "", "replace_episodes": "",
+            "operation": "save", "operation_request_id": "",
+            "_last_confirmation": last_confirmation,
         }
 
     def get_page(self) -> list[dict[str, Any]]:
