@@ -16,7 +16,7 @@ from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
 from app.db.oper.subscribe import SubscribeOper
 from app.plugins import _PluginBase
-from app.schemas.types import ChainEventType, EventType, MediaSource, MediaType
+from app.schemas.types import ChainEventType, EventType, MediaSource, MediaType, MessageType
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
@@ -138,9 +138,9 @@ class SubscribeOverwatcher(_PluginBase):
     """
 
     plugin_name = "剧集守门员"
-    plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载。"
+    plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -156,6 +156,9 @@ class SubscribeOverwatcher(_PluginBase):
         self._scan_lock = threading.Lock()
         self._enabled = False
         self._confirm_full_pack = True
+        self._daily_notice = True
+        self._notice_hour = 9
+        self._notice_minute = 0
         self._state: dict[str, Any] = {"baseline": None, "entries": {}}
         self._subscribes = SubscribeOper()
 
@@ -177,6 +180,9 @@ class SubscribeOverwatcher(_PluginBase):
             previously_disabled = self._state.get("was_enabled") is False
             self._enabled = bool(config.get("enabled"))
             self._confirm_full_pack = bool(config.get("confirm_full_pack", True))
+            self._daily_notice = bool(config.get("daily_notice", True))
+            self._notice_hour = self._time_part(config.get("notice_hour", 9), 9, 23)
+            self._notice_minute = self._time_part(config.get("notice_minute", 0), 0, 59)
             if self._enabled and (not isinstance(self._state.get("baseline"), int) or previously_disabled):
                 self._state["baseline"] = max(
                     self._state.get("baseline") or 0,
@@ -256,6 +262,15 @@ class SubscribeOverwatcher(_PluginBase):
         保存已由状态锁保护的确认和候选记录。
         """
         self.save_data("gate_state", self._state)
+
+    @staticmethod
+    def _time_part(value: Any, default: int, maximum: int) -> int:
+        """将通知时间限制在小时或分钟的有效范围内。"""
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return number if 0 <= number <= maximum else default
 
     def _is_approved(self, subscribe: Any) -> bool:
         """
@@ -1035,6 +1050,20 @@ class SubscribeOverwatcher(_PluginBase):
                 {"component": "VSwitch", "props": {
                     "model": "confirm_full_pack", "label": "全集种子也需确认",
                 }},
+                {"component": "VSwitch", "props": {
+                    "model": "daily_notice", "label": "每天推送待确认订阅汇总",
+                    "class": "mt-4",
+                }},
+                {"component": "VSelect", "props": {
+                    "model": "notice_hour", "label": "每日通知时间：小时",
+                    "items": [{"title": f"{hour:02d}", "value": hour} for hour in range(24)],
+                    "item-title": "title", "item-value": "value", "class": "mt-2",
+                }},
+                {"component": "VSelect", "props": {
+                    "model": "notice_minute", "label": "每日通知时间：分钟",
+                    "items": [{"title": f"{minute:02d}", "value": minute} for minute in range(60)],
+                    "item-title": "title", "item-value": "value", "class": "mt-2",
+                }},
                 {"component": "VAlert", "props": {
                     "type": "info", "variant": "tonal",
                     "text": "开启全集确认时新增剧集暂停；关闭后仍拦截分集下载，只有识别为覆盖整季且通过原订阅规则的种子可自动下载。显式撤销的订阅始终暂停。每 4 小时更新 E01 候选。",
@@ -1107,7 +1136,9 @@ class SubscribeOverwatcher(_PluginBase):
                 }},
             ]},
         ], {
-            "enabled": False, "confirm_full_pack": True, "historical_subscription": "", "adopt": False,
+            "enabled": False, "confirm_full_pack": True, "daily_notice": True,
+            "notice_hour": 9, "notice_minute": 0,
+            "historical_subscription": "", "adopt": False,
             "candidate": "", "rule_json": "", "preview": False, "confirm": False,
             "direct_subscription": "", "direct_approve": False,
             "revoke_subscription": "", "revoke": False,
@@ -1207,15 +1238,53 @@ class SubscribeOverwatcher(_PluginBase):
                 }})
         return page
 
+    def notify_pending_subscriptions(self) -> None:
+        """每天通过 MoviePilot 通知渠道汇总仍存在的待确认剧集。"""
+        if not self._enabled or not self._daily_notice:
+            return
+        subscriptions = {str(item.id): item for item in self._subscribes.list()}
+        with self._lock:
+            pending = [
+                (sid, entry.get("identity"), bool(entry.get("revoked")))
+                for sid, entry in self._state["entries"].items()
+                if isinstance(entry, dict) and entry.get("status") == "pending"
+            ]
+        lines = []
+        for sid, identity, revoked in sorted(pending, key=lambda item: int(item[0])):
+            subscribe = subscriptions.get(sid)
+            if (subscribe is None or subscribe.type != MediaType.TV.value
+                    or subscribe.state not in {"N", "R", "P", "S"}
+                    or identity != _identity(subscribe)):
+                continue
+            name = " ".join(str(subscribe.name or "未命名剧集").split())
+            lines.append(
+                f"{len(lines) + 1}. #{sid} {name} S{int(subscribe.season or 1):02d}"
+                + ("（已撤销批准）" if revoked else "")
+            )
+        text = f"当前有 {len(lines)} 条待确认订阅。"
+        text += "\n" + "\n".join(lines) if lines else "\n暂无待确认的剧集订阅。"
+        self.post_message(
+            mtype=MessageType.Subscribe,
+            title="剧集守门员：待确认订阅日报",
+            text=text,
+        )
+
     def get_service(self) -> list[dict[str, Any]]:
-        """
-        每 4 小时重新搜索所有待确认剧集的首集和全集。
-        """
-        return [{
+        """注册候选扫描和每日待确认订阅通知。"""
+        if not self._enabled:
+            return []
+        services = [{
             "id": "candidate_refresh", "name": "更新待确认剧集版本候选",
             "trigger": "interval", "func": self.refresh_candidates,
             "kwargs": {"hours": 4},
-        }] if self._enabled else []
+        }]
+        if self._daily_notice:
+            services.append({
+                "id": "pending_daily_notice", "name": "推送待确认剧集日报",
+                "trigger": "cron", "func": self.notify_pending_subscriptions,
+                "kwargs": {"hour": self._notice_hour, "minute": self._notice_minute},
+            })
+        return services
 
     def stop_service(self) -> None:
         """

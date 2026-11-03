@@ -33,6 +33,7 @@ def plugin_host(monkeypatch):
     search_results = []
     search_calls = []
     downloads = []
+    messages = []
 
     for name in ("app", "app.application", "app.application.torrent", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
@@ -67,6 +68,10 @@ def plugin_host(monkeypatch):
             记录一次性确认控件被复位。
             """
             storage["config"] = copy.deepcopy(config)
+
+        def post_message(self, **kwargs):
+            """记录通过宿主通知渠道发送的消息。"""
+            messages.append(kwargs)
 
     class SubscribeOper:
         """
@@ -197,6 +202,7 @@ def plugin_host(monkeypatch):
             "EventType": SimpleNamespace(SubscribeAdded="subscribe.added"),
             "MediaSource": lambda value: value,
             "MediaType": SimpleNamespace(TV=SimpleNamespace(value="电视剧")),
+            "MessageType": SimpleNamespace(Subscribe="subscribe"),
         },
         "app.sdk.events": {"Event": SimpleNamespace, "eventmanager": SimpleNamespace(register=register)},
         "app.sdk.logging": {"logger": SimpleNamespace(
@@ -219,6 +225,7 @@ def plugin_host(monkeypatch):
     return SimpleNamespace(
         module=module, subscriptions=subscriptions, storage=storage, jobs=jobs,
         search_results=search_results, search_calls=search_calls, downloads=downloads,
+        messages=messages,
     )
 
 
@@ -511,6 +518,50 @@ def test_scheduler_unavailable_does_not_release_pending_subscription(plugin_host
     event = _download_event(2)
     plugin.intercept_download(event)
     assert event.event_data.cancel is True
+
+
+def test_daily_notice_lists_live_pending_subscriptions_and_uses_configured_time(plugin_host):
+    """日报包含当前待确认剧集，忽略已批准及已删除记录。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    host.subscriptions[1].name = "历史剧"
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({
+        "enabled": True, "daily_notice": True,
+        "notice_hour": 20, "notice_minute": 15,
+    })
+    assert plugin.adopt_subscription(1)[0] is True
+    for sid, name in ((2, "新剧"), (3, "已批准剧"), (4, "已删除剧")):
+        host.subscriptions[sid] = _subscribe(sid)
+        host.subscriptions[sid].name = name
+        plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": sid}))
+    assert plugin.approve_subscription(3)[0] is True
+    del host.subscriptions[4]
+
+    services = {item["id"]: item for item in plugin.get_service()}
+    assert services["pending_daily_notice"]["trigger"] == "cron"
+    assert services["pending_daily_notice"]["kwargs"] == {"hour": 20, "minute": 15}
+    services["pending_daily_notice"]["func"]()
+
+    assert len(host.messages) == 1
+    assert host.messages[0] == {
+        "mtype": "subscribe",
+        "title": "剧集守门员：待确认订阅日报",
+        "text": "当前有 2 条待确认订阅。\n1. #1 历史剧 S01\n2. #2 新剧 S01",
+    }
+
+
+def test_daily_notice_reports_zero_and_respects_switch(plugin_host):
+    """每天零待确认也发送汇总，关闭通知后不注册任务。"""
+    plugin = plugin_host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    plugin.notify_pending_subscriptions()
+    assert plugin_host.messages[0]["text"] == "当前有 0 条待确认订阅。\n暂无待确认的剧集订阅。"
+
+    plugin.init_plugin({"enabled": True, "daily_notice": False})
+    assert {item["id"] for item in plugin.get_service()} == {"candidate_refresh"}
+    plugin.notify_pending_subscriptions()
+    assert len(plugin_host.messages) == 1
 
 
 def test_full_season_option_allows_only_complete_seed(plugin_host):
