@@ -188,7 +188,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1134,16 +1134,19 @@ class SubscribeOverwatcher(_PluginBase):
             })
 
         def col(component: dict[str, Any], *, cols: int = 12,
-                sm: Optional[int] = None, md: Optional[int] = None) -> dict[str, Any]:
-            grid: dict[str, int] = {"cols": cols}
+                sm: Optional[int] = None, md: Optional[int] = None,
+                action: bool = False) -> dict[str, Any]:
+            grid: dict[str, Any] = {"cols": cols}
             if sm is not None:
                 grid["sm"] = sm
             if md is not None:
                 grid["md"] = md
+            if action:
+                grid["class"] = "ps-md-6"
             return {"component": "VCol", "props": grid, "content": [component]}
 
         def row(*columns: dict[str, Any]) -> dict[str, Any]:
-            return {"component": "VRow", "props": {"dense": True}, "content": list(columns)}
+            return {"component": "VRow", "content": list(columns)}
 
         def info(message: str) -> dict[str, Any]:
             return {"component": "VAlert", "props": {
@@ -1176,7 +1179,7 @@ class SubscribeOverwatcher(_PluginBase):
                 col(select("historical_subscription", "选择纳入管理的历史剧集（按订阅进度从少到多）",
                            historical_choices, clearable=True,
                            **{"no-data-text": "暂无可纳入管理的历史剧集订阅"}), md=8),
-                col(switch("adopt", "纳入历史订阅（保留原规则）"), md=4),
+                col(switch("adopt", "纳入历史订阅（保留原规则）"), md=4, action=True),
             ),
             divider,
             row(
@@ -1192,10 +1195,11 @@ class SubscribeOverwatcher(_PluginBase):
             row(
                 col(select("direct_subscription", "选择直接批准的订阅", pending_choices,
                            clearable=True), md=8),
-                col(switch("direct_approve", "直接批准，不回填 E01 规则"), md=4),
+                col(switch("direct_approve", "直接批准，不回填 E01 规则"), md=4,
+                    action=True),
                 col(select("revoke_subscription", "选择撤销批准的订阅", approved_choices,
                            clearable=True), md=8),
-                col(switch("revoke", "撤销批准并暂停（保留规则）"), md=4),
+                col(switch("revoke", "撤销批准并暂停（保留规则）"), md=4, action=True),
             ),
             divider,
             row(col(info(
@@ -1205,7 +1209,8 @@ class SubscribeOverwatcher(_PluginBase):
             row(
                 col(select("replace_subscription", "选择要预览回刷资源的已批准订阅",
                            approved_choices, clearable=True), md=8),
-                col(switch("preview_replace", "按当前订阅规则预览可回刷资源"), md=4),
+                col(switch("preview_replace", "按当前订阅规则预览可回刷资源"), md=4,
+                    action=True),
                 col(select("replace_resource", "选择预览通过的回刷资源",
                            replacement_choices, clearable=True), md=8),
                 col(field("VTextField", {
