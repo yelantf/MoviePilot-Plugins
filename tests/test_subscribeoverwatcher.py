@@ -236,7 +236,8 @@ def _subscribe(sid, mtype="电视剧"):
     return SimpleNamespace(
         id=sid, type=mtype, media_source="themoviedb", media_id="123",
         season=1, episode_group=None, activity_key=f"activity-{sid}", name="样例剧", state="N",
-        total_episode=8, quality=None, resolution=None, effect=None, include=None, sites=[],
+        total_episode=8, lack_episode=8, start_episode=1, best_version=0,
+        quality=None, resolution=None, effect=None, include=None, sites=[],
     )
 
 
@@ -872,6 +873,66 @@ def test_historical_choices_are_visible_before_first_enable(plugin_host):
     assert host.storage["gate_state"]["baseline"] == 2
     assert host.storage["gate_state"]["entries"]["1"]["source"] == "historical"
     assert host.subscriptions[1].state == "S"
+
+
+def test_historical_choices_show_progress_and_prioritize_less_completed(plugin_host):
+    """纳入列表先显示零进度和低进度，未知进度明确标记。"""
+    host = plugin_host
+    for sid, lack in ((1, 8), (2, 2), (3, 7), (4, None)):
+        host.subscriptions[sid] = _subscribe(sid)
+        host.subscriptions[sid].name = f"剧集{sid}"
+        host.subscriptions[sid].lack_episode = lack
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": False})
+
+    choices = _form_items(plugin, "historical_subscription")
+    assert [item["value"] for item in choices] == [1, 3, 2, 4]
+    assert "已入库 0/8 集" in choices[0]["title"]
+    assert "已入库 1/8 集" in choices[1]["title"]
+    assert "订阅进度未知" in choices[3]["title"]
+
+    washing = _subscribe(5)
+    washing.best_version = 1
+    washing.episode_priority = {"1": 100, "2": 80}
+    assert host.module._progress_label(washing) == "洗版完成 1/8 集"
+
+
+def test_upgrade_reload_keeps_managed_history_and_shows_current_status(plugin_host):
+    """新版实例继续读取旧 gate_state，详情页列出手动纳入和新增接管记录。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    host.subscriptions[1].name = "历史剧"
+    host.subscriptions[1].lack_episode = 6
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    assert plugin.adopt_subscription(1)[0] is True
+    assert plugin.approve_subscription(1)[0] is True
+
+    host.subscriptions[2] = _subscribe(2)
+    host.subscriptions[2].name = "新剧"
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
+    plugin.refresh_candidates()
+    saved = copy.deepcopy(host.storage["gate_state"])
+
+    upgraded = host.module.SubscribeOverwatcher()
+    upgraded.init_plugin({"enabled": True})
+    entries = host.storage["gate_state"]["entries"]
+    assert entries["1"]["status"] == "approved"
+    assert entries["2"]["status"] == "pending"
+    assert entries["2"]["candidates"] == saved["entries"]["2"]["candidates"]
+    form_text = json.dumps(upgraded.get_form()[0], ensure_ascii=False)
+    assert "已纳入管理 2 条" in form_text
+    assert "#1 历史剧 S01（已批准）" in form_text
+    assert "#2 新剧 S01（待确认）" in form_text
+
+    table = next(item for item in upgraded.get_page()
+                 if item["component"] == "VTable"
+                 and "接管方式" in json.dumps(item, ensure_ascii=False))
+    rows = [[cell["text"] for cell in row["content"]]
+            for row in table["content"][1]["content"]]
+    assert ["#1", "历史剧 S01", "手动纳入", "已批准", "已入库 2/8 集"] in rows
+    assert ["#2", "新剧 S01", "新增接管", "待确认", "已入库 0/8 集"] in rows
 
 
 def test_reenable_does_not_adopt_subscriptions_created_while_disabled(plugin_host):

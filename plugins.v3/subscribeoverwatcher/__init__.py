@@ -101,6 +101,54 @@ def _rule_scope(subscribe: Any) -> str:
     )
 
 
+def _subscription_progress(subscribe: Any) -> tuple[Optional[int], Optional[int]]:
+    """按宿主订阅字段计算已完成集数；总集数未知时不猜测进度。"""
+    try:
+        total = int(getattr(subscribe, "total_episode", 0) or 0)
+    except (TypeError, ValueError):
+        return None, None
+    if total <= 0:
+        return None, None
+
+    completed = getattr(subscribe, "completed_episode", None)
+    if completed is None and not getattr(subscribe, "best_version", False):
+        lack = getattr(subscribe, "lack_episode", None)
+        if lack is None:
+            return None, total
+        try:
+            completed = total - int(lack)
+        except (TypeError, ValueError):
+            return None, total
+    elif completed is None:
+        start = max(1, min(int(getattr(subscribe, "start_episode", 1) or 1), total + 1))
+        completed = start - 1
+        if getattr(subscribe, "best_version_full", False):
+            if getattr(subscribe, "current_priority", None) == 100:
+                completed = total
+        else:
+            priorities = getattr(subscribe, "episode_priority", None) or {}
+            if isinstance(priorities, dict) and priorities:
+                completed += sum(
+                    1 for episode, priority in priorities.items()
+                    if str(episode).isdigit() and start <= int(episode) <= total and priority == 100
+                )
+            elif getattr(subscribe, "current_priority", None) == 100:
+                completed = total
+    try:
+        return max(0, min(int(completed), total)), total
+    except (TypeError, ValueError):
+        return None, total
+
+
+def _progress_label(subscribe: Any) -> str:
+    """在订阅列表中显示可辨识的宿主进度口径。"""
+    completed, total = _subscription_progress(subscribe)
+    if completed is None:
+        return "订阅进度未知"
+    kind = "洗版完成" if getattr(subscribe, "best_version", False) else "已入库"
+    return f"{kind} {completed}/{total} 集"
+
+
 def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     """
     将规则预览的通过与拒绝资源展示为安全字段表格。
@@ -140,7 +188,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -998,19 +1046,45 @@ class SubscribeOverwatcher(_PluginBase):
         返回全集确认策略与互斥的历史接管、批准和撤销操作。
         """
         with self._lock:
+            subscriptions = self._subscribes.list()
+            current = {str(item.id): item for item in subscriptions}
             # 首次启用前还没有水位；先展示现有订阅，保存启用配置时再冻结水位。
-            historical_choices = [
-                {
-                    "title": f"#{item.id} {item.name} S{int(item.season or 1):02d} · "
-                             f"{'已暂停' if item.state == 'S' else '订阅中'}",
-                    "value": item.id,
-                }
-                for item in self._subscribes.list()
+            historical = [
+                (item, _subscription_progress(item)[0])
+                for item in subscriptions
                 if (not self._enabled or item.id <= (self._state.get("baseline") or 0))
                 and item.type == MediaType.TV.value
                 and item.state in {"N", "R", "P", "S"}
                 and str(item.id) not in self._state["entries"]
             ]
+            historical.sort(key=lambda row: (
+                row[1] is None, row[1] if row[1] is not None else 0, row[0].id,
+            ))
+            historical_choices = [
+                {
+                    "title": f"#{item.id} {item.name} S{int(item.season or 1):02d} · "
+                             f"{_progress_label(item)} · "
+                             f"{'已暂停' if item.state == 'S' else '订阅中'}",
+                    "value": item.id,
+                }
+                for item, _completed in historical
+            ]
+            managed_names = [
+                f"#{sid} {item.name} S{int(item.season or 1):02d}"
+                f"（{'待确认' if entry['status'] == 'pending' else '已批准'}）"
+                for sid, entry in self._state["entries"].items()
+                if isinstance(entry, dict) and entry.get("status") in {"pending", "approved"}
+                and (item := current.get(sid)) is not None
+                and item.type == MediaType.TV.value
+                and item.state in {"N", "R", "P", "S"}
+                and entry.get("identity") == _identity(item)
+            ]
+            managed_summary = (
+                f"已纳入管理 {len(managed_names)} 条："
+                + "；".join(managed_names[:8])
+                + ("；其余请在插件详情页查看" if len(managed_names) > 8 else "")
+                if managed_names else "尚无已纳入管理的剧集订阅。"
+            )
             choices = [
                 {
                     "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
@@ -1068,8 +1142,12 @@ class SubscribeOverwatcher(_PluginBase):
                     "type": "info", "variant": "tonal",
                     "text": "开启全集确认时新增剧集暂停；关闭后仍拦截分集下载，只有识别为覆盖整季且通过原订阅规则的种子可自动下载。显式撤销的订阅始终暂停。每 4 小时更新 E01 候选。",
                 }},
+                {"component": "VAlert", "props": {
+                    "type": "info", "variant": "tonal", "text": managed_summary,
+                    "class": "mt-4",
+                }},
                 {"component": "VSelect", "props": {
-                    "model": "historical_subscription", "label": "选择纳入管理的历史剧集",
+                    "model": "historical_subscription", "label": "选择纳入管理的历史剧集（按订阅进度从少到多）",
                     "items": historical_choices, "item-title": "title", "item-value": "value", "clearable": True,
                     "no-data-text": "暂无可纳入管理的历史剧集订阅", "class": "mt-4",
                 }},
@@ -1153,14 +1231,46 @@ class SubscribeOverwatcher(_PluginBase):
         with self._lock:
             entries = copy.deepcopy(list(self._state["entries"].items()))
             last_confirmation = copy.deepcopy(self._state.get("last_confirmation"))
-        pending = [(sid, entry) for sid, entry in entries if entry.get("status") == "pending"]
-        approved = [(sid, entry) for sid, entry in entries if entry.get("status") == "approved"]
+        current = {str(item.id): item for item in self._subscribes.list()}
+        active_entries = [
+            (sid, entry, subscribe)
+            for sid, entry in entries
+            if isinstance(entry, dict)
+            and entry.get("status") in {"pending", "approved"}
+            and (subscribe := current.get(sid)) is not None
+            and subscribe.type == MediaType.TV.value
+            and subscribe.state in {"N", "R", "P", "S"}
+            and entry.get("identity") == _identity(subscribe)
+        ]
+        pending = [(sid, entry) for sid, entry, _subscribe in active_entries if entry["status"] == "pending"]
+        approved = [(sid, entry) for sid, entry, _subscribe in active_entries if entry["status"] == "approved"]
         page: list[dict[str, Any]] = []
         if last_confirmation:
             page.append({"component": "VAlert", "props": {
                 "type": "success" if last_confirmation.get("success") else "error",
                 "text": last_confirmation.get("message") or "",
             }})
+        managed_rows = []
+        for sid, entry, subscribe in active_entries:
+            managed_rows.append({"component": "tr", "content": [
+                {"component": "td", "text": f"#{sid}"},
+                {"component": "td", "text": f"{subscribe.name} S{int(subscribe.season or 1):02d}"},
+                {"component": "td", "text": "手动纳入" if entry.get("source") == "historical" else "新增接管"},
+                {"component": "td", "text": "待确认" if entry.get("status") == "pending" else "已批准"},
+                {"component": "td", "text": _progress_label(subscribe)},
+            ]})
+        page.append({"component": "VAlert", "props": {
+            "type": "info", "variant": "tonal",
+            "text": f"已纳入管理 {len(managed_rows)} 条剧集订阅；下表显示当前状态和订阅进度。",
+        }})
+        if managed_rows:
+            page.append({"component": "VTable", "props": {"hover": True}, "content": [
+                {"component": "thead", "content": [{"component": "tr", "content": [
+                    {"component": "th", "text": title}
+                    for title in ("订阅 ID", "剧集", "接管方式", "确认状态", "订阅进度")
+                ]}]},
+                {"component": "tbody", "content": managed_rows},
+            ]})
         if not pending:
             page.append({"component": "VAlert", "props": {
                 "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集全集和 E01 候选。",
