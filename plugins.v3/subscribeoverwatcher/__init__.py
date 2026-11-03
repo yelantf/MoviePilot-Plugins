@@ -140,7 +140,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -983,6 +983,7 @@ class SubscribeOverwatcher(_PluginBase):
         返回全集确认策略与互斥的历史接管、批准和撤销操作。
         """
         with self._lock:
+            # 首次启用前还没有水位；先展示现有订阅，保存启用配置时再冻结水位。
             historical_choices = [
                 {
                     "title": f"#{item.id} {item.name} S{int(item.season or 1):02d} · "
@@ -990,7 +991,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "value": item.id,
                 }
                 for item in self._subscribes.list()
-                if item.id <= (self._state.get("baseline") or 0)
+                if (not self._enabled or item.id <= (self._state.get("baseline") or 0))
                 and item.type == MediaType.TV.value
                 and item.state in {"N", "R", "P", "S"}
                 and str(item.id) not in self._state["entries"]
@@ -1041,37 +1042,42 @@ class SubscribeOverwatcher(_PluginBase):
                 {"component": "VSelect", "props": {
                     "model": "historical_subscription", "label": "选择纳入管理的历史剧集",
                     "items": historical_choices, "item-title": "title", "item-value": "value", "clearable": True,
+                    "no-data-text": "暂无可纳入管理的历史剧集订阅", "class": "mt-4",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "adopt", "label": "纳入历史订阅，原有筛选规则暂不修改",
+                    "class": "mt-2",
                 }},
                 {"component": "VSelect", "props": {
                     "model": "candidate", "label": "选择一个版本（全集优先）", "items": choices,
-                    "item-title": "title", "item-value": "value", "clearable": True,
+                    "item-title": "title", "item-value": "value", "clearable": True, "class": "mt-4",
                 }},
                 {"component": "VTextarea", "props": {
                     "model": "rule_json", "label": "草稿规则 JSON；留空使用候选规格，可编辑后重新预览",
-                    "rows": 5,
+                    "rows": 5, "class": "mt-4",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "preview", "label": "只搜索并预览规则匹配，不恢复订阅",
+                    "class": "mt-2",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "confirm", "label": "确认已预览规则并恢复订阅",
                 }},
                 {"component": "VSelect", "props": {
                     "model": "direct_subscription", "label": "选择直接批准的订阅", "items": pending_choices,
-                    "item-title": "title", "item-value": "value", "clearable": True,
+                    "item-title": "title", "item-value": "value", "clearable": True, "class": "mt-4",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "direct_approve", "label": "直接批准，不回填 E01 规则",
+                    "class": "mt-2",
                 }},
                 {"component": "VSelect", "props": {
                     "model": "revoke_subscription", "label": "选择撤销批准的订阅", "items": approved_choices,
-                    "item-title": "title", "item-value": "value", "clearable": True,
+                    "item-title": "title", "item-value": "value", "clearable": True, "class": "mt-4",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "revoke", "label": "撤销批准并暂停，保留当前筛选规则",
+                    "class": "mt-2",
                 }},
                 {"component": "VAlert", "props": {
                     "type": "info", "variant": "tonal",
@@ -1080,19 +1086,24 @@ class SubscribeOverwatcher(_PluginBase):
                 {"component": "VSelect", "props": {
                     "model": "replace_subscription", "label": "选择要预览回刷资源的已批准订阅",
                     "items": approved_choices, "item-title": "title", "item-value": "value", "clearable": True,
+                    "class": "mt-4",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "preview_replace", "label": "按当前订阅规则预览可回刷资源",
+                    "class": "mt-2",
                 }},
                 {"component": "VSelect", "props": {
                     "model": "replace_resource", "label": "选择预览通过的回刷资源",
                     "items": replacement_choices, "item-title": "title", "item-value": "value", "clearable": True,
+                    "class": "mt-4",
                 }},
                 {"component": "VTextField", "props": {
                     "model": "replace_episodes", "label": "明确选择重新下载的集数，例如 1,3-5",
+                    "class": "mt-4",
                 }},
                 {"component": "VSwitch", "props": {
                     "model": "submit_replace", "label": "提交所选资源和集数重新下载",
+                    "class": "mt-2",
                 }},
             ]},
         ], {

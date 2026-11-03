@@ -803,6 +803,26 @@ def test_historical_subscriptions_require_explicit_adoption(plugin_host):
     assert host.storage["gate_state"]["entries"]["2"]["needs_search"] is False
 
 
+def test_historical_choices_are_visible_before_first_enable(plugin_host):
+    """
+    未启用时可先选择现有剧集；启用并纳入时再冻结水位。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    host.subscriptions[2] = _subscribe(2, mtype="电影")
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": False})
+
+    assert host.storage["gate_state"]["baseline"] is None
+    assert [item["value"] for item in _form_items(plugin, "historical_subscription")] == [1]
+    assert host.subscriptions[1].state == "N"
+
+    plugin.init_plugin({"enabled": True, "historical_subscription": 1, "adopt": True})
+    assert host.storage["gate_state"]["baseline"] == 2
+    assert host.storage["gate_state"]["entries"]["1"]["source"] == "historical"
+    assert host.subscriptions[1].state == "S"
+
+
 def test_reenable_does_not_adopt_subscriptions_created_while_disabled(plugin_host):
     """
     停用期间的新订阅留给用户管理，原待确认记录仍被拦截。
@@ -815,6 +835,7 @@ def test_reenable_does_not_adopt_subscriptions_created_while_disabled(plugin_hos
     plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
     plugin.init_plugin({"enabled": False})
     host.subscriptions[3] = _subscribe(3)
+    assert 3 in [item["value"] for item in _form_items(plugin, "historical_subscription")]
     plugin.init_plugin({"enabled": True})
 
     assert host.storage["gate_state"]["baseline"] == 3
