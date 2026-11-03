@@ -275,7 +275,14 @@ def _form_items(plugin, model):
     根据配置字段读取选择项，避免表单顺序影响行为测试。
     """
     form, _defaults = plugin.get_form()
-    return next(item["props"]["items"] for item in form[0]["content"] if item["props"].get("model") == model)
+
+    def walk(components):
+        for component in components:
+            yield component
+            yield from walk(component.get("content", []))
+
+    return next(item["props"]["items"] for item in walk(form)
+                if item.get("props", {}).get("model") == model)
 
 
 def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):

@@ -188,7 +188,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1118,102 +1118,102 @@ class SubscribeOverwatcher(_PluginBase):
                 if entry.get("status") == "approved"
                 for item in (entry.get("replacement_preview") or {}).get("matched") or []
             ]
-        return [
-            {"component": "VForm", "content": [
-                {"component": "VSwitch", "props": {"model": "enabled", "label": "接管新增剧集订阅"}},
-                {"component": "VSwitch", "props": {
-                    "model": "confirm_full_pack", "label": "全集种子也需确认",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "daily_notice", "label": "每天推送待确认订阅汇总",
-                    "class": "mt-4",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "notice_hour", "label": "每日通知时间：小时",
-                    "items": [{"title": f"{hour:02d}", "value": hour} for hour in range(24)],
-                    "item-title": "title", "item-value": "value", "class": "mt-2",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "notice_minute", "label": "每日通知时间：分钟",
-                    "items": [{"title": f"{minute:02d}", "value": minute} for minute in range(60)],
-                    "item-title": "title", "item-value": "value", "class": "mt-2",
-                }},
-                {"component": "VAlert", "props": {
-                    "type": "info", "variant": "tonal",
-                    "text": "开启全集确认时新增剧集暂停；关闭后仍拦截分集下载，只有识别为覆盖整季且通过原订阅规则的种子可自动下载。显式撤销的订阅始终暂停。每 4 小时更新 E01 候选。",
-                }},
-                {"component": "VAlert", "props": {
-                    "type": "info", "variant": "tonal", "text": managed_summary,
-                    "class": "mt-4",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "historical_subscription", "label": "选择纳入管理的历史剧集（按订阅进度从少到多）",
-                    "items": historical_choices, "item-title": "title", "item-value": "value", "clearable": True,
-                    "no-data-text": "暂无可纳入管理的历史剧集订阅", "class": "mt-4",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "adopt", "label": "纳入历史订阅，原有筛选规则暂不修改",
-                    "class": "mt-2",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "candidate", "label": "选择一个版本（全集优先）", "items": choices,
-                    "item-title": "title", "item-value": "value", "clearable": True, "class": "mt-4",
-                }},
-                {"component": "VTextarea", "props": {
+        def field(component: str, props: dict[str, Any]) -> dict[str, Any]:
+            return {"component": component, "props": {
+                "density": "compact", "hide-details": True, **props,
+            }}
+
+        def switch(model: str, label: str) -> dict[str, Any]:
+            return field("VSwitch", {"model": model, "label": label})
+
+        def select(model: str, label: str, items: list[dict[str, Any]],
+                   **props: Any) -> dict[str, Any]:
+            return field("VSelect", {
+                "model": model, "label": label, "items": items,
+                "item-title": "title", "item-value": "value", **props,
+            })
+
+        def col(component: dict[str, Any], *, cols: int = 12,
+                sm: Optional[int] = None, md: Optional[int] = None) -> dict[str, Any]:
+            grid: dict[str, int] = {"cols": cols}
+            if sm is not None:
+                grid["sm"] = sm
+            if md is not None:
+                grid["md"] = md
+            return {"component": "VCol", "props": grid, "content": [component]}
+
+        def row(*columns: dict[str, Any]) -> dict[str, Any]:
+            return {"component": "VRow", "props": {"dense": True}, "content": list(columns)}
+
+        def info(message: str) -> dict[str, Any]:
+            return {"component": "VAlert", "props": {
+                "type": "info", "variant": "tonal", "density": "compact", "text": message,
+            }}
+
+        divider = {"component": "VDivider", "props": {"class": "my-3"}}
+        return [{"component": "VForm", "content": [
+            row(
+                col(switch("enabled", "接管新增剧集订阅"), sm=6),
+                col(switch("confirm_full_pack", "全集种子也需确认"), sm=6),
+                col(switch("daily_notice", "每天推送待确认订阅汇总"), sm=6),
+                col(select("notice_hour", "通知小时", [
+                    {"title": f"{hour:02d}", "value": hour} for hour in range(24)
+                ]), cols=6, sm=3),
+                col(select("notice_minute", "通知分钟", [
+                    {"title": f"{minute:02d}", "value": minute} for minute in range(60)
+                ]), cols=6, sm=3),
+            ),
+            row(
+                col(info(
+                    "开启全集确认后，新剧集暂停；关闭后，分集下载仍会拦截，"
+                    "仅覆盖整季且符合原规则的种子可自动下载。撤销批准后始终暂停。"
+                    "E01 候选每 4 小时更新。"
+                ), md=6),
+                col(info(managed_summary), md=6),
+            ),
+            divider,
+            row(
+                col(select("historical_subscription", "选择纳入管理的历史剧集（按订阅进度从少到多）",
+                           historical_choices, clearable=True,
+                           **{"no-data-text": "暂无可纳入管理的历史剧集订阅"}), md=8),
+                col(switch("adopt", "纳入历史订阅（保留原规则）"), md=4),
+            ),
+            divider,
+            row(
+                col(select("candidate", "选择一个版本（全集优先）", choices, clearable=True)),
+                col(field("VTextarea", {
                     "model": "rule_json", "label": "草稿规则 JSON；留空使用候选规格，可编辑后重新预览",
-                    "rows": 5, "class": "mt-4",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "preview", "label": "只搜索并预览规则匹配，不恢复订阅",
-                    "class": "mt-2",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "confirm", "label": "确认已预览规则并恢复订阅",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "direct_subscription", "label": "选择直接批准的订阅", "items": pending_choices,
-                    "item-title": "title", "item-value": "value", "clearable": True, "class": "mt-4",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "direct_approve", "label": "直接批准，不回填 E01 规则",
-                    "class": "mt-2",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "revoke_subscription", "label": "选择撤销批准的订阅", "items": approved_choices,
-                    "item-title": "title", "item-value": "value", "clearable": True, "class": "mt-4",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "revoke", "label": "撤销批准并暂停，保留当前筛选规则",
-                    "class": "mt-2",
-                }},
-                {"component": "VAlert", "props": {
-                    "type": "info", "variant": "tonal",
-                    "text": "要回刷已入库集数，先预览已批准订阅的当前规则，再选预览通过的资源和集数提交下载。插件不删除旧文件；最终替换由 MoviePilot 整理流程决定。",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "replace_subscription", "label": "选择要预览回刷资源的已批准订阅",
-                    "items": approved_choices, "item-title": "title", "item-value": "value", "clearable": True,
-                    "class": "mt-4",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "preview_replace", "label": "按当前订阅规则预览可回刷资源",
-                    "class": "mt-2",
-                }},
-                {"component": "VSelect", "props": {
-                    "model": "replace_resource", "label": "选择预览通过的回刷资源",
-                    "items": replacement_choices, "item-title": "title", "item-value": "value", "clearable": True,
-                    "class": "mt-4",
-                }},
-                {"component": "VTextField", "props": {
-                    "model": "replace_episodes", "label": "明确选择重新下载的集数，例如 1,3-5",
-                    "class": "mt-4",
-                }},
-                {"component": "VSwitch", "props": {
-                    "model": "submit_replace", "label": "提交所选资源和集数重新下载",
-                    "class": "mt-2",
-                }},
-            ]},
-        ], {
+                    "rows": 3, "auto-grow": True,
+                })),
+                col(switch("preview", "预览规则匹配（不恢复订阅）"), sm=6),
+                col(switch("confirm", "确认已预览规则并恢复订阅"), sm=6),
+            ),
+            divider,
+            row(
+                col(select("direct_subscription", "选择直接批准的订阅", pending_choices,
+                           clearable=True), md=8),
+                col(switch("direct_approve", "直接批准，不回填 E01 规则"), md=4),
+                col(select("revoke_subscription", "选择撤销批准的订阅", approved_choices,
+                           clearable=True), md=8),
+                col(switch("revoke", "撤销批准并暂停（保留规则）"), md=4),
+            ),
+            divider,
+            row(col(info(
+                "回刷已入库集数：先预览已批准订阅的当前规则，再选择资源和集数提交。"
+                "插件不删除旧文件，最终替换由 MoviePilot 整理流程决定。"
+            ))),
+            row(
+                col(select("replace_subscription", "选择要预览回刷资源的已批准订阅",
+                           approved_choices, clearable=True), md=8),
+                col(switch("preview_replace", "按当前订阅规则预览可回刷资源"), md=4),
+                col(select("replace_resource", "选择预览通过的回刷资源",
+                           replacement_choices, clearable=True), md=8),
+                col(field("VTextField", {
+                    "model": "replace_episodes", "label": "重新下载集数（如 1,3-5）",
+                }), md=4),
+                col(switch("submit_replace", "提交所选资源和集数重新下载")),
+            ),
+        ]}], {
             "enabled": False, "confirm_full_pack": True, "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
             "historical_subscription": "", "adopt": False,
