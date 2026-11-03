@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="剧集守门员">
+  <rect width="64" height="64" rx="14" fill="#254a6d"/>
+  <rect x="11" y="14" width="42" height="34" rx="5" fill="#fff"/>
+  <path d="M19 25h18M19 33h11" fill="none" stroke="#254a6d" stroke-linecap="round" stroke-width="4"/>
+  <circle cx="45" cy="44" r="13" fill="#3abf93" stroke="#fff" stroke-width="3"/>
+  <path d="m39 44 4 4 8-9" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="3"/>
+</svg>

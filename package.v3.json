@@ -1,0 +1,15 @@
+{
+  "SubscribeOverwatcher": {
+    "name": "剧集守门员",
+    "description": "新增剧集订阅先确认规格；可选择全集直下、直接批准或撤销批准。",
+    "labels": "订阅管理",
+    "version": "1.1.0",
+    "icon": "icon.svg",
+    "author": "yelantf",
+    "level": 2,
+    "history": {
+      "v1.0.0": "新增首集候选收集、订阅下载拦截和确认回填。",
+      "v1.1.0": "新增全集确认开关、直接批准及保留规则的撤销批准。"
+    }
+  }
+}
