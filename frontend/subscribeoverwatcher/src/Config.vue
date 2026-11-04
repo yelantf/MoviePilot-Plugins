@@ -63,17 +63,26 @@
       <v-card variant="outlined" class="mb-4">
         <v-card-title class="text-subtitle-1">候选规则确认</v-card-title>
         <v-card-text>
-          <v-select v-model="form.candidate" label="选择一个版本（全集优先）" :items="options.candidate"
-            clearable density="comfortable" hide-details />
+          <v-row>
+            <v-col cols="12" md="8">
+              <v-select v-model="form.candidate" label="选择一个版本（全集优先）" :items="options.candidate"
+                clearable density="comfortable" hide-details />
+            </v-col>
+            <v-col cols="12" md="4">
+              <v-select v-model="form.rule_mode" label="站点范围" :items="ruleModes"
+                density="comfortable" hide-details @update:model-value="clearRuleDraft" />
+            </v-col>
+          </v-row>
           <p class="text-caption text-medium-emphasis mt-2 mb-4">
             候选按媒体身份搜索目标季，跳过全局搜索规则组及本订阅的站点和筛选规则；只列出首集和整季，并保留历史扫描版本。
+            详情页将同标题、同大小且解析规格一致的跨站资源合并展示；这里仍逐站点选择。
             <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
               class="text-primary text-decoration-underline ms-2">查看所选资源详情</a>
           </p>
           <v-textarea v-model="form.rule_json" label="草稿规则 JSON；留空使用候选规格"
             rows="3" auto-grow density="comfortable" hide-details />
           <p class="text-caption text-medium-emphasis mt-2 mb-0">
-            可回填质量、分辨率、特效、包含、排除和站点；标题同时包含制作组和自定义标识时，会将两者组合成包含规则。未识别的字段保留原值，预览核对基础规则，正式追更仍应用订阅规则组。
+            “不限站点”会清除订阅的站点限制，其他规格照常回填。包含规则可能同时使用制作组和自定义标识。预览核对基础规则，正式追更仍应用订阅规则组。
           </p>
           <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
             density="compact" class="mt-3">{{ feedback.text }}</v-alert>
@@ -172,7 +181,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
   'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
-  'historical_subscription', 'candidate', 'rule_json', 'direct_subscription',
+  'historical_subscription', 'candidate', 'rule_mode', 'rule_json', 'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
 ]
 const sections = {
@@ -180,6 +189,10 @@ const sections = {
   direct_approve: 'approve', revoke: 'revoke',
   preview_replace: 'replace', submit_replace: 'replace',
 }
+const ruleModes = [
+  { title: '只用所选站点', value: 'candidate' },
+  { title: '不限站点', value: 'all_sites' },
+]
 
 const props = defineProps({
   api: { type: [Object, Function], required: true },
@@ -190,7 +203,7 @@ const emit = defineEmits(['switch'])
 const form = reactive({
   enabled: false, confirm_full_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
-  candidate: '', rule_json: '', direct_subscription: '', revoke_subscription: '',
+  candidate: '', rule_mode: 'candidate', rule_json: '', direct_subscription: '', revoke_subscription: '',
   replace_subscription: '', replace_resource: '', replace_episodes: '',
 })
 const options = reactive({
@@ -209,6 +222,10 @@ const selectedCandidateUrl = computed(() => {
 watch(() => form.candidate, (candidate, previous) => {
   if (previous && candidate !== previous) form.rule_json = ''
 })
+
+function clearRuleDraft() {
+  form.rule_json = ''
+}
 watch(() => form.replace_subscription, (subscription, previous) => {
   if (previous && subscription !== previous) {
     form.replace_resource = ''

@@ -128,19 +128,52 @@ def _single_target_season(meta: Any, season: int) -> bool:
         and getattr(meta, "end_season", None) in (None, season)
 
 
+def _title_starts_after_first_episode(title: str) -> bool:
+    """标题显式写出 S01E11 等后续集数时，不依赖宿主集数列表。"""
+    numbers = [int(number) for number in re.findall(
+        r"(?<![A-Za-z0-9])S\d{1,2}[ ._-]*E(?:P)?0*(\d{1,3})(?!\d)", title, re.I,
+    )]
+    return bool(numbers) and 1 not in numbers and all(number > 1 for number in numbers)
+
+
 def _candidate_kind(meta: Any, title: str, season: int, total_episode: Optional[int]) -> Optional[str]:
     """
     区分识别集数覆盖全集、疑似全集和单集 E01。
     """
     if not _single_target_season(meta, season):
         return None
+    if _title_starts_after_first_episode(title):
+        return None
     episodes = _episode_numbers(meta)
     if isinstance(total_episode, int) and not isinstance(total_episode, bool) and total_episode > 0:
         if set(range(1, total_episode + 1)).issubset(episodes):
             return "full_season"
+    if _is_single_first_episode(meta, season):
+        return "first_episode"
     if re.search(r"全集|全季|完结|\bCOMPLETE\b|\bSEASON[ ._-]?PACK\b|\bS\d{1,2}[ ._-]?(?:PACK|COMPLETE)\b", title, re.I):
+        # 标题明确标出后续集数时，整季字样不能把单集误判为整季候选。
+        begin_episode = getattr(meta, "begin_episode", None)
+        if (episodes and 1 not in episodes) or (not episodes and isinstance(begin_episode, int)
+                                                 and not isinstance(begin_episode, bool) and begin_episode > 1):
+            return None
         return "suspected_full"
-    return "first_episode" if _is_single_first_episode(meta, season) else None
+    return None
+
+
+def candidate_is_eligible(candidate: Any) -> bool:
+    """排除旧状态中已知只覆盖后续集数的疑似整季候选。"""
+    if not isinstance(candidate, dict) or not candidate.get("id"):
+        return False
+    if _title_starts_after_first_episode(str(candidate.get("title") or "")):
+        return False
+    if candidate.get("kind") != "suspected_full":
+        return True
+    episodes = candidate.get("episodes")
+    if not isinstance(episodes, (list, tuple, set)):
+        episodes = []
+    recognized = {episode for episode in episodes
+                  if isinstance(episode, int) and not isinstance(episode, bool) and episode > 0}
+    return not recognized or 1 in recognized
 
 
 def resource_candidate(
@@ -244,8 +277,10 @@ def merge_candidates(
     :param limit: 每条订阅最多保存的候选数
     :return: 按最近发现时间排序的候选
     """
-    merged = {item["id"]: item for item in old if isinstance(item, dict) and item.get("id")}
+    merged = {item["id"]: item for item in old if candidate_is_eligible(item)}
     for candidate in fresh:
+        if not candidate_is_eligible(candidate):
+            continue
         previous = merged.get(candidate["id"])
         if previous:
             candidate["first_seen"] = previous.get("first_seen") or candidate["first_seen"]

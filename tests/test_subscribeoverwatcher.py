@@ -508,6 +508,51 @@ def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host
     assert rules.merge_candidates(merged, []) == merged
 
 
+def test_late_episode_with_pack_word_is_not_a_candidate(plugin_host):
+    """整季字样不能让明确的 E11 或 E11–E12 混入首集与整季候选。"""
+    rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
+    assert rules.resource_candidate(_context("Show.S01E11.Complete", episodes=(11,)),
+                                    1, "now", total_episode=12) is None
+    assert rules.resource_candidate(_context("Show.S01E11-E12.Complete", episodes=(11, 12)),
+                                    1, "now", total_episode=12) is None
+    missing_list = _context("Show.S01E11.Complete", episodes=(11,))
+    missing_list.meta_info.episode_list = []
+    missing_list.meta_info.begin_episode = 11
+    assert rules.resource_candidate(missing_list, 1, "now", total_episode=12) is None
+    missing_list.meta_info.begin_episode = None
+    assert rules.resource_candidate(missing_list, 1, "now", total_episode=12) is None
+    wrongly_full = _context("Show.S01E11.Complete", episodes=tuple(range(1, 13)))
+    assert rules.resource_candidate(wrongly_full, 1, "now", total_episode=12) is None
+    assert rules.resource_candidate(_context("Show.S01E01.Complete", episodes=(1,)),
+                                    1, "now", total_episode=12)["kind"] == "first_episode"
+
+
+def test_reload_discards_saved_late_episode_pack_candidate(plugin_host):
+    """升级时清理旧状态的误判候选和与之关联的预览。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    saved = host.storage["gate_state"]["entries"]["2"]
+    saved["candidates"] = [{
+        "id": "late", "kind": "suspected_full", "episodes": [11], "total_episode": 12,
+        "title": "Show.S01E11.Complete", "first_seen": "old", "last_seen": "old",
+    }, {
+        "id": "unparsed-late", "kind": "suspected_full", "episodes": [], "total_episode": 12,
+        "title": "Show.S01E11.Complete", "first_seen": "old", "last_seen": "old",
+    }]
+    saved["preview"] = {"choice": "2:late"}
+
+    reloaded = host.module.SubscribeOverwatcher()
+    reloaded.init_plugin({"enabled": True})
+    entry = host.storage["gate_state"]["entries"]["2"]
+    assert entry["candidates"] == []
+    assert "preview" not in entry
+    assert _form_items(reloaded, "candidate") == []
+
+
 def test_candidate_rules_recognize_spec_aliases_and_both_include_markers(plugin_host):
     """候选回填常见规格别名，并在标题验证两个包含标识。"""
     rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
@@ -1238,6 +1283,88 @@ def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
     assert links[0]["props"]["rel"] == "noopener noreferrer"
 
 
+def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
+    """同标题同大小跨站候选合并展示，站点链接与单站确认保持独立。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    title = "Show.S01E01.1080p.WEB-DL.HDR-TEAM"
+    first = _context(title, page_url="https://one.example/details.php?id=11")
+    second = _context(title, page_url="https://two.example/details.php?id=22")
+    second.torrent_info.site = 7
+    second.torrent_info.site_name = "另一个站"
+    host.search_results.extend([first, second])
+    plugin.refresh_candidates()
+
+    candidates = host.storage["gate_state"]["entries"]["2"]["candidates"]
+    assert len(candidates) == 2
+    same_site = {**candidates[0], "id": "another-id"}
+    different_size = {**candidates[1], "size_bytes": 2048}
+    assert len(host.module._display_groups([candidates[0], same_site])) == 2
+    assert len(host.module._display_groups([candidates[0], different_size])) == 2
+    choices = _form_items(plugin, "candidate")
+    assert len(choices) == 2
+    candidate_table = next(item for item in plugin.get_page()
+                           if item["component"] == "VTable"
+                           and "最后发现" in json.dumps(item, ensure_ascii=False))
+    rows = candidate_table["content"][1]["content"]
+    assert len(rows) == 1
+    site_links = [item for item in rows[0]["content"][2]["content"] if item["component"] == "a"]
+    assert {item["props"]["href"] for item in site_links} == {
+        "https://one.example/details.php?id=11", "https://two.example/details.php?id=22",
+    }
+
+    choice = next(item["value"] for item in choices if "另一个站" in item["title"])
+    assert plugin.preview_candidate(choice, '{"sites": []}')[0] is True
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 2
+    preview_table = next(item for item in plugin.get_page()
+                         if item["component"] == "VTable"
+                         and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
+    assert len(preview_table["content"][1]["content"]) == 1
+    assert plugin.preview_candidate(choice)[0] is True
+    assert plugin.confirm_candidate(choice)[0] is True
+    assert host.subscriptions[2].sites == [7]
+
+
+def test_all_sites_mode_clears_site_filter_and_keeps_candidate_specs(plugin_host):
+    """跨站确认可清除站点限制，仍回填所选版本的其他规格。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.sites = [5]
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    first = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    second = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    second.torrent_info.site = 7
+    second.torrent_info.site_name = "另一个站"
+    host.search_results.extend([first, second])
+    plugin.refresh_candidates()
+    choice = _form_items(plugin, "candidate")[0]["value"]
+
+    assert plugin.preview_candidate(choice)[0] is True
+    assert plugin.confirm_candidate(choice, rule_mode="all_sites")[0] is False
+    plugin.init_plugin({
+        "enabled": True, "candidate": choice, "rule_mode": "all_sites", "operation": "preview",
+    })
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 2
+    assert preview["rules"]["sites"] == []
+    plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
+    assert subscribe.sites == []
+    assert subscribe.quality == r"WEB[- .]?(?:DL|RIP)"
+    assert subscribe.resolution == r"1080[pi]?|x1080"
+    assert subscribe.effect == "HDR"
+    assert subscribe.include == "TEAM"
+    assert host.storage["config"]["rule_mode"] == "candidate"
+
+
 def test_candidate_labels_do_not_claim_unrecognized_or_sparse_episodes_are_complete(plugin_host):
     """标题整季词和已识别集号分别展示，跳号不能渲染成连续覆盖。"""
     module = plugin_host.module
@@ -1329,6 +1456,30 @@ def test_multiple_full_season_versions_need_narrower_rules(plugin_host):
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
     success, _message = plugin.confirm_candidate(choice, draft)
     assert success is True
+
+
+def test_same_full_season_version_across_sites_counts_once(plugin_host):
+    """同标题同大小的跨站整季资源按一个版本确认。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    title = "Show.S01.Complete.1080p.WEB-DL.HDR-TEAM"
+    first = _context(title, episodes=tuple(range(1, 9)))
+    second = _context(title, episodes=tuple(range(1, 9)))
+    second.torrent_info.site = 7
+    second.torrent_info.site_name = "另一个站"
+    host.search_results.extend([first, second])
+    plugin.refresh_candidates()
+    choice = next(item["value"] for item in _form_items(plugin, "candidate")
+                  if "另一个站" in item["title"])
+    success, _message, draft = plugin.preview_candidate(choice, '{"sites": []}')
+    assert success is True
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 2
+    assert "规则匹配多个集数覆盖全集的版本" not in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert plugin.confirm_candidate(choice, draft)[0] is True
 
 
 def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_host):

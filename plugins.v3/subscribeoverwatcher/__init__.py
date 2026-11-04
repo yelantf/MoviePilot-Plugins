@@ -25,7 +25,9 @@ from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .preview import normalize_draft_rules, parse_episode_selection, preview_resource
-from .rules import is_complete_season_download, merge_candidates, public_page_url, resource_candidate
+from .rules import (
+    candidate_is_eligible, is_complete_season_download, merge_candidates, public_page_url, resource_candidate,
+)
 
 
 def _utc_now() -> str:
@@ -95,6 +97,16 @@ def _candidate_coverage(candidate: dict[str, Any]) -> str:
         first = last = episode
     spans.append(f"E{first:02d}" + (f"–E{last:02d}" if first != last else ""))
     return f"{', '.join(spans)}/{total or '?'}"
+
+
+def _draft_rules(candidate: dict[str, Any], raw: str, mode: str) -> dict[str, Any]:
+    """选择所选站点或所有站点，其他候选规格照常回填。"""
+    if mode not in {"candidate", "all_sites"}:
+        raise ValueError("站点范围无效，请重新选择")
+    rules = normalize_draft_rules(candidate.get("rules") or {}, raw)
+    if mode == "all_sites":
+        rules["sites"] = []
+    return rules
 
 
 def _rule_scope(subscribe: Any) -> str:
@@ -177,6 +189,58 @@ def _resource_title_cell(item: dict[str, Any]) -> dict[str, Any]:
     }]}
 
 
+def _display_groups(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """仅在展示时合并同标题、同大小且解析规格一致的跨站资源。"""
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for index, item in enumerate(items):
+        title = " ".join(str(item.get("title") or "").split()).casefold()
+        size = item.get("size_bytes")
+        if not title or not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            key: tuple[Any, ...] = ("single", index)
+        else:
+            episodes = item.get("episodes")
+            episode_key = tuple(sorted({number for number in episodes
+                                        if isinstance(number, int) and not isinstance(number, bool) and number > 0})) \
+                if isinstance(episodes, (list, tuple, set)) else ()
+            key = (
+                "version", title, size, item.get("kind"), episode_key, item.get("total_episode"),
+                item.get("quality"), item.get("resolution"), item.get("effect"), item.get("team"),
+                item.get("reason"),
+            )
+            site = item.get("site_id") or item.get("site_name")
+            if site is None or any((member.get("site_id") or member.get("site_name")) == site
+                                   for member in groups.get(key, [])):
+                key = ("single", index)
+        groups.setdefault(key, []).append(item)
+    return list(groups.values())
+
+
+def _site_cell(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """一行跨站资源显示所有来源，并把可用的站点名链接到详情页。"""
+    if len(items) == 1:
+        item = items[0]
+        return {"component": "td", "text": item.get("site_name") or str(item.get("site_id") or "?")}
+    content = []
+    for index, item in enumerate(items):
+        if index:
+            content.append({"component": "span", "text": "、"})
+        label = item.get("site_name") or str(item.get("site_id") or "?")
+        url = public_page_url(item.get("page_url"))
+        if url:
+            content.append({"component": "a", "text": label, "props": {
+                "href": url, "target": "_blank", "rel": "noopener noreferrer",
+                "title": f"打开{label}详情页", "class": "text-primary text-decoration-underline",
+            }})
+        else:
+            content.append({"component": "span", "text": label})
+    return {"component": "td", "content": content}
+
+
+def _full_season_version_count(items: list[dict[str, Any]]) -> int:
+    """跨站同版本整季资源在确认和提示中只计一次。"""
+    return sum(group[0].get("kind") == "full_season" for group in _display_groups(items))
+
+
 def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     """
     将规则预览的通过与拒绝资源展示为安全字段表格。
@@ -189,17 +253,18 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
             {"component": "td", "text": "通过" if accepted else "排除"},
             {"component": "td", "text": _candidate_label(item)},
             {"component": "td", "text": _candidate_coverage(item)},
-            {"component": "td", "text": item.get("site_name") or str(item.get("site_id") or "?")},
-            _resource_title_cell(item),
+            _site_cell(group),
+            _resource_title_cell(item) if len(group) == 1 else {"component": "td", "text": item.get("title") or ""},
             {"component": "td", "text": item.get("reason") or "符合当前规则"},
         ]}
         for accepted, items in ((True, preview.get("matched") or []), (False, preview.get("rejected") or []))
-        for item in items
+        for group in _display_groups(items)
+        for item in group[:1]
     ]
     return {"component": "VTable", "props": {"hover": True}, "content": [
         {"component": "thead", "content": [{"component": "tr", "content": [
             {"component": "th", "text": title}
-            for title in ("结果", "类型", "识别集号/目标总集数", "站点", "资源", "原因")
+            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "原因")
         ]}]},
         {"component": "tbody", "content": rows},
     ]}
@@ -216,7 +281,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -258,6 +323,17 @@ class SubscribeOverwatcher(_PluginBase):
                 self._state = {"baseline": None, "entries": {}}
             if not isinstance(self._state.get("entries"), dict):
                 self._state["entries"] = {}
+            stale_candidates = False
+            for entry in self._state["entries"].values():
+                if not isinstance(entry, dict) or not isinstance(entry.get("candidates"), list):
+                    continue
+                kept = [item for item in entry["candidates"] if candidate_is_eligible(item)]
+                if len(kept) != len(entry["candidates"]):
+                    entry["candidates"] = kept
+                    entry.pop("preview", None)
+                    stale_candidates = True
+            if stale_candidates:
+                self._save_state()
             previously_disabled = self._state.get("was_enabled") is False
             self._enabled = bool(config.get("enabled"))
             self._confirm_full_pack = bool(config.get("confirm_full_pack", True))
@@ -308,10 +384,12 @@ class SubscribeOverwatcher(_PluginBase):
             elif actions[0] == "preview":
                 success, message, normalized_rules = self.preview_candidate(
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
+                    str(config.get("rule_mode") or "candidate"),
                 )
             elif actions[0] == "confirm":
                 success, message = self.confirm_candidate(
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
+                    str(config.get("rule_mode") or "candidate"),
                 )
             elif actions[0] == "direct_approve":
                 success, message = self.approve_subscription(config.get("direct_subscription"))
@@ -351,6 +429,7 @@ class SubscribeOverwatcher(_PluginBase):
                     updated_config["revoke_subscription"] = ""
                 elif actions == ["confirm"]:
                     updated_config["candidate"] = ""
+                    updated_config["rule_mode"] = "candidate"
                     updated_config["rule_json"] = ""
                 elif actions == ["preview_replace"]:
                     updated_config["replace_resource"] = ""
@@ -741,12 +820,15 @@ class SubscribeOverwatcher(_PluginBase):
             "searched_at": now, "searched_ts": datetime.now(timezone.utc).timestamp(),
         }
 
-    def preview_candidate(self, choice: str, rule_json: str = "") -> tuple[bool, str, str]:
+    def preview_candidate(
+        self, choice: str, rule_json: str = "", rule_mode: str = "candidate",
+    ) -> tuple[bool, str, str]:
         """
         生成候选规格的只读匹配预览，保持订阅暂停和原规则不变。
 
         :param choice: 订阅 ID 与候选 ID
         :param rule_json: 用户调整的草稿规则 JSON
+        :param rule_mode: 选择所选站点或所有站点
         :return: 是否成功、结果消息和规范化草稿 JSON
         """
         try:
@@ -766,7 +848,7 @@ class SubscribeOverwatcher(_PluginBase):
             entry.pop("preview", None)
             self._save_state()
             try:
-                rules = normalize_draft_rules(candidate.get("rules") or {}, rule_json)
+                rules = _draft_rules(candidate, rule_json, rule_mode)
             except ValueError as error:
                 return False, str(error), rule_json
             scope = _rule_scope(subscribe)
@@ -780,18 +862,21 @@ class SubscribeOverwatcher(_PluginBase):
             entry = self._state["entries"].get(str(sid)) or {}
             if not current or entry.get("status") != "pending" or _rule_scope(current) != scope:
                 return False, "预览期间订阅发生变化，请重新预览", rule_json
-            preview.update({"choice": choice, "rules": rules, "scope": scope})
+            preview.update({"choice": choice, "rules": rules, "scope": scope, "rule_mode": rule_mode})
             entry["preview"] = preview
             self._save_state()
         normalized_json = json.dumps(rules, ensure_ascii=False, indent=2)
         return True, f"当前匹配 {preview['matched_count']} 条，排除 {preview['rejected_count']} 条；订阅仍保持待确认", normalized_json
 
-    def confirm_candidate(self, choice: str, rule_json: Optional[str] = None) -> tuple[bool, str]:
+    def confirm_candidate(
+        self, choice: str, rule_json: Optional[str] = None, rule_mode: str = "candidate",
+    ) -> tuple[bool, str]:
         """
         回填所选版本的规则，再恢复订阅并安排补搜。
 
         :param choice: 配置页传入的“订阅 ID:候选 ID”
         :param rule_json: 用户当前提交的草稿规则；变更后必须重新预览
+        :param rule_mode: 必须与本次预览使用的站点范围一致
         :return: 是否确认成功及可展示的结果
         """
         try:
@@ -813,13 +898,14 @@ class SubscribeOverwatcher(_PluginBase):
                 return False, "订阅身份已变化，请重新扫描"
             preview = entry.get("preview") or {}
             if preview.get("choice") != choice or preview.get("scope") != _rule_scope(subscribe) \
+                    or preview.get("rule_mode", "candidate") != rule_mode \
                     or not isinstance(preview.get("searched_ts"), (int, float)) \
                     or datetime.now(timezone.utc).timestamp() - preview["searched_ts"] > 1800:
                 return False, "请先为当前候选生成不超过 30 分钟的匹配预览"
             rules = preview.get("rules") or {}
             if rule_json is not None:
                 try:
-                    if normalize_draft_rules(candidate.get("rules") or {}, rule_json) != rules:
+                    if _draft_rules(candidate, rule_json, rule_mode) != rules:
                         return False, "规则已修改，请重新预览后确认"
                 except ValueError as error:
                     return False, str(error)
@@ -827,8 +913,8 @@ class SubscribeOverwatcher(_PluginBase):
                 item.get("id") for item in preview.get("matched") or []
             }:
                 return False, "所选版本未通过当前规则，请修改规则并重新预览"
-            if candidate.get("kind") == "full_season" and sum(
-                item.get("kind") == "full_season" for item in preview.get("matched") or []
+            if candidate.get("kind") == "full_season" and _full_season_version_count(
+                preview.get("matched") or []
             ) > 1:
                 return False, "规则仍匹配多个全集版本，请缩小规则后重新预览"
             payload = {field: value for field, value in rules.items() if field != "sites" or value is not None}
@@ -1290,7 +1376,13 @@ class SubscribeOverwatcher(_PluginBase):
             ),
             divider,
             row(
-                col(select("candidate", "选择一个版本（全集优先）", choices, clearable=True)),
+                col(select("candidate", "选择一个版本（全集优先）", choices, clearable=True), md=8),
+                col(select("rule_mode", "站点范围", [
+                    {"title": "只用所选站点", "value": "candidate"},
+                    {"title": "不限站点", "value": "all_sites"},
+                ]), md=4),
+            ),
+            row(
                 col(field("VTextarea", {
                     "model": "rule_json", "label": "草稿规则 JSON；留空使用候选规格，可编辑后重新预览",
                     "rows": 3, "auto-grow": True,
@@ -1333,7 +1425,7 @@ class SubscribeOverwatcher(_PluginBase):
         ]}], {
             "enabled": False, "confirm_full_pack": True, "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
-            "historical_subscription": [], "candidate": "", "rule_json": "",
+            "historical_subscription": [], "candidate": "", "rule_mode": "candidate", "rule_json": "",
             "direct_subscription": "", "revoke_subscription": "",
             "replace_subscription": "", "replace_resource": "", "replace_episodes": "",
             "operation": "save", "operation_request_id": "",
@@ -1387,10 +1479,11 @@ class SubscribeOverwatcher(_PluginBase):
                 "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集首集和整季候选。",
             }})
         for sid, entry in pending:
+            groups = _display_groups(entry.get("candidates") or [])
             page.append({"component": "VAlert", "props": {
                 "type": "info", "variant": "tonal",
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
-                        f"候选 {len(entry.get('candidates') or [])} 个（含历史扫描记录） · "
+                        f"候选 {len(entry.get('candidates') or [])} 条、合并展示 {len(groups)} 行（含历史扫描记录） · "
                         f"最近扫描 {entry.get('last_scan') or '等待中'}"
                         + (" · 已撤销，等待重新批准" if entry.get("revoked") else "")
                         + (f" · 扫描错误：{entry['last_error']}" if entry.get("last_error") else ""),
@@ -1399,20 +1492,21 @@ class SubscribeOverwatcher(_PluginBase):
                 {"component": "tr", "content": [
                     {"component": "td", "text": _candidate_label(item)},
                     {"component": "td", "text": _candidate_coverage(item)},
-                    {"component": "td", "text": item.get("site_name") or str(item.get("site_id") or "?")},
-                    _resource_title_cell(item),
+                    _site_cell(group),
+                    _resource_title_cell(item) if len(group) == 1 else {"component": "td", "text": item.get("title") or ""},
                     {"component": "td", "text": item.get("quality") or "?"},
                     {"component": "td", "text": item.get("resolution") or "?"},
                     {"component": "td", "text": item.get("effect") or "?"},
                     {"component": "td", "text": item.get("team") or "?"},
-                    {"component": "td", "text": item.get("last_seen") or ""},
+                    {"component": "td", "text": max((member.get("last_seen") or "" for member in group), default="")},
                 ]}
-                for item in entry.get("candidates") or []
+                for group in groups
+                for item in group[:1]
             ]
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点", "资源", "质量", "分辨率", "特效", "制作组", "最后发现")
+                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "质量", "分辨率", "特效", "制作组", "最后发现")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})
@@ -1425,7 +1519,7 @@ class SubscribeOverwatcher(_PluginBase):
                             "仅显示前 80 条通过和前 40 条排除资源；确认前若修改规则，需重新预览。",
                 }})
                 page.append(_preview_table(preview))
-                if sum(item.get("kind") == "full_season" for item in preview.get("matched") or []) > 1:
+                if _full_season_version_count(preview.get("matched") or []) > 1:
                     page.append({"component": "VAlert", "props": {
                         "type": "warning", "text": "当前规则匹配多个集数覆盖全集的版本；若选择全集候选，请收窄规则并重新预览。",
                     }})
