@@ -1346,7 +1346,7 @@ def test_cross_season_resource_is_not_eligible_for_manual_episode_replacement(pl
 
 
 def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
-    """同标题同大小跨站候选合并展示，站点链接与单站确认保持独立。"""
+    """仅同大小的跨站候选合并展示，并在选择项和表格显示大小。"""
     host = plugin_host
     host.subscriptions[1] = _subscribe(1)
     plugin = host.module.SubscribeOverwatcher()
@@ -1358,39 +1358,72 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     second = _context(title, page_url="https://two.example/details.php?id=22")
     second.torrent_info.site = 7
     second.torrent_info.site_name = "另一个站"
-    host.search_results.extend([first, second])
+    third = _context(title, page_url="https://three.example/details.php?id=33")
+    third.torrent_info.site = 9
+    third.torrent_info.site_name = "第三个站"
+    first.torrent_info.size = second.torrent_info.size = 1024 ** 3
+    third.torrent_info.size = 2 * 1024 ** 3
+    host.search_results.extend([first, second, third])
     plugin.refresh_candidates()
 
     candidates = host.storage["gate_state"]["entries"]["2"]["candidates"]
-    assert len(candidates) == 2
-    same_site = {**candidates[0], "id": "another-id"}
-    different_size = {**candidates[1], "size_bytes": 2048}
-    assert len(host.module._display_groups([candidates[0], same_site])) == 2
-    assert len(host.module._display_groups([candidates[0], different_size])) == 2
+    assert len(candidates) == 3
+    by_site = {item["site_name"]: item for item in candidates}
+    first_candidate = by_site["样例站"]
+    second_candidate = by_site["另一个站"]
+    third_candidate = by_site["第三个站"]
+    same_site = {**first_candidate, "id": "another-id"}
+    unknown_size = {**second_candidate, "size_bytes": None}
+    different_episode = {**second_candidate, "episodes": [2]}
+    different_quality = {**second_candidate, "quality": "BluRay"}
+    assert len(host.module._display_groups([first_candidate, second_candidate])) == 1
+    assert len(host.module._display_groups([first_candidate, same_site])) == 2
+    assert len(host.module._display_groups([first_candidate, third_candidate])) == 2
+    assert len(host.module._display_groups([first_candidate, unknown_size])) == 2
+    assert len(host.module._display_groups([first_candidate, different_episode])) == 2
+    assert len(host.module._display_groups([first_candidate, different_quality])) == 2
+    assert host.module._size_label(None) == "未知"
     choices = _form_items(plugin, "candidate")
-    assert len(choices) == 2
+    assert len(choices) == 3
+    assert all("1.00 GiB（1,073,741,824 B）" in item["title"]
+               for item in choices if "第三个站" not in item["title"])
+    assert "2.00 GiB（2,147,483,648 B）" in next(
+        item["title"] for item in choices if "第三个站" in item["title"]
+    )
+    assert host.module._size_label(1024 ** 3, exact=True) != \
+        host.module._size_label(1024 ** 3 + 1, exact=True)
     candidate_table = next(item for item in plugin.get_page()
                            if item["component"] == "VTable"
                            and "最后发现" in json.dumps(item, ensure_ascii=False))
     rows = candidate_table["content"][1]["content"]
-    assert len(rows) == 1
-    site_links = [item for item in rows[0]["content"][2]["content"] if item["component"] == "a"]
+    assert len(rows) == 2
+    grouped_row = next(row for row in rows if row["content"][4]["text"] == "1.00 GiB")
+    other_row = next(row for row in rows if row["content"][4]["text"] == "2.00 GiB")
+    assert grouped_row["content"][4]["props"]["title"] == "精确大小：1,073,741,824 B"
+    assert other_row["content"][4]["props"]["title"] == "精确大小：2,147,483,648 B"
+    site_links = [item for item in grouped_row["content"][2]["content"] if item["component"] == "a"]
     assert {item["props"]["href"] for item in site_links} == {
         "https://one.example/details.php?id=11", "https://two.example/details.php?id=22",
     }
-    assert rows[0]["content"][3] == {"component": "td", "text": title}
+    assert other_row["content"][2]["content"][0]["props"]["href"] == \
+        "https://three.example/details.php?id=33"
+    assert all(row["content"][3] == {"component": "td", "text": title} for row in rows)
 
     choice = next(item["value"] for item in choices if "另一个站" in item["title"])
     assert plugin.preview_candidate(choice, '{"sites": []}')[0] is True
     preview = host.storage["gate_state"]["entries"]["2"]["preview"]
-    assert preview["matched_count"] == 2
+    assert preview["matched_count"] == 3
     preview_table = next(item for item in plugin.get_page()
                          if item["component"] == "VTable"
                          and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
-    assert len(preview_table["content"][1]["content"]) == 1
-    assert len([node for node in preview_table["content"][1]["content"][0]["content"][3]["content"]
+    preview_rows = preview_table["content"][1]["content"]
+    assert len(preview_rows) == 2
+    grouped_preview = next(row for row in preview_rows if row["content"][5]["text"] == "1.00 GiB")
+    assert any(row["content"][5]["text"] == "2.00 GiB" for row in preview_rows)
+    assert grouped_preview["content"][5]["props"]["title"] == "精确大小：1,073,741,824 B"
+    assert len([node for node in grouped_preview["content"][3]["content"]
                 if node["component"] == "a"]) == 2
-    assert preview_table["content"][1]["content"][0]["content"][4] == \
+    assert grouped_preview["content"][4] == \
         {"component": "td", "text": title}
     assert plugin.preview_candidate(choice)[0] is True
     assert plugin.confirm_candidate(choice)[0] is True
@@ -1542,6 +1575,11 @@ def test_same_full_season_version_across_sites_counts_once(plugin_host):
     second.torrent_info.site_name = "另一个站"
     host.search_results.extend([first, second])
     plugin.refresh_candidates()
+    candidates = host.storage["gate_state"]["entries"]["2"]["candidates"]
+    assert host.module._full_season_version_count(candidates) == 1
+    assert host.module._full_season_version_count([
+        candidates[0], {**candidates[1], "size_bytes": 2048},
+    ]) == 2
     choice = next(item["value"] for item in _form_items(plugin, "candidate")
                   if "另一个站" in item["title"])
     success, _message, draft = plugin.preview_candidate(choice, '{"sites": []}')
@@ -1581,6 +1619,7 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     assert "secret.example" not in json.dumps(preview)
     choice = _form_items(plugin, "replace_resource")[0]["value"]
     assert "集数覆盖全集" in _form_items(plugin, "replace_resource")[0]["title"]
+    assert "1.00 KiB（1,024 B）" in _form_items(plugin, "replace_resource")[0]["title"]
     plugin.init_plugin({
         "enabled": True, "replace_resource": choice, "replace_episodes": "1,3-5",
         "operation": "submit_replace",

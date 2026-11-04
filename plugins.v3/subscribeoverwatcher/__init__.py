@@ -106,6 +106,28 @@ def _candidate_coverage(candidate: dict[str, Any]) -> str:
     return f"{', '.join(spans)}/{total or '?'}"
 
 
+def _size_label(size_bytes: Any, *, exact: bool = False) -> str:
+    """把候选快照中的字节大小显示为便于比较的单位。"""
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        return "未知"
+    size = size_bytes
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if size < 1024 or unit == "PiB":
+            label = f"{size} B" if unit == "B" else f"{size:.2f} {unit}"
+            return f"{label}（{size_bytes:,} B）" if exact and unit != "B" else label
+        size /= 1024
+    return "未知"
+
+
+def _size_cell(item: dict[str, Any]) -> dict[str, Any]:
+    """详情表格显示易读大小，悬停可核对合并所用的精确字节数。"""
+    size = item.get("size_bytes")
+    cell = {"component": "td", "text": _size_label(size)}
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        cell["props"] = {"title": f"精确大小：{size:,} B"}
+    return cell
+
+
 def _draft_rules(candidate: dict[str, Any], raw: str, mode: str) -> dict[str, Any]:
     """选择所选站点或所有站点，其他候选规格照常回填。"""
     if mode not in {"candidate", "all_sites"}:
@@ -182,7 +204,7 @@ def _progress_label(subscribe: Any) -> str:
 
 
 def _display_groups(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """仅在展示时合并同标题、同大小且解析规格一致的跨站资源。"""
+    """仅在展示时合并同标题、同大小、同集数且解析规格一致的跨站资源。"""
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for index, item in enumerate(items):
         title = " ".join(str(item.get("title") or "").split()).casefold()
@@ -245,6 +267,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
             {"component": "td", "text": _candidate_coverage(item)},
             _site_cell(group),
             {"component": "td", "text": item.get("title") or ""},
+            _size_cell(item),
             {"component": "td", "text": item.get("reason") or "符合当前规则"},
         ]}
         for accepted, items in ((True, preview.get("matched") or []), (False, preview.get("rejected") or []))
@@ -254,7 +277,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     return {"component": "VTable", "props": {"hover": True}, "content": [
         {"component": "thead", "content": [{"component": "tr", "content": [
             {"component": "th", "text": title}
-            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "原因")
+            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "原因")
         ]}]},
         {"component": "tbody", "content": rows},
     ]}
@@ -271,7 +294,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.4"
+    plugin_version = "1.5.5"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1286,6 +1309,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
                              f"{_candidate_label(item)} {_candidate_coverage(item)} · "
                              f"{item.get('site_name') or item.get('site_id') or '未知站点'} · "
+                             f"{_size_label(item.get('size_bytes'), exact=True)} · "
                              f"{item.get('quality') or '?'} {item.get('resolution') or '?'} "
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
@@ -1309,7 +1333,8 @@ class SubscribeOverwatcher(_PluginBase):
             replacement_choices = [
                 {
                     "title": f"#{sid} · {_candidate_label(item)} {_candidate_coverage(item)} · "
-                             f"{item.get('site_name') or item.get('site_id') or '未知站点'} · {item.get('title')}",
+                             f"{item.get('site_name') or item.get('site_id') or '未知站点'} · "
+                             f"{_size_label(item.get('size_bytes'), exact=True)} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
                 }
                 for sid, entry in self._state["entries"].items()
@@ -1496,6 +1521,7 @@ class SubscribeOverwatcher(_PluginBase):
                     {"component": "td", "text": _candidate_coverage(item)},
                     _site_cell(group),
                     {"component": "td", "text": item.get("title") or ""},
+                    _size_cell(item),
                     {"component": "td", "text": item.get("quality") or "?"},
                     {"component": "td", "text": item.get("resolution") or "?"},
                     {"component": "td", "text": item.get("effect") or "?"},
@@ -1508,7 +1534,7 @@ class SubscribeOverwatcher(_PluginBase):
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "质量", "分辨率", "特效", "制作组", "最后发现")
+                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "质量", "分辨率", "特效", "制作组", "最后发现")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})
