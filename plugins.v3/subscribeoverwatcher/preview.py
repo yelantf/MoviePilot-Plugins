@@ -9,7 +9,7 @@ import re
 from hashlib import sha256
 from typing import Any, Optional
 
-from .rules import resource_candidate
+from .rules import public_page_url, resource_candidate
 
 
 RULE_FIELDS = ("quality", "resolution", "effect", "include", "exclude", "sites")
@@ -30,7 +30,8 @@ def normalize_draft_rules(defaults: dict[str, Any], raw: str) -> dict[str, Any]:
         raise ValueError("规则 JSON 格式错误") from error
     if not isinstance(changes, dict) or set(changes) - set(RULE_FIELDS):
         raise ValueError("规则 JSON 只能包含质量、分辨率、特效、包含、排除和站点字段")
-    result = {key: value for key, value in defaults.items() if key in RULE_FIELDS}
+    # 未识别出的候选属性不应清空订阅已有规则；用户仍可显式提交 null 清空。
+    result = {key: value for key, value in defaults.items() if key in RULE_FIELDS and value is not None}
     result.update(changes)
     for key in RULE_FIELDS:
         if key not in result:
@@ -106,7 +107,7 @@ def preview_resource(context: Any, season: int, total_episode: Optional[int], se
     if candidate:
         return {key: candidate[key] for key in (
             "id", "kind", "episodes", "total_episode", "title", "site_id", "site_name", "size_bytes",
-            "quality", "resolution", "effect", "team",
+            "page_url", "quality", "resolution", "effect", "team",
         )}
     title = str(getattr(torrent, "title", None) or "").strip()[:240]
     if not title:
@@ -122,6 +123,7 @@ def preview_resource(context: Any, season: int, total_episode: Optional[int], se
         "kind": "episode", "episodes": episodes, "total_episode": total_episode,
         "title": title, "site_id": site_id,
         "site_name": str(getattr(torrent, "site_name", None) or "")[:80],
+        "page_url": public_page_url(getattr(torrent, "page_url", None), getattr(torrent, "enclosure", None)),
         "size_bytes": size_bytes,
         "quality": str(getattr(meta, "resource_type", None) or "")[:80],
         "resolution": str(getattr(meta, "resource_pix", None) or "")[:80],

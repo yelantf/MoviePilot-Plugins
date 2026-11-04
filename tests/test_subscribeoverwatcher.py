@@ -103,12 +103,35 @@ def plugin_host(monkeypatch):
         只返回预置搜索结果，不产生下载副作用。
         """
 
-        def search_by_id(self, **kwargs):
+        def process(self, **kwargs):
             """
-            记录首集扫描并返回预置候选。
+            记录未应用规则组的搜索并返回预置候选。
             """
             search_calls.append(kwargs)
             return list(search_results)
+
+    class MediaChain:
+        """返回与订阅身份对应的媒体信息。"""
+
+        def recognize_media(self, *, media_source, media_id, mtype):
+            """模拟宿主按媒体 ID 识别目标剧集。"""
+            return SimpleNamespace(media_source=media_source, media_id=media_id,
+                                   type=mtype, season=None)
+
+    class NotExistMediaInfo:
+        """记录按目标季搜索所需的缺集占位信息。"""
+
+        def __init__(self, *, episodes):
+            """保留目标集数参数供断言。"""
+            self.episodes = episodes
+
+    def resolve_media_identity(*, media):
+        """从内存媒体对象取出来源与原生 ID。"""
+        return media.media_source, media.media_id
+
+    def build_media_key(media_source, media_id):
+        """生成内存搜索使用的媒体键。"""
+        return f"{media_source}:{media_id}"
 
     class SubscribeChain:
         """
@@ -193,16 +216,20 @@ def plugin_host(monkeypatch):
     exports = {
         "app.application.torrent.download": {"TorrentHelper": TorrentHelper},
         "app.chain.download": {"DownloadChain": DownloadChain},
+        "app.chain.media": {"MediaChain": MediaChain},
         "app.chain.search": {"SearchChain": SearchChain},
         "app.chain.subscribe": {"SubscribeChain": SubscribeChain},
         "app.db.oper.subscribe": {"SubscribeOper": SubscribeOper},
         "app.plugins": {"_PluginBase": PluginBase},
+        "app.schemas.media": {"build_media_key": build_media_key,
+                              "resolve_media_identity": resolve_media_identity},
+        "app.schemas.mediaserver": {"NotExistMediaInfo": NotExistMediaInfo},
         "app.schemas.types": {
             "ChainEventType": SimpleNamespace(ResourceDownload="resource.download"),
             "EventType": SimpleNamespace(SubscribeAdded="subscribe.added"),
             "MediaSource": lambda value: value,
             "MediaType": SimpleNamespace(TV=SimpleNamespace(value="电视剧")),
-            "MessageType": SimpleNamespace(Subscribe="subscribe"),
+            "MessageType": SimpleNamespace(Plugin="plugin"),
         },
         "app.sdk.events": {"Event": SimpleNamespace, "eventmanager": SimpleNamespace(register=register)},
         "app.sdk.logging": {"logger": SimpleNamespace(
@@ -241,7 +268,7 @@ def _subscribe(sid, mtype="电视剧"):
     )
 
 
-def _context(title, episodes=(1,), enclosure="https://secret.example/torrent"):
+def _context(title, episodes=(1,), enclosure="https://secret.example/torrent", page_url=None):
     """
     建立带敏感字段的资源上下文，用于验证快照范围。
     """
@@ -253,7 +280,7 @@ def _context(title, episodes=(1,), enclosure="https://secret.example/torrent"):
         ),
         torrent_info=SimpleNamespace(
             title=title, site=5, site_name="样例站", size=1024,
-            pubdate="2026-11-02", enclosure=enclosure, site_cookie="cookie-secret",
+            pubdate="2026-11-02", enclosure=enclosure, page_url=page_url, site_cookie="cookie-secret",
             description="", labels=[], volume_factor="",
         ),
     )
@@ -320,7 +347,9 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     assert len(entry["candidates"]) == 1
     assert "secret.example" not in json.dumps(entry)
     assert "cookie-secret" not in json.dumps(entry)
-    assert host.search_calls[0]["season"] == 1
+    assert host.search_calls[0]["rule_groups"] == []
+    assert host.search_calls[0]["mediainfo"].season == 1
+    assert 1 in host.search_calls[0]["no_exists"]["themoviedb:123"]
 
     choice = _form_items(plugin, "candidate")[0]["value"]
     plugin.init_plugin({"enabled": True, "candidate": choice, "operation": "preview"})
@@ -332,7 +361,7 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     updated = host.subscriptions[2]
     assert updated.state == "R"
     assert updated.quality == r"WEB[- .]?(?:DL|RIP)"
-    assert updated.resolution == r"1080[pi]?"
+    assert updated.resolution == r"1080[pi]?|x1080"
     assert updated.effect == "HDR"
     assert updated.include == "TEAM"
     assert updated.sites == [5]
@@ -411,7 +440,7 @@ def test_fake_downloader_receives_task_only_after_confirming_a_version(plugin_ho
     subscribe = host.subscriptions[42]
     assert subscribe.state == "R"
     assert subscribe.quality == r"Blu[- .]?Ray|BluRay"
-    assert subscribe.resolution == r"2160[pi]?|4K"
+    assert subscribe.resolution == r"2160[pi]?|4K|x2160"
     assert subscribe.effect is not None
     assert subscribe.include == "GROUP"
     assert subscribe.sites == [7]
@@ -455,21 +484,105 @@ def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host
     候选只收单集 E01，并在资源消失后保留发现记录。
     """
     rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
-    first = rules.resource_candidate(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"), 1, "2026-11-02T01:00:00+00:00")
+    first = rules.resource_candidate(_context(
+        "Show.S01E01.1080p.WEB-DL.HDR-TEAM",
+        page_url="https://tracker.example/details.php?id=42&hit=1&passkey=secret",
+    ), 1, "2026-11-02T01:00:00+00:00")
     assert first is not None
     assert rules.resource_candidate(_context("Show.S01E01-E02", episodes=(1, 2)), 1, "now") is None
+    assert rules.resource_candidate(_context("Show.S01E02", episodes=(2,)), 1, "now") is None
     assert rules.resource_candidate(_context("Show.S01E01"), 2, "now") is None
     unspecified_season = _context("Show.E01.1080p.WEB-DL")
     unspecified_season.meta_info.begin_season = None
     assert rules.resource_candidate(unspecified_season, 2, "now") is None
     assert "enclosure" not in first
     assert "site_cookie" not in first
+    assert first["page_url"] == "https://tracker.example/details.php?id=42&hit=1"
+    assert "secret" not in json.dumps(first)
 
     updated = rules.resource_candidate(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"), 1, "2026-11-02T02:00:00+00:00")
     merged = rules.merge_candidates([first], [updated])
     assert merged[0]["first_seen"] == "2026-11-02T01:00:00+00:00"
     assert merged[0]["last_seen"] == "2026-11-02T02:00:00+00:00"
+    assert merged[0]["page_url"] == first["page_url"]
     assert rules.merge_candidates(merged, []) == merged
+
+
+def test_candidate_rules_recognize_spec_aliases_and_both_include_markers(plugin_host):
+    """候选回填常见规格别名，并在标题验证两个包含标识。"""
+    rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
+    title = "Show.S01E01.x2160.H265.Atmos.CUSTOM-TEAM"
+    context = _context(title)
+    context.meta_info.resource_type = "HEVC"
+    context.meta_info.resource_pix = "2160p"
+    context.meta_info.resource_effect = "Dolby Atmos"
+    context.meta_info.customization = "CUSTOM"
+    candidate = rules.resource_candidate(context, 1, "now")
+    assert candidate is not None
+    for field in ("quality", "resolution", "effect", "include"):
+        assert re.search(candidate["rules"][field], title, re.I)
+    assert not re.search(candidate["rules"]["include"], title.replace("CUSTOM", "OTHER"), re.I)
+    assert not re.search(candidate["rules"]["include"], title.replace("TEAM", "OTHER"), re.I)
+
+    context.meta_info.resource_type = "UHD"
+    context.meta_info.resource_effect = "SDR"
+    context.torrent_info.title = "Show.S01E01.UHD.SDR.CUSTOM-TEAM"
+    candidate = rules.resource_candidate(context, 1, "now")
+    assert candidate is not None
+    assert re.search(candidate["rules"]["quality"], context.torrent_info.title, re.I)
+    assert re.search(candidate["rules"]["effect"], context.torrent_info.title, re.I)
+
+
+def test_unrecognized_candidate_values_preserve_existing_subscription_rules(plugin_host):
+    """候选未识别到字段时确认不清空订阅已有规则。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.quality = "WEB-DL"
+    subscribe.resolution = "1080p"
+    subscribe.effect = "HDR"
+    subscribe.include = "TEAM"
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    context = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    context.meta_info.resource_type = "未识别质量"
+    context.meta_info.resource_pix = "未识别分辨率"
+    context.meta_info.resource_effect = "未识别特效"
+    context.meta_info.resource_team = "未识别制作组"
+    host.search_results.append(context)
+    plugin.refresh_candidates()
+    choice = _form_items(plugin, "candidate")[0]["value"]
+    success, _message, draft = plugin.preview_candidate(choice)
+    assert success is True
+    assert set(json.loads(draft)) == {"sites"}
+    assert plugin.confirm_candidate(choice, draft)[0] is True
+    assert (subscribe.quality, subscribe.resolution, subscribe.effect, subscribe.include) == \
+           ("WEB-DL", "1080p", "HDR", "TEAM")
+
+
+def test_only_public_detail_pages_are_kept(plugin_host):
+    """详情链接保留站内资源 ID，过滤下载链接、票据与非网页协议。"""
+    rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
+    public = rules.public_page_url
+    assert public("https://tracker.example/#/torrent/detail/100/") == \
+        "https://tracker.example/#/torrent/detail/100/"
+    assert public("https://tracker.example/details.php?id=42&passkey=secret") == \
+        "https://tracker.example/details.php?id=42"
+    assert public("javascript:alert(1)") is None
+    assert public("https://user:password@tracker.example/details.php?id=42") is None
+    assert public("https://tracker.example/download.php?id=42") is None
+    assert public("https://tracker.example/dl/42/signed-ticket") is None
+    assert public("https://tracker.example/details.php?id=42",
+                  "https://tracker.example/details.php?id=42") is None
+    preview = importlib.import_module(f"{plugin_host.module.__name__}.preview")
+    later_episode = preview.preview_resource(_context(
+        "Show.S01E02.1080p.WEB-DL", episodes=(2,),
+        page_url="https://tracker.example/details.php?id=43&passkey=secret",
+    ), 1, 8, "now")
+    assert later_episode["kind"] == "episode"
+    assert later_episode["page_url"] == "https://tracker.example/details.php?id=43"
 
 
 def test_failed_resume_keeps_download_gate_closed(plugin_host, monkeypatch):
@@ -558,7 +671,7 @@ def test_daily_notice_lists_live_pending_subscriptions_and_uses_configured_time(
 
     assert len(host.messages) == 1
     assert host.messages[0] == {
-        "mtype": "subscribe",
+        "mtype": "plugin",
         "title": "剧集守门员：待确认订阅日报",
         "text": "当前有 2 条待确认订阅。\n1. #1 历史剧 S01\n2. #2 新剧 S01",
     }
@@ -769,7 +882,7 @@ def test_candidate_approval_can_be_revoked_without_overwriting_manual_edits(plug
     assert success is True
     assert subscribe.state == "S"
     assert subscribe.quality == "REMUX"
-    assert subscribe.resolution == r"1080[pi]?"
+    assert subscribe.resolution == r"1080[pi]?|x1080"
     event = _download_event(2)
     plugin.intercept_download(event)
     assert event.event_data.cancel is True
@@ -969,6 +1082,22 @@ def test_custom_config_action_returns_result_and_refreshes_choices(plugin_host, 
     assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "ui-adopt-2"
 
 
+def test_detail_shows_current_state_without_repeating_last_operation(plugin_host):
+    """配置页仍可确认操作结果，详情页只展示当前管理状态。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({
+        "enabled": True, "historical_subscription": [1], "operation": "adopt",
+        "operation_request_id": "adopt-1",
+    })
+
+    assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "adopt-1"
+    page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "当前管理 1 条剧集订阅" in page_text
+    assert "订阅 1 已纳入管理" not in page_text
+
+
 def test_custom_interface_bundle_is_ready(plugin_host):
     """插件市场安装后的 Vue 配置和详情入口都包含在插件目录内。"""
     plugin = plugin_host.module.SubscribeOverwatcher()
@@ -1078,7 +1207,10 @@ def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
     host.subscriptions[2] = _subscribe(2)
     plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
     first = _context("Show.S01E01.1080p.WEB-DL", episodes=(1,))
-    full_1080 = _context("Show.S01.Complete.1080p.WEB-DL", episodes=tuple(range(1, 9)))
+    full_1080 = _context(
+        "Show.S01.Complete.1080p.WEB-DL", episodes=tuple(range(1, 9)),
+        page_url="https://tracker.example/details.php?id=1080",
+    )
     full_2160 = _context("Show.S01.Complete.2160p.WEB-DL", episodes=tuple(range(1, 9)))
     suspect = _context("Show.S01.Complete.Unknown", episodes=(1, 2))
     cross_season = _context("Show.S01-S02.Complete", episodes=tuple(range(1, 9)))
@@ -1093,6 +1225,27 @@ def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
     assert all(item["episodes"] == list(range(1, 9)) for item in candidates[:2])
     assert "secret.example" not in json.dumps(candidates)
     assert "集数覆盖全集" in _form_items(plugin, "candidate")[0]["title"]
+    assert next(item["page_url"] for item in _form_items(plugin, "candidate")
+                if "Complete.1080p" in item["title"]) == \
+        "https://tracker.example/details.php?id=1080"
+    candidate_table = next(item for item in plugin.get_page()
+                           if item["component"] == "VTable"
+                           and "最后发现" in json.dumps(item, ensure_ascii=False))
+    links = [cell["content"][0] for row in candidate_table["content"][1]["content"]
+             for cell in row["content"] if cell.get("content")]
+    assert len(links) == 1
+    assert links[0]["props"]["href"] == "https://tracker.example/details.php?id=1080"
+    assert links[0]["props"]["rel"] == "noopener noreferrer"
+
+
+def test_candidate_labels_do_not_claim_unrecognized_or_sparse_episodes_are_complete(plugin_host):
+    """标题整季词和已识别集号分别展示，跳号不能渲染成连续覆盖。"""
+    module = plugin_host.module
+    candidate = {"kind": "suspected_full", "episodes": [], "total_episode": 8}
+    assert module._candidate_label(candidate) == "标题疑似整季"
+    assert module._candidate_coverage(candidate) == "未识别具体集号（目标总集数 8）"
+    candidate["episodes"] = [1, 3, 4, 8]
+    assert module._candidate_coverage(candidate) == "E01, E03–E04, E08/8"
 
 
 def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
@@ -1105,7 +1258,8 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     plugin.init_plugin({"enabled": True})
     host.subscriptions[2] = _subscribe(2)
     plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
-    chosen = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    chosen = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM",
+                      page_url="https://tracker.example/details.php?id=1")
     rejected = _context("Show.S01E02.2160p.BluRay.DV-GROUP", episodes=(2,))
     cross_season = _context("Show.S01-S02.1080p.WEB-DL.HDR-TEAM")
     cross_season.meta_info.end_season = 2
@@ -1128,6 +1282,11 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     assert "符合当前规则" in page_text
     assert "排除" in page_text
     assert "规则预览" in page_text
+    preview_table = next(item for item in plugin.get_page()
+                         if item["component"] == "VTable"
+                         and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
+    assert preview_table["content"][1]["content"][0]["content"][4]["content"][0]["props"]["href"] == \
+        "https://tracker.example/details.php?id=1"
 
     success, message = plugin.confirm_candidate(choice, draft.replace("1080", "2160"))
     assert success is False
@@ -1216,6 +1375,8 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     history = host.storage["gate_state"]["entries"]["2"]["replacement_history"]
     assert history[0]["episodes"] == [1, 3, 4, 5]
     assert "secret.example" not in json.dumps(history)
+    assert len(host.search_calls) == 2
+    assert all(call["rule_groups"] == [] for call in host.search_calls)
 
 
 def test_replacement_rechecks_rules_resource_and_episode_coverage(plugin_host):

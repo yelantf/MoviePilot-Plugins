@@ -106,12 +106,39 @@ describe('custom configuration actions', () => {
       .toBeUndefined()
   })
 
+  it('links the selected candidate to its site detail page', async () => {
+    const data = snapshot({ managed: '尚无已纳入管理的剧集订阅。', historical: [] })
+    data.conf[0].content.push({ component: 'VSelect', props: {
+      model: 'candidate', items: [{
+        title: '样例资源', value: '1:resource', page_url: 'https://tracker.example/details.php?id=42',
+      }],
+    } })
+    data.model.candidate = '1:resource'
+    const wrapper = mount(Config, {
+      props: { api: { get: vi.fn().mockResolvedValue(data) } }, global: { components },
+    })
+    await flushPromises()
+
+    const link = wrapper.find('a')
+    expect(link.text()).toBe('查看所选资源详情')
+    expect(link.attributes()).toMatchObject({
+      href: 'https://tracker.example/details.php?id=42',
+      target: '_blank', rel: 'noopener noreferrer',
+    })
+  })
+
   it('keeps the existing detail tables visible in the custom page', async () => {
     const api = { get: vi.fn().mockResolvedValue({ page: [
       { component: 'VAlert', props: { text: '已纳入管理 1 条剧集订阅' } },
       { component: 'VTable', content: [
         { component: 'tbody', content: [
-          { component: 'tr', content: [{ component: 'td', text: '样例剧 S01' }] },
+          { component: 'tr', content: [
+            { component: 'td', text: '样例剧 S01' },
+            { component: 'td', content: [{
+              component: 'a', text: '查看资源',
+              props: { href: 'https://tracker.example/details.php?id=42', target: '_blank' },
+            }] },
+          ] },
         ] },
       ] },
     ] }) }
@@ -120,5 +147,6 @@ describe('custom configuration actions', () => {
 
     expect(wrapper.text()).toContain('已纳入管理 1 条剧集订阅')
     expect(wrapper.text()).toContain('样例剧 S01')
+    expect(wrapper.find('a').attributes('href')).toBe('https://tracker.example/details.php?id=42')
   })
 })

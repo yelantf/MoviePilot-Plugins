@@ -1,7 +1,7 @@
 """
 新增剧集订阅的选版确认插件。
 
-同步拦截订阅下载，定期收集 E01 候选；用户确认后回填规则并恢复追更。
+同步拦截订阅下载，定期收集目标季候选；用户确认后回填规则并恢复追更。
 """
 
 import copy
@@ -12,17 +12,20 @@ from typing import Any, Optional
 
 from app.application.torrent.download import TorrentHelper
 from app.chain.download import DownloadChain
+from app.chain.media import MediaChain
 from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
 from app.db.oper.subscribe import SubscribeOper
 from app.plugins import _PluginBase
+from app.schemas.media import build_media_key, resolve_media_identity
+from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import ChainEventType, EventType, MediaSource, MediaType, MessageType
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .preview import normalize_draft_rules, parse_episode_selection, preview_resource
-from .rules import is_complete_season_download, merge_candidates, resource_candidate
+from .rules import is_complete_season_download, merge_candidates, public_page_url, resource_candidate
 
 
 def _utc_now() -> str:
@@ -60,13 +63,13 @@ def _subscription_id(origin: Any) -> Optional[int]:
 
 def _candidate_label(candidate: dict[str, Any]) -> str:
     """
-    为不同类型的首集与全集候选生成简短标签。
+    为不同类型的目标季候选生成简短标签。
     """
     kind = candidate.get("kind")
     if kind == "full_season":
-        return "集数覆盖全集"
+        return "识别集数覆盖全集"
     if kind == "suspected_full":
-        return "疑似全集"
+        return "标题疑似整季"
     if kind == "episode":
         return "分集"
     return "单集 E01"
@@ -74,14 +77,24 @@ def _candidate_label(candidate: dict[str, Any]) -> str:
 
 def _candidate_coverage(candidate: dict[str, Any]) -> str:
     """
-    显示候选已识别的集数范围，未知时明确标记。
+    显示标题解析出的具体集号；不把不连续的集号写成完整范围。
     """
-    episodes = candidate.get("episodes") or []
+    episodes = sorted({episode for episode in candidate.get("episodes") or []
+                       if isinstance(episode, int) and not isinstance(episode, bool) and episode > 0})
     total = candidate.get("total_episode")
+    total = total if isinstance(total, int) and not isinstance(total, bool) and total > 0 else None
     if not episodes:
-        return "集数待核实"
-    scope = str(episodes[0]) if len(episodes) == 1 else f"{episodes[0]}–{episodes[-1]}"
-    return f"E{scope}/{total or '?'}"
+        return f"未识别具体集号（目标总集数 {total or '未知'}）"
+    spans = []
+    first = last = episodes[0]
+    for episode in episodes[1:]:
+        if episode == last + 1:
+            last = episode
+            continue
+        spans.append(f"E{first:02d}" + (f"–E{last:02d}" if first != last else ""))
+        first = last = episode
+    spans.append(f"E{first:02d}" + (f"–E{last:02d}" if first != last else ""))
+    return f"{', '.join(spans)}/{total or '?'}"
 
 
 def _rule_scope(subscribe: Any) -> str:
@@ -149,6 +162,21 @@ def _progress_label(subscribe: Any) -> str:
     return f"{kind} {completed}/{total} 集"
 
 
+def _resource_title_cell(item: dict[str, Any]) -> dict[str, Any]:
+    """详情地址可用时将资源标题显示为站点详情页链接。"""
+    title = item.get("title") or ""
+    url = public_page_url(item.get("page_url"))
+    if not url:
+        return {"component": "td", "text": title}
+    return {"component": "td", "content": [{
+        "component": "a", "text": title,
+        "props": {
+            "href": url, "target": "_blank", "rel": "noopener noreferrer",
+            "title": "打开站点详情页", "class": "text-primary text-decoration-underline",
+        },
+    }]}
+
+
 def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     """
     将规则预览的通过与拒绝资源展示为安全字段表格。
@@ -162,7 +190,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
             {"component": "td", "text": _candidate_label(item)},
             {"component": "td", "text": _candidate_coverage(item)},
             {"component": "td", "text": item.get("site_name") or str(item.get("site_id") or "?")},
-            {"component": "td", "text": item.get("title") or ""},
+            _resource_title_cell(item),
             {"component": "td", "text": item.get("reason") or "符合当前规则"},
         ]}
         for accepted, items in ((True, preview.get("matched") or []), (False, preview.get("rejected") or []))
@@ -171,7 +199,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     return {"component": "VTable", "props": {"hover": True}, "content": [
         {"component": "thead", "content": [{"component": "tr", "content": [
             {"component": "th", "text": title}
-            for title in ("结果", "类型", "覆盖", "站点", "资源", "原因")
+            for title in ("结果", "类型", "识别集号/目标总集数", "站点", "资源", "原因")
         ]}]},
         {"component": "tbody", "content": rows},
     ]}
@@ -179,7 +207,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
 
 class SubscribeOverwatcher(_PluginBase):
     """
-    管理新剧集订阅的下载确认和首集版本候选。
+    管理新剧集订阅的下载确认和目标季版本候选。
 
     下载闸门读取持久确认记录；即使新增订阅广播晚到，也按创建前的 ID 水位拦截。
     允许全集直下时保留待确认订阅的搜索资格，只放行明确覆盖整季的下载事件。
@@ -188,7 +216,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -543,7 +571,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def refresh_candidates(self) -> None:
         """
-        补收新增事件、更新首集和全集候选并执行待处理的补搜。
+        补收新增事件、更新目标季候选并执行待处理的补搜。
         """
         if not self._enabled or not self._scan_lock.acquire(blocking=False):
             return
@@ -589,7 +617,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def _scan_one(self, sid: int) -> None:
         """
-        搜索一条待确认订阅的首集和全集，并保留历史候选。
+        搜索一条待确认订阅的首集和整季资源，并保留历史候选。
         """
         subscribe = self._subscribes.get(sid)
         if not subscribe:
@@ -600,13 +628,7 @@ class SubscribeOverwatcher(_PluginBase):
         if subscribe.type != MediaType.TV.value or not subscribe.media_source or not subscribe.media_id:
             return
         try:
-            contexts = SearchChain().search_by_id(
-                media_source=MediaSource(subscribe.media_source),
-                media_id=str(subscribe.media_id),
-                mtype=MediaType.TV,
-                season=subscribe.season or 1,
-                cache_local=False,
-            )
+            contexts = self._search_unfiltered(subscribe)
             now = _utc_now()
             fresh = []
             for context in contexts:
@@ -615,7 +637,7 @@ class SubscribeOverwatcher(_PluginBase):
                         context, subscribe.season or 1, now, subscribe.total_episode,
                     )
                 except (TypeError, ValueError, OverflowError):
-                    logger.warning(f"订阅 {sid} 的一个 E01 搜索结果格式异常，已跳过")
+                    logger.warning(f"订阅 {sid} 的一个目标季搜索结果格式异常，已跳过")
                     continue
                 if candidate:
                     fresh.append(candidate)
@@ -627,12 +649,34 @@ class SubscribeOverwatcher(_PluginBase):
                     entry.pop("last_error", None)
                     self._save_state()
         except Exception:
-            logger.exception(f"扫描订阅 {sid} 的 E01 候选失败")
+            logger.exception(f"扫描订阅 {sid} 的目标季候选失败")
             with self._lock:
                 entry = self._state["entries"].get(str(sid))
                 if entry and entry.get("status") == "pending":
                     entry["last_error"] = "搜索失败，详情见插件日志"
                     self._save_state()
+
+    @staticmethod
+    def _search_unfiltered(subscribe: Any) -> list[Any]:
+        """按媒体身份搜索目标季，跳过全局规则组和订阅筛选条件。"""
+        media = MediaChain().recognize_media(
+            media_source=MediaSource(subscribe.media_source),
+            media_id=str(subscribe.media_id), mtype=MediaType.TV,
+        )
+        if media is None:
+            return []
+        target = copy.copy(media)
+        season = subscribe.season or 1
+        target.season = season
+        media_source, media_id = resolve_media_identity(media=target)
+        media_key = build_media_key(media_source, media_id)
+        if not media_key:
+            return []
+        return SearchChain().process(
+            mediainfo=target,
+            no_exists={media_key: {season: NotExistMediaInfo(episodes=[])}},
+            rule_groups=[],
+        )
 
     @staticmethod
     def _rule_rejection(subscribe: Any, context: Any) -> Optional[str]:
@@ -664,13 +708,7 @@ class SubscribeOverwatcher(_PluginBase):
                 setattr(working, field, value)
             elif field != "sites":
                 setattr(working, field, None)
-        contexts = SearchChain().search_by_id(
-            media_source=MediaSource(subscribe.media_source),
-            media_id=str(subscribe.media_id),
-            mtype=MediaType.TV,
-            season=subscribe.season or 1,
-            cache_local=False,
-        )
+        contexts = self._search_unfiltered(subscribe)
         now = _utc_now()
         matched: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
@@ -976,10 +1014,7 @@ class SubscribeOverwatcher(_PluginBase):
             if resource_id not in {item.get("id") for item in preview.get("matched") or []}:
                 return False, "资源不在当前规则的预览匹配列表中"
         try:
-            contexts = SearchChain().search_by_id(
-                media_source=MediaSource(subscribe.media_source), media_id=str(subscribe.media_id),
-                mtype=MediaType.TV, season=subscribe.season or 1, cache_local=False,
-            )
+            contexts = self._search_unfiltered(subscribe)
         except Exception:
             logger.exception(f"重新搜索订阅 {sid} 的回刷资源失败")
             return False, "提交前重新搜索失败，未开始下载"
@@ -1167,6 +1202,7 @@ class SubscribeOverwatcher(_PluginBase):
                              f"{item.get('quality') or '?'} {item.get('resolution') or '?'} "
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
+                    "page_url": public_page_url(item.get("page_url")),
                 }
                 for sid, entry in self._state["entries"].items()
                 if entry.get("status") == "pending"
@@ -1241,7 +1277,7 @@ class SubscribeOverwatcher(_PluginBase):
                 col(info(
                     "开启全集确认后，新剧集暂停；关闭后，分集下载仍会拦截，"
                     "仅覆盖整季且符合原规则的种子可自动下载。撤销批准后始终暂停。"
-                    "E01 候选每 4 小时更新。"
+                    "目标季候选每 4 小时更新。"
                 ), md=6),
                 col(info(managed_summary), md=6),
             ),
@@ -1306,11 +1342,10 @@ class SubscribeOverwatcher(_PluginBase):
 
     def get_page(self) -> list[dict[str, Any]]:
         """
-        展示待确认和已批准订阅、候选规格及最近操作状态。
+        展示待确认和已批准订阅、候选规格及当前管理状态。
         """
         with self._lock:
             entries = copy.deepcopy(list(self._state["entries"].items()))
-            last_confirmation = copy.deepcopy(self._state.get("last_confirmation"))
         current = {str(item.id): item for item in self._subscribes.list()}
         active_entries = [
             (sid, entry, subscribe)
@@ -1325,11 +1360,6 @@ class SubscribeOverwatcher(_PluginBase):
         pending = [(sid, entry) for sid, entry, _subscribe in active_entries if entry["status"] == "pending"]
         approved = [(sid, entry) for sid, entry, _subscribe in active_entries if entry["status"] == "approved"]
         page: list[dict[str, Any]] = []
-        if last_confirmation:
-            page.append({"component": "VAlert", "props": {
-                "type": "success" if last_confirmation.get("success") else "error",
-                "text": last_confirmation.get("message") or "",
-            }})
         managed_rows = []
         for sid, entry, subscribe in active_entries:
             managed_rows.append({"component": "tr", "content": [
@@ -1341,7 +1371,8 @@ class SubscribeOverwatcher(_PluginBase):
             ]})
         page.append({"component": "VAlert", "props": {
             "type": "info", "variant": "tonal",
-            "text": f"已纳入管理 {len(managed_rows)} 条剧集订阅；下表显示当前状态和订阅进度。",
+            "text": (f"当前管理 {len(managed_rows)} 条剧集订阅；下表显示当前状态和订阅进度。"
+                     if managed_rows else "当前没有纳入管理的剧集订阅。"),
         }})
         if managed_rows:
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
@@ -1353,13 +1384,13 @@ class SubscribeOverwatcher(_PluginBase):
             ]})
         if not pending:
             page.append({"component": "VAlert", "props": {
-                "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集全集和 E01 候选。",
+                "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集首集和整季候选。",
             }})
         for sid, entry in pending:
             page.append({"component": "VAlert", "props": {
                 "type": "info", "variant": "tonal",
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
-                        f"候选 {len(entry.get('candidates') or [])} 个 · "
+                        f"候选 {len(entry.get('candidates') or [])} 个（含历史扫描记录） · "
                         f"最近扫描 {entry.get('last_scan') or '等待中'}"
                         + (" · 已撤销，等待重新批准" if entry.get("revoked") else "")
                         + (f" · 扫描错误：{entry['last_error']}" if entry.get("last_error") else ""),
@@ -1369,7 +1400,7 @@ class SubscribeOverwatcher(_PluginBase):
                     {"component": "td", "text": _candidate_label(item)},
                     {"component": "td", "text": _candidate_coverage(item)},
                     {"component": "td", "text": item.get("site_name") or str(item.get("site_id") or "?")},
-                    {"component": "td", "text": item.get("title") or ""},
+                    _resource_title_cell(item),
                     {"component": "td", "text": item.get("quality") or "?"},
                     {"component": "td", "text": item.get("resolution") or "?"},
                     {"component": "td", "text": item.get("effect") or "?"},
@@ -1381,7 +1412,7 @@ class SubscribeOverwatcher(_PluginBase):
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "覆盖", "站点", "资源", "质量", "分辨率", "特效", "制作组", "最后发现")
+                    for title in ("类型", "识别集号/目标总集数", "站点", "资源", "质量", "分辨率", "特效", "制作组", "最后发现")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})
@@ -1454,7 +1485,7 @@ class SubscribeOverwatcher(_PluginBase):
         text = f"当前有 {len(lines)} 条待确认订阅。"
         text += "\n" + "\n".join(lines) if lines else "\n暂无待确认的剧集订阅。"
         self.post_message(
-            mtype=MessageType.Subscribe,
+            mtype=MessageType.Plugin,
             title="剧集守门员：待确认订阅日报",
             text=text,
         )

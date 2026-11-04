@@ -29,7 +29,7 @@
           </v-row>
           <v-alert type="info" variant="tonal" density="compact" class="mt-3">
             开启全集确认后，新剧集暂停；关闭后仍拦截分集下载，只允许符合原规则的整季资源自动下载。
-            E01 候选每 4 小时更新。
+            目标季候选每 4 小时更新。
           </v-alert>
         </v-card-text>
         <v-card-actions class="px-4 pb-4">
@@ -64,9 +64,17 @@
         <v-card-title class="text-subtitle-1">候选规则确认</v-card-title>
         <v-card-text>
           <v-select v-model="form.candidate" label="选择一个版本（全集优先）" :items="options.candidate"
-            clearable density="comfortable" hide-details class="mb-4" />
+            clearable density="comfortable" hide-details />
+          <p class="text-caption text-medium-emphasis mt-2 mb-4">
+            候选按媒体身份搜索目标季，跳过全局搜索规则组及本订阅的站点和筛选规则；只列出首集和整季，并保留历史扫描版本。
+            <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
+              class="text-primary text-decoration-underline ms-2">查看所选资源详情</a>
+          </p>
           <v-textarea v-model="form.rule_json" label="草稿规则 JSON；留空使用候选规格"
             rows="3" auto-grow density="comfortable" hide-details />
+          <p class="text-caption text-medium-emphasis mt-2 mb-0">
+            可回填质量、分辨率、特效、包含、排除和站点；标题同时包含制作组和自定义标识时，会将两者组合成包含规则。未识别的字段保留原值，预览核对基础规则，正式追更仍应用订阅规则组。
+          </p>
           <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
             density="compact" class="mt-3">{{ feedback.text }}</v-alert>
         </v-card-text>
@@ -159,7 +167,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
@@ -193,6 +201,10 @@ const managedSummary = ref('正在读取已纳入管理的剧集…')
 const loading = ref(true)
 const busy = ref('')
 const feedback = reactive({ section: '', type: 'info', text: '' })
+const selectedCandidateUrl = computed(() => {
+  const url = options.candidate.find(item => item.value === form.candidate)?.page_url
+  return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : ''
+})
 
 watch(() => form.candidate, (candidate, previous) => {
   if (previous && candidate !== previous) form.rule_json = ''

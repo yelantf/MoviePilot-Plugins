@@ -1,12 +1,19 @@
 """
-从首集搜索结果提取可保存的候选信息和订阅规则。
+从目标季搜索结果提取可保存的候选信息和订阅规则。
 
-只保存展示与回填所需的字段，不保存种子链接、站点 Cookie 或完整搜索上下文。
+只保存展示与回填所需的字段及不含访问票据的详情页地址，不保存种子下载链接、站点 Cookie 或完整搜索上下文。
 """
 
 import hashlib
 import re
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+
+_PAGE_ID_KEYS = {"id", "tid", "torrentid", "torrent_id"}
+_SECRET_PATH_SEGMENT = re.compile(
+    r"^(?:(?=[0-9]*[A-Fa-f])[0-9A-Fa-f]{16,}|(?=.*[0-9])(?=.*[A-Za-z])[A-Za-z0-9]{24,})$"
+)
 
 
 def _short(value: Any, limit: int = 100) -> str:
@@ -14,6 +21,43 @@ def _short(value: Any, limit: int = 100) -> str:
     将搜索结果中的展示字段限制到固定长度。
     """
     return str(value or "").strip()[:limit]
+
+
+def public_page_url(page_url: Any, enclosure: Any = None) -> Optional[str]:
+    """从宿主的资源详情页地址中移除访问票据，不保存下载地址。"""
+    if not isinstance(page_url, str):
+        return None
+    value = page_url.strip()
+    if not value or len(value) > 2048 or any(char.isspace() or ord(char) < 32 for char in value):
+        return None
+    if isinstance(enclosure, str) and value == enclosure.strip():
+        return None
+    try:
+        parts = urlsplit(value)
+        if parts.scheme.lower() not in {"http", "https"} or not parts.hostname \
+                or parts.username is not None or parts.password is not None or parts.port == 0:
+            return None
+    except ValueError:
+        return None
+    segments = [segment.split(".", 1)[0] for segment in parts.path.split("/") if segment]
+    if any(_SECRET_PATH_SEGMENT.fullmatch(segment) for segment in segments):
+        return None
+    if any(segment.lower() in {"download", "dl", "gettorrent"} for segment in segments) \
+            or parts.path.lower().endswith((".torrent", "/download.php", "/dl.php", "/gettorrent.php")):
+        return None
+    query = []
+    for key, item in parse_qsl(parts.query, keep_blank_values=True):
+        name = key.lower()
+        if name in _PAGE_ID_KEYS and re.fullmatch(r"\d{1,20}", item):
+            query.append((key, item))
+        elif name in {"hit", "https"} and item in {"0", "1"}:
+            query.append((key, item))
+        elif name == "type" and re.fullmatch(r"[A-Za-z0-9_-]{1,20}", item):
+            query.append((key, item))
+    fragment = parts.fragment if re.fullmatch(r"/[A-Za-z0-9/_-]*", parts.fragment) else ""
+    if parts.path in {"", "/"} and not query and not fragment:
+        return None
+    return urlunsplit((parts.scheme.lower(), parts.netloc, parts.path or "/", urlencode(query), fragment))
 
 
 def _matching_pattern(value: Any, title: str, patterns: tuple[tuple[str, str], ...]) -> Optional[str]:
@@ -32,7 +76,7 @@ def _matching_pattern(value: Any, title: str, patterns: tuple[tuple[str, str], .
 
 def _effect_pattern(value: Any, title: str) -> Optional[str]:
     """
-    优先选择首集标题中可验证的特效标识。
+    优先选择资源标题中可验证的画面或音效标识。
     """
     return _matching_pattern(
         value,
@@ -41,6 +85,8 @@ def _effect_pattern(value: Any, title: str) -> Optional[str]:
             (r"Dolby.?Vision|DoVi|\bDV\b", r"Dolby[ ._-]?Vision|DoVi|(?:^|[ ._\[-])DV(?:$|[ ._\]-])"),
             (r"HDR10\+|HDR10Plus", r"HDR10\+|HDR10Plus"),
             (r"HDR", r"HDR"),
+            (r"Dolby.?Atmos|Atmos", r"Dolby[ ._-]?Atmos|Atmos"),
+            (r"SDR", r"(?:^|[ ._\[-])SDR(?:$|[ ._\]-])"),
         ),
     )
 
@@ -101,7 +147,7 @@ def resource_candidate(
     context: Any, season: int, seen_at: str, total_episode: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    从搜索结果生成安全的 E01 或完整季候选快照。
+    从搜索结果生成安全的目标季候选快照。
 
     :param context: 宿主返回的资源上下文
     :param season: 订阅季数
@@ -129,11 +175,16 @@ def resource_candidate(
     effect = _short(getattr(meta, "resource_effect", None), 80)
     team = _short(getattr(meta, "resource_team", None), 80)
     customization = _short(getattr(meta, "customization", None), 80)
-    include_word = next(
-        (word for word in (team, customization) if word and re.search(re.escape(word), title, re.I)),
-        None,
-    )
-    include = re.escape(include_word) if include_word else None
+    has_team = bool(team and re.search(re.escape(team), title, re.I))
+    has_customization = bool(customization and re.search(re.escape(customization), title, re.I))
+    if has_team and has_customization and team.casefold() != customization.casefold():
+        include = f"(?=.*{re.escape(customization)})(?=.*{re.escape(team)})"
+    elif has_team:
+        include = re.escape(team)
+    elif has_customization:
+        include = re.escape(customization)
+    else:
+        include = None
     return {
         "id": digest,
         "kind": kind,
@@ -142,6 +193,7 @@ def resource_candidate(
         "title": title,
         "site_id": site_id,
         "site_name": _short(getattr(torrent, "site_name", None), 80),
+        "page_url": public_page_url(getattr(torrent, "page_url", None), getattr(torrent, "enclosure", None)),
         "size_bytes": size_bytes,
         "pubdate": _short(getattr(torrent, "pubdate", None), 40),
         "quality": quality,
@@ -155,15 +207,21 @@ def resource_candidate(
                     (r"WEB.?DL|WEB.?RIP", r"WEB[- .]?(?:DL|RIP)"),
                     (r"REMUX", r"REMUX"),
                     (r"Blu.?Ray", r"Blu[- .]?Ray|BluRay"),
+                    (r"UHD|Ultra.?HD", r"UHD|Ultra[- .]?HD"),
                     (r"HDTV", r"HDTV"),
+                    (r"MiniBD", r"MiniBD"),
+                    (r"BDRIP", r"BD[- .]?RIP"),
+                    (r"HEVC|[Hx].?265", r"HEVC|[Hx][ ._-]?265"),
+                    (r"AVC|[Hx].?264", r"AVC|[Hx][ ._-]?264"),
                 ),
             ),
             "resolution": _matching_pattern(
                 resolution, title,
                 (
-                    (r"2160|4K", r"2160[pi]?|4K"),
-                    (r"1080", r"1080[pi]?"),
-                    (r"720", r"720[pi]?"),
+                    (r"2160|4K", r"2160[pi]?|4K|x2160"),
+                    (r"1080", r"1080[pi]?|x1080"),
+                    (r"720", r"720[pi]?|x720"),
+                    (r"480", r"480[pi]?|x480"),
                 ),
             ),
             "effect": _effect_pattern(effect, title),
@@ -191,6 +249,7 @@ def merge_candidates(
         previous = merged.get(candidate["id"])
         if previous:
             candidate["first_seen"] = previous.get("first_seen") or candidate["first_seen"]
+            candidate["page_url"] = candidate.get("page_url") or public_page_url(previous.get("page_url"))
         merged[candidate["id"]] = candidate
     kind_order = {"full_season": 2, "suspected_full": 1, "first_episode": 0}
     return sorted(
