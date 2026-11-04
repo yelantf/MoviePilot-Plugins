@@ -1285,11 +1285,15 @@ def test_complete_and_cross_season_candidates_are_shown_before_first_episode(plu
     candidate_table = next(item for item in plugin.get_page()
                            if item["component"] == "VTable"
                            and "最后发现" in json.dumps(item, ensure_ascii=False))
-    links = [cell["content"][0] for row in candidate_table["content"][1]["content"]
-             for cell in row["content"] if cell.get("content")]
+    links = [node for row in candidate_table["content"][1]["content"]
+             for cell in row["content"] for node in cell.get("content", [])
+             if node["component"] == "a"]
     assert len(links) == 1
+    assert links[0]["text"] == "样例站"
     assert links[0]["props"]["href"] == "https://tracker.example/details.php?id=1080"
     assert links[0]["props"]["rel"] == "noopener noreferrer"
+    assert all(row["content"][3].get("content") is None
+               for row in candidate_table["content"][1]["content"])
 
 
 def test_cross_season_candidate_requires_target_season_and_preview_keeps_uncertainty(plugin_host):
@@ -1374,6 +1378,7 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert {item["props"]["href"] for item in site_links} == {
         "https://one.example/details.php?id=11", "https://two.example/details.php?id=22",
     }
+    assert rows[0]["content"][3] == {"component": "td", "text": title}
 
     choice = next(item["value"] for item in choices if "另一个站" in item["title"])
     assert plugin.preview_candidate(choice, '{"sites": []}')[0] is True
@@ -1383,6 +1388,10 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
                          if item["component"] == "VTable"
                          and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
     assert len(preview_table["content"][1]["content"]) == 1
+    assert len([node for node in preview_table["content"][1]["content"][0]["content"][3]["content"]
+                if node["component"] == "a"]) == 2
+    assert preview_table["content"][1]["content"][0]["content"][4] == \
+        {"component": "td", "text": title}
     assert plugin.preview_candidate(choice)[0] is True
     assert plugin.confirm_candidate(choice)[0] is True
     assert host.subscriptions[2].sites == [7]
@@ -1470,8 +1479,10 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     preview_table = next(item for item in plugin.get_page()
                          if item["component"] == "VTable"
                          and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
-    assert preview_table["content"][1]["content"][0]["content"][4]["content"][0]["props"]["href"] == \
+    assert preview_table["content"][1]["content"][0]["content"][3]["content"][0]["props"]["href"] == \
         "https://tracker.example/details.php?id=1"
+    assert preview_table["content"][1]["content"][0]["content"][4] == \
+        {"component": "td", "text": chosen.torrent_info.title}
 
     success, message = plugin.confirm_candidate(choice, draft.replace("1080", "2160"))
     assert success is False

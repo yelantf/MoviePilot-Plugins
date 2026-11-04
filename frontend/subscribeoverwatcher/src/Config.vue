@@ -76,8 +76,9 @@
           <p class="text-caption text-medium-emphasis mt-2 mb-4">
             候选按媒体身份搜索后筛选包含目标季的资源，跳过全局搜索规则组及本订阅的站点和筛选规则；列出首集、整季及跨季资源，并保留历史扫描版本。
             详情页将同标题、同大小且解析规格一致的跨站资源合并展示；这里仍逐站点选择。
+            <span v-if="selectedCandidateUrl" class="ms-2">站点详情：</span>
             <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
-              class="text-primary text-decoration-underline ms-2">查看所选资源详情</a>
+              class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>
           </p>
           <v-textarea v-model="form.rule_json" label="草稿规则 JSON；留空使用候选规格"
             rows="3" auto-grow density="comfortable" hide-details />
@@ -214,10 +215,12 @@ const managedSummary = ref('正在读取已纳入管理的剧集…')
 const loading = ref(true)
 const busy = ref('')
 const feedback = reactive({ section: '', type: 'info', text: '' })
+const selectedCandidate = computed(() => options.candidate.find(item => item.value === form.candidate))
 const selectedCandidateUrl = computed(() => {
-  const url = options.candidate.find(item => item.value === form.candidate)?.page_url
+  const url = selectedCandidate.value?.page_url
   return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : ''
 })
+const selectedCandidateSite = computed(() => selectedCandidate.value?.site_name || '所选站点')
 
 watch(() => form.candidate, (candidate, previous) => {
   if (previous && candidate !== previous) form.rule_json = ''

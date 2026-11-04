@@ -110,7 +110,8 @@ describe('custom configuration actions', () => {
     const data = snapshot({ managed: '尚无已纳入管理的剧集订阅。', historical: [] })
     data.conf[0].content.push({ component: 'VSelect', props: {
       model: 'candidate', items: [{
-        title: '样例资源', value: '1:resource', page_url: 'https://tracker.example/details.php?id=42',
+        title: '样例资源', value: '1:resource', site_name: '样例站',
+        page_url: 'https://tracker.example/details.php?id=42',
       }],
     } })
     data.model.candidate = '1:resource'
@@ -120,7 +121,7 @@ describe('custom configuration actions', () => {
     await flushPromises()
 
     const link = wrapper.find('a')
-    expect(link.text()).toBe('查看所选资源详情')
+    expect(link.text()).toBe('样例站')
     expect(link.attributes()).toMatchObject({
       href: 'https://tracker.example/details.php?id=42',
       target: '_blank', rel: 'noopener noreferrer',
@@ -135,9 +136,10 @@ describe('custom configuration actions', () => {
           { component: 'tr', content: [
             { component: 'td', text: '样例剧 S01' },
             { component: 'td', content: [{
-              component: 'a', text: '查看资源',
+              component: 'a', text: '样例站',
               props: { href: 'https://tracker.example/details.php?id=42', target: '_blank' },
             }] },
+            { component: 'td', text: '资源标题' },
           ] },
         ] },
       ] },
@@ -147,6 +149,7 @@ describe('custom configuration actions', () => {
 
     expect(wrapper.text()).toContain('已纳入管理 1 条剧集订阅')
     expect(wrapper.text()).toContain('样例剧 S01')
+    expect(wrapper.text()).toContain('资源标题')
     expect(wrapper.find('a').attributes('href')).toBe('https://tracker.example/details.php?id=42')
   })
 })

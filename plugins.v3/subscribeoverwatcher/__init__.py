@@ -181,21 +181,6 @@ def _progress_label(subscribe: Any) -> str:
     return f"{kind} {completed}/{total} 集"
 
 
-def _resource_title_cell(item: dict[str, Any]) -> dict[str, Any]:
-    """详情地址可用时将资源标题显示为站点详情页链接。"""
-    title = item.get("title") or ""
-    url = public_page_url(item.get("page_url"))
-    if not url:
-        return {"component": "td", "text": title}
-    return {"component": "td", "content": [{
-        "component": "a", "text": title,
-        "props": {
-            "href": url, "target": "_blank", "rel": "noopener noreferrer",
-            "title": "打开站点详情页", "class": "text-primary text-decoration-underline",
-        },
-    }]}
-
-
 def _display_groups(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """仅在展示时合并同标题、同大小且解析规格一致的跨站资源。"""
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
@@ -224,10 +209,7 @@ def _display_groups(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 
 
 def _site_cell(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """一行跨站资源显示所有来源，并把可用的站点名链接到详情页。"""
-    if len(items) == 1:
-        item = items[0]
-        return {"component": "td", "text": item.get("site_name") or str(item.get("site_id") or "?")}
+    """单站或跨站资源都在站点名上显示详情链接。"""
     content = []
     for index, item in enumerate(items):
         if index:
@@ -262,7 +244,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
             {"component": "td", "text": _candidate_label(item)},
             {"component": "td", "text": _candidate_coverage(item)},
             _site_cell(group),
-            _resource_title_cell(item) if len(group) == 1 else {"component": "td", "text": item.get("title") or ""},
+            {"component": "td", "text": item.get("title") or ""},
             {"component": "td", "text": item.get("reason") or "符合当前规则"},
         ]}
         for accepted, items in ((True, preview.get("matched") or []), (False, preview.get("rejected") or []))
@@ -289,7 +271,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1308,6 +1290,7 @@ class SubscribeOverwatcher(_PluginBase):
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
                     "page_url": public_page_url(item.get("page_url")),
+                    "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
                 }
                 for sid, entry in self._state["entries"].items()
                 if entry.get("status") == "pending"
@@ -1512,7 +1495,7 @@ class SubscribeOverwatcher(_PluginBase):
                     {"component": "td", "text": _candidate_label(item)},
                     {"component": "td", "text": _candidate_coverage(item)},
                     _site_cell(group),
-                    _resource_title_cell(item) if len(group) == 1 else {"component": "td", "text": item.get("title") or ""},
+                    {"component": "td", "text": item.get("title") or ""},
                     {"component": "td", "text": item.get("quality") or "?"},
                     {"component": "td", "text": item.get("resolution") or "?"},
                     {"component": "td", "text": item.get("effect") or "?"},
