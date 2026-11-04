@@ -9,7 +9,7 @@ import re
 from hashlib import sha256
 from typing import Any, Optional
 
-from .rules import public_page_url, resource_candidate
+from .rules import public_page_url, resource_candidate, target_seasons
 
 
 RULE_FIELDS = ("quality", "resolution", "effect", "include", "exclude", "sites")
@@ -99,14 +99,14 @@ def preview_resource(context: Any, season: int, total_episode: Optional[int], se
         return None
     if getattr(context, "match_status", None) not in (None, "exact"):
         return None
-    seasons = getattr(meta, "season_list", None) or [1]
-    if seasons != [season] or getattr(meta, "begin_season", None) not in (None, season) \
-            or getattr(meta, "end_season", None) not in (None, season):
+    seasons = target_seasons(meta, season)
+    if not seasons:
         return None
     candidate = resource_candidate(context, season, seen_at, total_episode)
     if candidate:
         return {key: candidate[key] for key in (
-            "id", "kind", "episodes", "total_episode", "title", "site_id", "site_name", "size_bytes",
+            "id", "kind", "seasons", "target_season", "episodes", "total_episode",
+            "title", "site_id", "site_name", "size_bytes",
             "page_url", "quality", "resolution", "effect", "team",
         )}
     title = str(getattr(torrent, "title", None) or "").strip()[:240]
@@ -120,7 +120,8 @@ def preview_resource(context: Any, season: int, total_episode: Optional[int], se
                        if isinstance(item, int) and not isinstance(item, bool) and item > 0})
     return {
         "id": sha256(f"{site_id}|{title}|{size_bytes}".encode("utf-8")).hexdigest()[:20],
-        "kind": "episode", "episodes": episodes, "total_episode": total_episode,
+        "kind": "episode", "seasons": seasons, "target_season": season,
+        "episodes": episodes, "total_episode": total_episode,
         "title": title, "site_id": site_id,
         "site_name": str(getattr(torrent, "site_name", None) or "")[:80],
         "page_url": public_page_url(getattr(torrent, "page_url", None), getattr(torrent, "enclosure", None)),

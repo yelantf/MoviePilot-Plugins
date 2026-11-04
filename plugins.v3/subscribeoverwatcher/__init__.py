@@ -18,7 +18,6 @@ from app.chain.subscribe import SubscribeChain
 from app.db.oper.subscribe import SubscribeOper
 from app.plugins import _PluginBase
 from app.schemas.media import build_media_key, resolve_media_identity
-from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import ChainEventType, EventType, MediaSource, MediaType, MessageType
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
@@ -27,6 +26,7 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 from .preview import normalize_draft_rules, parse_episode_selection, preview_resource
 from .rules import (
     candidate_is_eligible, is_complete_season_download, merge_candidates, public_page_url, resource_candidate,
+    target_seasons,
 )
 
 
@@ -70,6 +70,8 @@ def _candidate_label(candidate: dict[str, Any]) -> str:
     kind = candidate.get("kind")
     if kind == "full_season":
         return "识别集数覆盖全集"
+    if kind == "cross_season":
+        return "跨季资源（含目标季）"
     if kind == "suspected_full":
         return "标题疑似整季"
     if kind == "episode":
@@ -81,6 +83,11 @@ def _candidate_coverage(candidate: dict[str, Any]) -> str:
     """
     显示标题解析出的具体集号；不把不连续的集号写成完整范围。
     """
+    if candidate.get("kind") == "cross_season":
+        seasons = candidate.get("seasons") or []
+        labels = "、".join(f"S{number:02d}" for number in seasons
+                          if isinstance(number, int) and not isinstance(number, bool) and number >= 0)
+        return f"{labels or '跨季'}（各季集数待核实）"
     episodes = sorted({episode for episode in candidate.get("episodes") or []
                        if isinstance(episode, int) and not isinstance(episode, bool) and episode > 0})
     total = candidate.get("total_episode")
@@ -204,6 +211,7 @@ def _display_groups(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
                 if isinstance(episodes, (list, tuple, set)) else ()
             key = (
                 "version", title, size, item.get("kind"), episode_key, item.get("total_episode"),
+                tuple(item.get("seasons") or []) if item.get("kind") == "cross_season" else (),
                 item.get("quality"), item.get("resolution"), item.get("effect"), item.get("team"),
                 item.get("reason"),
             )
@@ -281,7 +289,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.2"
+    plugin_version = "1.5.3"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -696,7 +704,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def _scan_one(self, sid: int) -> None:
         """
-        搜索一条待确认订阅的首集和整季资源，并保留历史候选。
+        搜索一条待确认订阅的首集、整季及含目标季的跨季资源，并保留历史候选。
         """
         subscribe = self._subscribes.get(sid)
         if not subscribe:
@@ -737,7 +745,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     @staticmethod
     def _search_unfiltered(subscribe: Any) -> list[Any]:
-        """按媒体身份搜索目标季，跳过全局规则组和订阅筛选条件。"""
+        """按媒体身份搜索各季，再保留包含目标季的资源。"""
         media = MediaChain().recognize_media(
             media_source=MediaSource(subscribe.media_source),
             media_id=str(subscribe.media_id), mtype=MediaType.TV,
@@ -746,15 +754,21 @@ class SubscribeOverwatcher(_PluginBase):
             return []
         target = copy.copy(media)
         season = subscribe.season or 1
-        target.season = season
+        # 宿主的目标季过滤要求种子的所有季均等于目标季，会先剔除跨季包。
+        # 取消该过滤，并在搜索结果处理中先按目标季筛选，保持别名搜索的命中判断准确。
+        target.season = None
         media_source, media_id = resolve_media_identity(media=target)
         media_key = build_media_key(media_source, media_id)
         if not media_key:
             return []
         return SearchChain().process(
             mediainfo=target,
-            no_exists={media_key: {season: NotExistMediaInfo(episodes=[])}},
             rule_groups=[],
+            candidate_filter=lambda contexts: [
+                context for context in contexts
+                if getattr(context, "match_status", None) in (None, "exact")
+                and target_seasons(getattr(context, "meta_info", None), season)
+            ],
         )
 
     @staticmethod
@@ -799,7 +813,9 @@ class SubscribeOverwatcher(_PluginBase):
                 continue
             if not item:
                 continue
-            if require_episodes and not item["episodes"]:
+            if require_episodes and item["kind"] == "cross_season":
+                reason = "跨季资源无法确定目标季集数，不能手动选集"
+            elif require_episodes and not item["episodes"]:
                 reason = "未明确识别集数，不能手动选集"
             else:
                 try:
@@ -811,7 +827,8 @@ class SubscribeOverwatcher(_PluginBase):
                 rejected.append(item)
             else:
                 matched.append(item)
-        priority = {"full_season": 3, "suspected_full": 2, "first_episode": 1, "episode": 0}
+        priority = {"full_season": 4, "cross_season": 3, "suspected_full": 2,
+                    "first_episode": 1, "episode": 0}
         matched.sort(key=lambda item: priority.get(item["kind"], 0), reverse=True)
         rejected.sort(key=lambda item: priority.get(item["kind"], 0), reverse=True)
         return {
@@ -1116,6 +1133,8 @@ class SubscribeOverwatcher(_PluginBase):
         if len(candidates) != 1:
             return False, "资源已消失或同名资源不唯一，请重新预览，未开始下载"
         context = candidates[0]
+        if len(target_seasons(context.meta_info, subscribe.season or 1)) != 1:
+            return False, "跨季资源无法确定目标季集数，未开始下载"
         recognized = {
             item for item in (getattr(context.meta_info, "episode_list", None) or [])
             if isinstance(item, int) and not isinstance(item, bool) and item > 0
@@ -1476,7 +1495,7 @@ class SubscribeOverwatcher(_PluginBase):
             ]})
         if not pending:
             page.append({"component": "VAlert", "props": {
-                "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集首集和整季候选。",
+                "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集首集、整季及含目标季的跨季候选。",
             }})
         for sid, entry in pending:
             groups = _display_groups(entry.get("candidates") or [])

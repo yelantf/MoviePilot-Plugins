@@ -108,7 +108,9 @@ def plugin_host(monkeypatch):
             记录未应用规则组的搜索并返回预置候选。
             """
             search_calls.append(kwargs)
-            return list(search_results)
+            contexts = list(search_results)
+            callback = kwargs.get("candidate_filter")
+            return callback(contexts) if callback else contexts
 
     class MediaChain:
         """返回与订阅身份对应的媒体信息。"""
@@ -348,8 +350,9 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     assert "secret.example" not in json.dumps(entry)
     assert "cookie-secret" not in json.dumps(entry)
     assert host.search_calls[0]["rule_groups"] == []
-    assert host.search_calls[0]["mediainfo"].season == 1
-    assert 1 in host.search_calls[0]["no_exists"]["themoviedb:123"]
+    assert host.search_calls[0]["mediainfo"].season is None
+    assert "no_exists" not in host.search_calls[0]
+    assert callable(host.search_calls[0]["candidate_filter"])
 
     choice = _form_items(plugin, "candidate")[0]["value"]
     plugin.init_plugin({"enabled": True, "candidate": choice, "operation": "preview"})
@@ -1241,9 +1244,9 @@ def test_reenable_does_not_adopt_subscriptions_created_while_disabled(plugin_hos
     assert ignored.event_data.cancel is False
 
 
-def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
+def test_complete_and_cross_season_candidates_are_shown_before_first_episode(plugin_host):
     """
-    核实全集优先，集数不明的全集标疑似，跨季包不纳入候选。
+    核实全集优先，含目标季的跨季包进入候选但不冒充目标季全集。
     """
     host = plugin_host
     host.subscriptions[1] = _subscribe(1)
@@ -1260,14 +1263,20 @@ def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
     suspect = _context("Show.S01.Complete.Unknown", episodes=(1, 2))
     cross_season = _context("Show.S01-S02.Complete", episodes=tuple(range(1, 9)))
     cross_season.meta_info.season_list = [1, 2]
-    host.search_results.extend([first, full_1080, full_2160, suspect, cross_season])
+    cross_season.meta_info.end_season = 2
+    other_season = _context("Show.S03.Complete", episodes=tuple(range(1, 9)))
+    other_season.meta_info.begin_season = 3
+    other_season.meta_info.season_list = [3]
+    host.search_results.extend([first, full_1080, full_2160, suspect, cross_season, other_season])
 
     plugin.refresh_candidates()
     candidates = host.storage["gate_state"]["entries"]["2"]["candidates"]
     assert [item["kind"] for item in candidates] == [
-        "full_season", "full_season", "suspected_full", "first_episode",
+        "full_season", "full_season", "cross_season", "suspected_full", "first_episode",
     ]
     assert all(item["episodes"] == list(range(1, 9)) for item in candidates[:2])
+    assert candidates[2]["seasons"] == [1, 2]
+    assert "各季集数待核实" in host.module._candidate_coverage(candidates[2])
     assert "secret.example" not in json.dumps(candidates)
     assert "集数覆盖全集" in _form_items(plugin, "candidate")[0]["title"]
     assert next(item["page_url"] for item in _form_items(plugin, "candidate")
@@ -1281,6 +1290,55 @@ def test_complete_season_candidates_are_shown_before_first_episode(plugin_host):
     assert len(links) == 1
     assert links[0]["props"]["href"] == "https://tracker.example/details.php?id=1080"
     assert links[0]["props"]["rel"] == "noopener noreferrer"
+
+
+def test_cross_season_candidate_requires_target_season_and_preview_keeps_uncertainty(plugin_host):
+    """跨季包可供目标季选择，但不借混合集号断言该季全集。"""
+    rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
+    preview = importlib.import_module(f"{plugin_host.module.__name__}.preview")
+    context = _context("Show.S01-S02.Complete", episodes=tuple(range(1, 9)))
+    context.meta_info.season_list = [1, 2]
+    context.meta_info.end_season = 2
+    first = rules.resource_candidate(context, 1, "now", total_episode=8)
+    second = rules.resource_candidate(context, 2, "now", total_episode=8)
+    assert first["kind"] == second["kind"] == "cross_season"
+    assert first["target_season"] == 1
+    assert second["target_season"] == 2
+    assert rules.resource_candidate(context, 3, "now", total_episode=8) is None
+    assert preview.preview_resource(context, 1, 8, "now")["kind"] == "cross_season"
+    context.meta_info.begin_season = 0
+    context.meta_info.season_list = [0, 1]
+    context.meta_info.end_season = 1
+    assert rules.resource_candidate(context, 1, "now", total_episode=8)["seasons"] == [0, 1]
+
+
+def test_cross_season_resource_is_not_eligible_for_manual_episode_replacement(plugin_host):
+    """跨季资源可作为订阅候选，不能用混合集号提交目标季单集回刷。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert plugin.approve_subscription(2)[0] is True
+    context = _context("Show.S01-S02.Complete", episodes=tuple(range(1, 9)))
+    context.meta_info.season_list = [1, 2]
+    context.meta_info.end_season = 2
+    host.search_results.append(context)
+
+    assert plugin.preview_replacements(2)[0] is True
+    preview = plugin._state["entries"]["2"]["replacement_preview"]
+    assert preview["matched_count"] == 0
+    assert preview["rejected_count"] == 1
+    assert "跨季资源无法确定目标季集数" in preview["rejected"][0]["reason"]
+    assert _form_items(plugin, "replace_resource") == []
+
+    # 旧预览即使错误地把跨季资源列为通过，提交前也必须再次拦截。
+    item = preview["rejected"][0]
+    preview["matched"] = [item]
+    preview["matched_count"] = 1
+    assert plugin.submit_replacement(f"2:{item['id']}", "1")[0] is False
+    assert host.downloads == []
 
 
 def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):

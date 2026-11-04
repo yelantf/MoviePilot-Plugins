@@ -119,13 +119,26 @@ def _episode_numbers(meta: Any) -> list[int]:
     return sorted({item for item in episodes if isinstance(item, int) and not isinstance(item, bool) and item > 0})
 
 
-def _single_target_season(meta: Any, season: int) -> bool:
+def target_seasons(meta: Any, season: int) -> list[int]:
     """
-    排除跨季包与目标季不一致的候选。
+    返回包含目标季且季数元数据自洽的资源季列表。
     """
-    seasons = getattr(meta, "season_list", None) or [1]
-    return seasons == [season] and getattr(meta, "begin_season", None) in (None, season) \
-        and getattr(meta, "end_season", None) in (None, season)
+    if meta is None:
+        return []
+    raw = getattr(meta, "season_list", None) or [1]
+    if not isinstance(raw, (list, tuple, set)) or any(
+        not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in raw
+    ):
+        return []
+    seasons = sorted(set(raw))
+    begin = getattr(meta, "begin_season", None)
+    end = getattr(meta, "end_season", None)
+    if season not in seasons or (begin is not None and begin not in seasons) \
+            or (end is not None and end not in seasons):
+        return []
+    if begin is not None and end is not None and begin > end:
+        return []
+    return seasons
 
 
 def _title_starts_after_first_episode(title: str) -> bool:
@@ -138,12 +151,16 @@ def _title_starts_after_first_episode(title: str) -> bool:
 
 def _candidate_kind(meta: Any, title: str, season: int, total_episode: Optional[int]) -> Optional[str]:
     """
-    区分识别集数覆盖全集、疑似全集和单集 E01。
+    区分跨季资源、识别集数覆盖全集、疑似全集和单集 E01。
     """
-    if not _single_target_season(meta, season):
+    seasons = target_seasons(meta, season)
+    if not seasons:
         return None
     if _title_starts_after_first_episode(title):
         return None
+    if len(seasons) > 1:
+        # 集号列表没有按季拆分，不能据此断言目标季覆盖全集或只有 E01。
+        return "cross_season"
     episodes = _episode_numbers(meta)
     if isinstance(total_episode, int) and not isinstance(total_episode, bool) and total_episode > 0:
         if set(range(1, total_episode + 1)).issubset(episodes):
@@ -192,6 +209,8 @@ def resource_candidate(
     torrent = getattr(context, "torrent_info", None)
     if torrent is None or meta is None:
         return None
+    if getattr(context, "match_status", None) not in (None, "exact"):
+        return None
     title = _short(getattr(torrent, "title", None), 240)
     if not title:
         return None
@@ -221,6 +240,8 @@ def resource_candidate(
     return {
         "id": digest,
         "kind": kind,
+        "seasons": target_seasons(meta, season),
+        "target_season": season,
         "episodes": _episode_numbers(meta),
         "total_episode": total_episode if isinstance(total_episode, int) and total_episode > 0 else None,
         "title": title,
@@ -286,7 +307,7 @@ def merge_candidates(
             candidate["first_seen"] = previous.get("first_seen") or candidate["first_seen"]
             candidate["page_url"] = candidate.get("page_url") or public_page_url(previous.get("page_url"))
         merged[candidate["id"]] = candidate
-    kind_order = {"full_season": 2, "suspected_full": 1, "first_episode": 0}
+    kind_order = {"full_season": 3, "cross_season": 2, "suspected_full": 1, "first_episode": 0}
     return sorted(
         merged.values(),
         key=lambda item: (kind_order.get(item.get("kind"), 0), item.get("last_seen") or ""),
