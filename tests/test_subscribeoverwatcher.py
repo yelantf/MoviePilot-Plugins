@@ -1362,7 +1362,7 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     third.torrent_info.site = 9
     third.torrent_info.site_name = "第三个站"
     first.torrent_info.size = second.torrent_info.size = 1024 ** 3
-    third.torrent_info.size = 2 * 1024 ** 3
+    third.torrent_info.size = 1024 ** 3 + 1
     host.search_results.extend([first, second, third])
     plugin.refresh_candidates()
 
@@ -1387,7 +1387,7 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert len(choices) == 3
     assert all("1.00 GiB（1,073,741,824 B）" in item["title"]
                for item in choices if "第三个站" not in item["title"])
-    assert "2.00 GiB（2,147,483,648 B）" in next(
+    assert "1.00 GiB（1,073,741,825 B）" in next(
         item["title"] for item in choices if "第三个站" in item["title"]
     )
     assert host.module._size_label(1024 ** 3, exact=True) != \
@@ -1397,10 +1397,14 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
                            and "最后发现" in json.dumps(item, ensure_ascii=False))
     rows = candidate_table["content"][1]["content"]
     assert len(rows) == 2
-    grouped_row = next(row for row in rows if row["content"][4]["text"] == "1.00 GiB")
-    other_row = next(row for row in rows if row["content"][4]["text"] == "2.00 GiB")
+    grouped_row = next(row for row in rows
+                       if row["content"][4]["content"][1]["text"] == "1,073,741,824 B")
+    other_row = next(row for row in rows
+                     if row["content"][4]["content"][1]["text"] == "1,073,741,825 B")
+    assert grouped_row["content"][4]["content"][0]["text"] == "1.00 GiB"
+    assert other_row["content"][4]["content"][0]["text"] == "1.00 GiB"
     assert grouped_row["content"][4]["props"]["title"] == "精确大小：1,073,741,824 B"
-    assert other_row["content"][4]["props"]["title"] == "精确大小：2,147,483,648 B"
+    assert other_row["content"][4]["props"]["title"] == "精确大小：1,073,741,825 B"
     site_links = [item for item in grouped_row["content"][2]["content"] if item["component"] == "a"]
     assert {item["props"]["href"] for item in site_links} == {
         "https://one.example/details.php?id=11", "https://two.example/details.php?id=22",
@@ -1418,8 +1422,11 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
                          and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
     preview_rows = preview_table["content"][1]["content"]
     assert len(preview_rows) == 2
-    grouped_preview = next(row for row in preview_rows if row["content"][5]["text"] == "1.00 GiB")
-    assert any(row["content"][5]["text"] == "2.00 GiB" for row in preview_rows)
+    grouped_preview = next(row for row in preview_rows
+                           if row["content"][5]["content"][1]["text"] == "1,073,741,824 B")
+    assert any(row["content"][5]["content"][1]["text"] == "1,073,741,825 B"
+               for row in preview_rows)
+    assert all(row["content"][5]["content"][0]["text"] == "1.00 GiB" for row in preview_rows)
     assert grouped_preview["content"][5]["props"]["title"] == "精确大小：1,073,741,824 B"
     assert len([node for node in grouped_preview["content"][3]["content"]
                 if node["component"] == "a"]) == 2

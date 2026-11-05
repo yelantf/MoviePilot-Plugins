@@ -75,7 +75,7 @@
           </v-row>
           <p class="text-caption text-medium-emphasis mt-2 mb-4">
             候选按媒体身份搜索后筛选包含目标季的资源，跳过全局搜索规则组及本订阅的站点和筛选规则；列出首集、整季及跨季资源，并保留历史扫描版本。
-            候选选择项显示种子大小和精确字节数，详情页的大小可悬停查看字节数。跨站资源只在标题、字节大小、集数和解析规格一致时合并展示；这里仍逐站点选择。
+            候选选择项和详情页均显示种子大小及精确字节数。跨站资源只在标题、字节大小、集数和解析规格一致时合并展示；这里仍逐站点选择。
             <span v-if="selectedCandidateUrl" class="ms-2">站点详情：</span>
             <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
               class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>

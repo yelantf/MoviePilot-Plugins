@@ -120,12 +120,19 @@ def _size_label(size_bytes: Any, *, exact: bool = False) -> str:
 
 
 def _size_cell(item: dict[str, Any]) -> dict[str, Any]:
-    """详情表格显示易读大小，悬停可核对合并所用的精确字节数。"""
+    """详情表格同时显示易读大小和合并所用的精确字节数。"""
     size = item.get("size_bytes")
-    cell = {"component": "td", "text": _size_label(size)}
-    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
-        cell["props"] = {"title": f"精确大小：{size:,} B"}
-    return cell
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return {"component": "td", "text": "未知"}
+    props = {"title": f"精确大小：{size:,} B"}
+    if size < 1024:
+        return {"component": "td", "text": f"{size} B", "props": props}
+    return {"component": "td", "props": props, "content": [
+        {"component": "div", "text": _size_label(size), "props": {"style": "white-space: nowrap"}},
+        {"component": "div", "text": f"{size:,} B", "props": {
+            "class": "text-caption text-medium-emphasis", "style": "white-space: nowrap",
+        }},
+    ]}
 
 
 def _draft_rules(candidate: dict[str, Any], raw: str, mode: str) -> dict[str, Any]:
@@ -294,7 +301,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.5"
+    plugin_version = "1.5.6"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
