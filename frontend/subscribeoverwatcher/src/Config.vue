@@ -60,15 +60,24 @@
         </v-card-actions>
       </v-card>
 
-      <v-card variant="outlined" class="mb-4">
+      <v-card ref="candidateCard" variant="outlined" class="mb-4">
         <v-card-title class="text-subtitle-1">候选规则确认</v-card-title>
         <v-card-text>
+          <v-alert v-if="handoffNotice" type="info" variant="tonal" density="compact" class="mb-4">
+            {{ handoffNotice }}
+          </v-alert>
           <v-row>
-            <v-col cols="12" md="8">
-              <v-select v-model="form.candidate" label="选择一个版本（全集优先）" :items="options.candidate"
-                clearable density="comfortable" hide-details />
-            </v-col>
             <v-col cols="12" md="4">
+              <v-select v-model="form.candidate_subscription" label="选择有版本的剧集"
+                :items="options.candidate_subscription" clearable density="comfortable" hide-details
+                no-data-text="暂无有版本的待确认剧集" @update:model-value="selectCandidateSubscription" />
+            </v-col>
+            <v-col cols="12" md="5">
+              <v-select v-model="form.candidate" label="选择该剧集版本（全集优先）" :items="candidateChoices"
+                :disabled="!form.candidate_subscription" clearable density="comfortable" hide-details
+                @update:model-value="selectCandidate" />
+            </v-col>
+            <v-col cols="12" md="3">
               <v-select v-model="form.rule_mode" label="站点范围" :items="ruleModes"
                 density="comfortable" hide-details @update:model-value="clearRuleDraft" />
             </v-col>
@@ -91,9 +100,9 @@
         <v-card-actions class="px-4 pb-4 flex-wrap ga-2">
           <v-spacer />
           <v-btn color="info" variant="tonal" :loading="busy === 'preview'"
-            :disabled="!!busy || !form.candidate" @click="submit('preview')">预览匹配</v-btn>
+            :disabled="!!busy || !selectedCandidate" @click="submit('preview')">预览匹配</v-btn>
           <v-btn color="primary" variant="tonal" :loading="busy === 'confirm'"
-            :disabled="!!busy || !form.candidate" @click="submit('confirm')">确认并恢复</v-btn>
+            :disabled="!!busy || !selectedCandidate" @click="submit('confirm')">确认并恢复</v-btn>
         </v-card-actions>
       </v-card>
 
@@ -177,12 +186,14 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { CANDIDATE_SELECTION_EVENT, takeCandidateSelection } from './candidateSelection'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
   'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
-  'historical_subscription', 'candidate', 'rule_mode', 'rule_json', 'direct_subscription',
+  'historical_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json',
+  'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
 ]
 const sections = {
@@ -204,27 +215,47 @@ const emit = defineEmits(['switch'])
 const form = reactive({
   enabled: false, confirm_full_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
-  candidate: '', rule_mode: 'candidate', rule_json: '', direct_subscription: '', revoke_subscription: '',
+  candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_json: '',
+  direct_subscription: '', revoke_subscription: '',
   replace_subscription: '', replace_resource: '', replace_episodes: '',
 })
 const options = reactive({
-  notice_hour: [], notice_minute: [], historical_subscription: [], candidate: [],
+  notice_hour: [], notice_minute: [], historical_subscription: [],
+  candidate_subscription: [], candidate: [],
   direct_subscription: [], revoke_subscription: [], replace_subscription: [], replace_resource: [],
 })
 const managedSummary = ref('正在读取已纳入管理的剧集…')
 const loading = ref(true)
+const formReady = ref(false)
 const busy = ref('')
+const candidateCard = ref(null)
+const handoffNotice = ref('')
 const feedback = reactive({ section: '', type: 'info', text: '' })
-const selectedCandidate = computed(() => options.candidate.find(item => item.value === form.candidate))
+function candidateSubscriptionId(item) {
+  return String(item.subscription_id ?? String(item.value).split(':')[0])
+}
+
+const candidateChoices = computed(() => options.candidate.filter(item =>
+  form.candidate_subscription && candidateSubscriptionId(item) === form.candidate_subscription))
+const selectedCandidate = computed(() => candidateChoices.value.find(item => item.value === form.candidate))
 const selectedCandidateUrl = computed(() => {
   const url = selectedCandidate.value?.page_url
   return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : ''
 })
 const selectedCandidateSite = computed(() => selectedCandidate.value?.site_name || '所选站点')
 
-watch(() => form.candidate, (candidate, previous) => {
-  if (previous && candidate !== previous) form.rule_json = ''
-})
+function selectCandidateSubscription(subscription) {
+  form.candidate_subscription = subscription || ''
+  form.candidate = ''
+  form.rule_json = ''
+  handoffNotice.value = ''
+}
+
+function selectCandidate(candidate) {
+  form.candidate = candidate || ''
+  form.rule_json = ''
+  handoffNotice.value = ''
+}
 
 function clearRuleDraft() {
   form.rule_json = ''
@@ -264,7 +295,42 @@ function applySnapshot(snapshot) {
       managedSummary.value = summary
     }
   })
+  const candidate = options.candidate.find(item => item.value === form.candidate)
+  if (candidate) {
+    form.candidate_subscription = candidateSubscriptionId(candidate)
+  } else {
+    if (form.candidate) {
+      form.candidate = ''
+      form.rule_json = ''
+    }
+    if (!options.candidate_subscription.some(item => item.value === form.candidate_subscription)) {
+      form.candidate_subscription = ''
+    }
+  }
   return source.model._last_confirmation
+}
+
+function applyCandidateSelection() {
+  const candidateId = takeCandidateSelection()
+  if (!candidateId) return false
+  handoffNotice.value = ''
+  const candidate = options.candidate.find(item => item.value === candidateId)
+  const subscriptionId = candidate && candidateSubscriptionId(candidate)
+  if (!candidate || !options.candidate_subscription.some(item => item.value === subscriptionId)) {
+    feedback.section = 'settings'
+    feedback.type = 'warning'
+    feedback.text = '所选版本已不在待确认列表，请重新选择'
+    return false
+  }
+  form.candidate_subscription = subscriptionId
+  form.candidate = candidateId
+  form.rule_mode = 'candidate'
+  form.rule_json = Object.keys(candidate.rules || {}).length
+    ? JSON.stringify(candidate.rules, null, 2) : ''
+  feedback.section = ''
+  feedback.text = ''
+  handoffNotice.value = '已选中详情页里的版本。可修改规则草稿，再预览匹配。'
+  return true
 }
 
 async function refreshForm() {
@@ -288,6 +354,7 @@ async function submit(action) {
     const rawResponse = await props.api.post(`plugin/${PLUGIN_ID}/apply`, payload(action, requestId))
     const response = rawResponse?.data?.success === undefined ? rawResponse : rawResponse.data
     const result = await refreshForm()
+    if (!selectedCandidate.value) handoffNotice.value = ''
     feedback.section = sections[action] || 'settings'
     if (action !== 'save' && result?.request_id !== requestId) {
       feedback.type = 'error'
@@ -306,15 +373,26 @@ async function submit(action) {
   }
 }
 
+async function consumeSelectionAndScroll() {
+  if (!formReady.value || !applyCandidateSelection()) return
+  await nextTick()
+  candidateCard.value?.$el?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+}
+
 onMounted(async () => {
+  window.addEventListener(CANDIDATE_SELECTION_EVENT, consumeSelectionAndScroll)
   try {
     await refreshForm()
+    formReady.value = true
   } catch (error) {
     feedback.section = 'settings'
     feedback.type = 'error'
     feedback.text = error?.message || '读取配置失败'
   } finally {
     loading.value = false
+    await consumeSelectionAndScroll()
   }
 })
+onActivated(consumeSelectionAndScroll)
+onBeforeUnmount(() => window.removeEventListener(CANDIDATE_SELECTION_EVENT, consumeSelectionAndScroll))
 </script>

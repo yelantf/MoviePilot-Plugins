@@ -319,6 +319,28 @@ def _form_items(plugin, model):
     return _form_field(plugin, model)["props"]["items"]
 
 
+def test_version_confirmation_lists_only_pending_series_with_candidates(plugin_host):
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert _form_items(plugin, "candidate_subscription") == []
+
+    host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
+    plugin.refresh_candidates()
+    host.subscriptions[3] = _subscribe(3)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 3}))
+
+    assert _form_items(plugin, "candidate_subscription") == [
+        {"title": "#2 样例剧 S01", "value": "2"},
+    ]
+    assert {item["value"] for item in _form_items(plugin, "direct_subscription")} == {"2", "3"}
+    assert {item["subscription_id"] for item in _form_items(plugin, "candidate")} == {"2"}
+
+
 def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     """
     新增广播未到时先拦下载；确认后回填规则并补搜。
@@ -1390,6 +1412,7 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert "1.00 GiB（1,073,741,825 B）" in next(
         item["title"] for item in choices if "第三个站" in item["title"]
     )
+    assert {tuple(item["rules"]["sites"]) for item in choices} == {(5,), (7,), (9,)}
     assert host.module._size_label(1024 ** 3, exact=True) != \
         host.module._size_label(1024 ** 3 + 1, exact=True)
     candidate_table = next(item for item in plugin.get_page()
@@ -1412,6 +1435,13 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert other_row["content"][2]["content"][0]["props"]["href"] == \
         "https://three.example/details.php?id=33"
     assert all(row["content"][3] == {"component": "td", "text": title} for row in rows)
+    actions = grouped_row["content"][-1]["content"]
+    assert {action["props"]["data-candidate-id"] for action in actions} == {
+        f"2:{first_candidate['id']}", f"2:{second_candidate['id']}",
+    }
+    assert {action["content"][0]["text"] for action in actions} == {"配置·样例站", "配置·另一个站"}
+    assert other_row["content"][-1]["content"][0]["props"]["data-candidate-id"] == \
+        f"2:{third_candidate['id']}"
 
     choice = next(item["value"] for item in choices if "另一个站" in item["title"])
     assert plugin.preview_candidate(choice, '{"sites": []}')[0] is True

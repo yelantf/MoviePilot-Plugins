@@ -255,6 +255,19 @@ def _site_cell(items: list[dict[str, Any]]) -> dict[str, Any]:
     return {"component": "td", "content": content}
 
 
+def _candidate_action_cell(sid: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """合并展示的候选仍按站点分别进入配置。"""
+    buttons = []
+    for item in items:
+        site = item.get("site_name") or str(item.get("site_id") or "未知站点")
+        buttons.append({"component": "VBtn", "props": {
+            "variant": "tonal", "color": "primary", "size": "small", "class": "ma-1",
+            "data-candidate-id": f"{sid}:{item['id']}",
+            "aria-label": f"选择{site}的版本并前往配置",
+        }, "content": [{"component": "span", "text": f"配置·{site}"}]})
+    return {"component": "td", "content": buttons}
+
+
 def _full_season_version_count(items: list[dict[str, Any]]) -> int:
     """跨站同版本整季资源在确认和提示中只计一次。"""
     return sum(group[0].get("kind") == "full_season" for group in _display_groups(items))
@@ -301,7 +314,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.6"
+    plugin_version = "1.5.8"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -388,7 +401,8 @@ class SubscribeOverwatcher(_PluginBase):
                     **config, "operation": "save", "adopt": False, "preview": False, "confirm": False,
                     "direct_approve": False, "revoke": False,
                     "preview_replace": False, "submit_replace": False,
-                    "historical_subscription": [], "candidate": "", "direct_subscription": "",
+                    "historical_subscription": [], "candidate_subscription": "", "candidate": "",
+                    "direct_subscription": "",
                     "revoke_subscription": "", "rule_json": "", "replace_subscription": "",
                     "replace_resource": "", "replace_episodes": "", "operation_request_id": "",
                 })
@@ -448,6 +462,7 @@ class SubscribeOverwatcher(_PluginBase):
                 elif actions == ["revoke"]:
                     updated_config["revoke_subscription"] = ""
                 elif actions == ["confirm"]:
+                    updated_config["candidate_subscription"] = ""
                     updated_config["candidate"] = ""
                     updated_config["rule_mode"] = "candidate"
                     updated_config["rule_json"] = ""
@@ -1311,6 +1326,18 @@ class SubscribeOverwatcher(_PluginBase):
                 + ("；其余请在插件详情页查看" if len(managed_names) > 8 else "")
                 if managed_names else "尚无已纳入管理的剧集订阅。"
             )
+            candidate_entries = [
+                (sid, entry)
+                for sid, entry in self._state["entries"].items()
+                if entry.get("status") == "pending" and entry.get("candidates")
+            ]
+            candidate_subscription_choices = [
+                {
+                    "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d}",
+                    "value": sid,
+                }
+                for sid, entry in candidate_entries
+            ]
             choices = [
                 {
                     "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
@@ -1320,11 +1347,16 @@ class SubscribeOverwatcher(_PluginBase):
                              f"{item.get('quality') or '?'} {item.get('resolution') or '?'} "
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
+                    "subscription_id": sid,
+                    "rules": {
+                        key: value for key, value in (item.get("rules") or {}).items()
+                        if key in {"quality", "resolution", "effect", "include", "exclude", "sites"}
+                        and value is not None
+                    },
                     "page_url": public_page_url(item.get("page_url")),
                     "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
                 }
-                for sid, entry in self._state["entries"].items()
-                if entry.get("status") == "pending"
+                for sid, entry in candidate_entries
                 for item in entry.get("candidates") or []
             ]
             pending_choices = [
@@ -1410,11 +1442,14 @@ class SubscribeOverwatcher(_PluginBase):
             ),
             divider,
             row(
-                col(select("candidate", "选择一个版本（全集优先）", choices, clearable=True), md=8),
+                col(select("candidate_subscription", "选择有版本的剧集",
+                           candidate_subscription_choices, clearable=True,
+                           **{"no-data-text": "暂无有版本的待确认剧集"}), md=4),
+                col(select("candidate", "选择该剧集版本（全集优先）", choices, clearable=True), md=5),
                 col(select("rule_mode", "站点范围", [
                     {"title": "只用所选站点", "value": "candidate"},
                     {"title": "不限站点", "value": "all_sites"},
-                ]), md=4),
+                ]), md=3),
             ),
             row(
                 col(field("VTextarea", {
@@ -1459,7 +1494,8 @@ class SubscribeOverwatcher(_PluginBase):
         ]}], {
             "enabled": False, "confirm_full_pack": True, "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
-            "historical_subscription": [], "candidate": "", "rule_mode": "candidate", "rule_json": "",
+            "historical_subscription": [], "candidate_subscription": "", "candidate": "",
+            "rule_mode": "candidate", "rule_json": "",
             "direct_subscription": "", "revoke_subscription": "",
             "replace_subscription": "", "replace_resource": "", "replace_episodes": "",
             "operation": "save", "operation_request_id": "",
@@ -1534,6 +1570,7 @@ class SubscribeOverwatcher(_PluginBase):
                     {"component": "td", "text": item.get("effect") or "?"},
                     {"component": "td", "text": item.get("team") or "?"},
                     {"component": "td", "text": max((member.get("last_seen") or "" for member in group), default="")},
+                    _candidate_action_cell(sid, group),
                 ]}
                 for group in groups
                 for item in group[:1]
@@ -1541,7 +1578,7 @@ class SubscribeOverwatcher(_PluginBase):
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "质量", "分辨率", "特效", "制作组", "最后发现")
+                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "质量", "分辨率", "特效", "制作组", "最后发现", "配置")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})

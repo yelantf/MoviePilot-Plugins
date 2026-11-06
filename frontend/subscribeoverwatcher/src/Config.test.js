@@ -19,6 +19,20 @@ components.VAlert = defineComponent({
   props: ['text'],
   template: '<div>{{ text }}<slot /></div>',
 })
+const Select = defineComponent({
+  props: ['modelValue', 'items', 'label', 'disabled'],
+  emits: ['update:modelValue'],
+  template: `<select :aria-label="label" :disabled="disabled" :value="modelValue ?? ''"
+    @change="$emit('update:modelValue', $event.target.value)">
+    <option value="">请选择</option>
+    <option v-for="item in items" :key="item.value" :value="item.value">{{ item.title }}</option>
+  </select>`,
+})
+const Textarea = defineComponent({
+  props: ['modelValue'],
+  emits: ['update:modelValue'],
+  template: `<textarea :value="modelValue" @input="$emit('update:modelValue', $event.target.value)" />`,
+})
 
 function snapshot({ managed, historical, result = null }) {
   return {
@@ -34,6 +48,118 @@ function snapshot({ managed, historical, result = null }) {
 }
 
 describe('custom configuration actions', () => {
+  it('opens a chosen page version in config with its site rules ready to edit', async () => {
+    window.sessionStorage.clear()
+    const pageApi = { get: vi.fn().mockResolvedValue({ page: [{
+      component: 'VTable', content: [{ component: 'tbody', content: [{ component: 'tr', content: [
+        { component: 'td', content: [{ component: 'VBtn', props: {
+          'data-candidate-id': '2:site7',
+        }, content: [{ component: 'span', text: '配置·另一个站' }] }] },
+      ] }] }],
+    }] }) }
+    const page = mount(Page, { props: { api: pageApi }, global: { components } })
+    await flushPromises()
+    await page.find('button[data-candidate-id="2:site7"]').trigger('click')
+    expect(page.emitted('switch')).toHaveLength(1)
+    page.unmount()
+
+    const data = snapshot({ managed: '已纳入管理 1 条：#2 剧集甲（待确认）', historical: [] })
+    data.conf[0].content.push(
+      { component: 'VSelect', props: { model: 'candidate_subscription', items: [
+        { title: '#2 剧集甲 S01', value: '2' },
+      ] } },
+      { component: 'VSelect', props: { model: 'candidate', items: [
+        { title: '样例站版本', value: '2:site5', subscription_id: '2', rules: { sites: [5] } },
+        { title: '另一个站版本', value: '2:site7', subscription_id: '2',
+          rules: { quality: 'WEB-DL', sites: [7] } },
+      ] } },
+    )
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockResolvedValue({ success: true, message: '预览完成' }),
+    }
+    const config = mount(Config, {
+      props: { api },
+      global: { components: { ...components, VSelect: Select, VTextarea: Textarea } },
+    })
+    await flushPromises()
+    expect(config.find('select[aria-label="选择有版本的剧集"]').element.value).toBe('2')
+    expect(config.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe('2:site7')
+    expect(config.find('textarea').element.value).toBe(JSON.stringify({ quality: 'WEB-DL', sites: [7] }, null, 2))
+    expect(config.text()).toContain('可修改规则草稿，再预览匹配')
+    expect(window.sessionStorage.length).toBe(0)
+
+    await config.find('textarea').setValue('{"quality":"BluRay","sites":[7]}')
+    await config.findAll('button').find(button => button.text().includes('预览匹配')).trigger('click')
+    expect(api.post).toHaveBeenCalledWith('plugin/SubscribeOverwatcher/apply', expect.objectContaining({
+      operation: 'preview', candidate_subscription: '2', candidate: '2:site7',
+      rule_json: '{"quality":"BluRay","sites":[7]}',
+    }))
+    await flushPromises()
+
+    const activePage = mount(Page, { props: { api: { get: vi.fn().mockResolvedValue({ page: [{
+      component: 'VBtn', props: { 'data-candidate-id': '2:site5' },
+      content: [{ component: 'span', text: '配置·样例站' }],
+    }] }) } }, global: { components } })
+    await flushPromises()
+    await activePage.find('button[data-candidate-id="2:site5"]').trigger('click')
+    await flushPromises()
+    expect(config.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe('2:site5')
+    expect(config.find('textarea').element.value).toBe(JSON.stringify({ sites: [5] }, null, 2))
+    expect(window.sessionStorage.length).toBe(0)
+    activePage.unmount()
+    config.unmount()
+  })
+
+  it('selects a series before a version and clears the previous version when the series changes', async () => {
+    const data = snapshot({ managed: '尚无已纳入管理的剧集订阅。', historical: [] })
+    data.conf[0].content.push(
+      { component: 'VSelect', props: { model: 'candidate_subscription', items: [
+        { title: '#2 剧集甲 S01', value: '2' },
+        { title: '#3 剧集乙 S01', value: '3' },
+      ] } },
+      { component: 'VSelect', props: { model: 'candidate', items: [
+        { title: '甲版本 A', value: '2:a', subscription_id: '2' },
+        { title: '甲版本 B', value: '2:b', subscription_id: '2' },
+        { title: '乙版本', value: '3:c', subscription_id: '3' },
+      ] } },
+    )
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockResolvedValue({ success: true, message: '预览完成' }),
+    }
+    const wrapper = mount(Config, {
+      props: { api },
+      global: { components: { ...components, VSelect: Select, VTextarea: Textarea } },
+    })
+    await flushPromises()
+
+    const series = wrapper.find('select[aria-label="选择有版本的剧集"]')
+    const version = wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]')
+    const preview = wrapper.findAll('button').find(button => button.text().includes('预览匹配'))
+    expect(version.attributes('disabled')).toBeDefined()
+    expect(preview.attributes('disabled')).toBeDefined()
+
+    await series.setValue('2')
+    expect(version.findAll('option').map(option => option.text())).toEqual(['请选择', '甲版本 A', '甲版本 B'])
+    await version.setValue('2:a')
+    await wrapper.find('textarea').setValue('{"quality":"old"}')
+    expect(preview.attributes('disabled')).toBeUndefined()
+
+    await series.setValue('3')
+    expect(version.element.value).toBe('')
+    expect(version.findAll('option').map(option => option.text())).toEqual(['请选择', '乙版本'])
+    expect(wrapper.find('textarea').element.value).toBe('')
+    expect(preview.attributes('disabled')).toBeDefined()
+
+    await version.setValue('3:c')
+    expect(preview.attributes('disabled')).toBeUndefined()
+    await preview.trigger('click')
+    expect(api.post).toHaveBeenCalledWith('plugin/SubscribeOverwatcher/apply', expect.objectContaining({
+      operation: 'preview', candidate_subscription: '3', candidate: '3:c', rule_json: '',
+    }))
+  })
+
   it('keeps the page open, refreshes choices, and shows the action result', async () => {
     const initial = snapshot({
       managed: '尚无已纳入管理的剧集订阅。',
