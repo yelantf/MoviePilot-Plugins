@@ -361,6 +361,8 @@ def plugin_host(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
 
     name = "subscribeoverwatcher_isolated_test"
+    # 搜索适配器继承当前夹具的宿主替身，不能跨场景复用上一个宿主的基类。
+    monkeypatch.delitem(sys.modules, f"{name}.search", raising=False)
     spec = importlib.util.spec_from_file_location(
         name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)],
     )
@@ -1997,7 +1999,7 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     history = host.storage["gate_state"]["entries"]["2"]["replacement_history"]
     assert history[0]["episodes"] == [1, 3, 4, 5]
     assert "secret.example" not in json.dumps(history)
-    assert len(host.search_calls) == 2
+    assert len(host.search_calls) == 4
     assert all(call["rule_groups"] == [] for call in host.search_calls)
 
 
@@ -2135,39 +2137,39 @@ def test_preview_reuses_search_without_age_limit_but_rechecks_rules_and_can_refr
     clock_value = [100.0]
     monkeypatch.setattr(host.module.time, "monotonic", lambda: clock_value[0])
     plugin.init_plugin({"enabled": True, "candidate": choice, "operation": "preview"})
-    assert len(host.search_calls) == 1
+    assert len(host.search_calls) == 2
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
     assert host.search_calls[0]["sites"] == [5]
     clock_value[0] += 3
     plugin.init_plugin({**host.storage["config"], "operation": "preview", "rule_mode": "all_sites"})
-    assert len(host.search_calls) == 2
-    assert host.search_calls[1]["sites"] is None
+    assert len(host.search_calls) == 4
+    assert host.search_calls[2]["sites"] is None
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_cached"] is False
     clock_value[0] += 3
     plugin.init_plugin({**host.storage["config"], "operation": "preview"})
     cached = host.storage["gate_state"]["entries"]["2"]["preview"]
-    assert len(host.search_calls) == 2
+    assert len(host.search_calls) == 4
     assert cached["search_cached"] is True
     assert cached["search_age_seconds"] == 3
     assert cached["matched_count"] == 2
     assert cached["timings"]["search_seconds"] == 0
     host.search_results[:] = [chosen]
     assert plugin.preview_candidate(choice, rule_mode="all_sites", refresh_search=True)[0]
-    assert len(host.search_calls) == 3
+    assert len(host.search_calls) == 6
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
     clock_value[0] += 90 * 24 * 3600
     host.search_results.clear()
     assert plugin.preview_candidate(choice)[0]
-    assert len(host.search_calls) == 3
+    assert len(host.search_calls) == 6
     cached = host.storage["gate_state"]["entries"]["2"]["preview"]
     assert cached["search_cached"] is True
     assert cached["search_age_seconds"] == 90 * 24 * 3600
     assert cached["matched_count"] == 1
     assert plugin.preview_candidate(choice, refresh_search=True)[0]
-    assert len(host.search_calls) == 4
+    assert len(host.search_calls) == 8
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 0
     assert plugin.preview_candidate(choice)[0]
-    assert len(host.search_calls) == 4
+    assert len(host.search_calls) == 8
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_cached"] is True
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_result_count"] == 0
     assert "cookie-secret" not in json.dumps(host.storage)
@@ -2229,8 +2231,8 @@ def test_preview_timings_separate_recognition_search_filtering_and_directory(plu
     monkeypatch.setattr(host.module, "preview_download_path", timed(host.module.preview_download_path, 3))
     assert plugin.preview_candidate(choice, refresh_search=True)[0]
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["timings"] == {
-        "recognition_seconds": 2, "search_seconds": 11, "filter_seconds": 0.5,
-        "directory_seconds": 3, "total_seconds": 16.5,
+        "recognition_seconds": 2, "search_seconds": 22, "filter_seconds": 0.5,
+        "directory_seconds": 3, "total_seconds": 27.5,
     }
 
 
@@ -2814,3 +2816,357 @@ def test_replacement_rechecks_rule_groups_against_the_fresh_resource_before_down
     assert success is False
     assert "系统默认规则组" in message
     assert host.downloads == []
+
+
+def test_saving_and_cached_preview_do_not_schedule_background_searches(plugin_host):
+    host = plugin_host
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    host.jobs.clear()
+    host.search_calls.clear()
+    plugin.init_plugin({"enabled": True, "operation": "save"})
+    plugin.init_plugin({"enabled": True, "operation": "preview", "candidate": choice})
+    assert host.search_calls == []
+    assert "collect" not in host.jobs
+    assert plugin._queued_scan_ids == set()
+    assert plugin.get_service()[0]["kwargs"] == {"hours": 4}
+
+
+def test_added_subscription_only_scans_itself_and_busy_scan_preserves_queue(plugin_host, monkeypatch):
+    host = plugin_host
+    plugin, _choice, _context_value = _prepare_directory_confirmation(host)
+    calls = []
+    monkeypatch.setattr(plugin, "_scan_one", calls.append)
+    host.subscriptions[3] = _subscribe(3)
+    event = SimpleNamespace(event_data={"subscribe_id": 3})
+    plugin.on_subscribe_added(event)
+    plugin.on_subscribe_added(event)
+    plugin._scan_lock.acquire()
+    try:
+        plugin._run_scheduled_scan()
+        assert plugin._queued_scan_ids == {3}
+        assert calls == []
+    finally:
+        plugin._scan_lock.release()
+    plugin._run_scheduled_scan()
+    assert calls == [3]
+    assert plugin._queued_scan_ids == set()
+
+
+def test_restart_does_not_repeat_a_recent_scan_but_collects_due_subscriptions(plugin_host):
+    host = plugin_host
+    _plugin, _choice, _context_value = _prepare_directory_confirmation(host)
+    host.jobs.clear()
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert "collect" not in host.jobs
+    assert not restarted._queued_scan_ids
+    host.storage["gate_state"]["entries"]["2"]["last_scan"] = "2020-01-01T00:00:00+00:00"
+    due = host.module.SubscribeOverwatcher()
+    due.init_plugin({"enabled": True})
+    assert due._queued_scan_ids == {2}
+    assert host.jobs["collect"][1] == 15
+
+
+@pytest.mark.parametrize("season", [2, 7])
+def test_search_uses_season_keyword_and_original_search_without_losing_middle_season(plugin_host, monkeypatch, season):
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    subscribe = _subscribe(7)
+    subscribe.season = season
+    subscribe.name = "万物生灵"
+    media = SimpleNamespace(media_source="themoviedb", media_id="123", season=None,
+                            en_title="All Creatures Great & Small", title="万物生灵")
+    monkeypatch.setattr(host.module.MediaChain, "recognize_media", lambda _self, **kwargs: media)
+    first = _context(f"All Creatures Great and Small 2020 S{season:02d}E01 1080p")
+    first.meta_info.begin_season = season
+    first.meta_info.season_list = [season]
+    pack = _context("All Creatures Great and Small S01-S10 Complete")
+    pack.meta_info.end_season = 10
+    pack.meta_info.season_list = list(range(1, 11))
+    wrong_season = _context("All Creatures Great and Small S01E01")
+
+    def process(_self, **kwargs):
+        host.search_calls.append(kwargs)
+        results = [first] if (kwargs["keyword"] or "").endswith(f" S{season:02d}") else [first, pack, wrong_season]
+        return kwargs["candidate_filter"](results)
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    diagnostics = {}
+    contexts = plugin._search_unfiltered(subscribe, sites=[5], diagnostics=diagnostics)
+    assert contexts == [first, pack]
+    assert [call["keyword"] for call in host.search_calls] == [
+        f"All Creatures Great and Small S{season:02d}", None,
+    ]
+    assert all(call["rule_groups"] == [] and call["sites"] == [5]
+               and call["mediainfo"].season is None and "no_exists" not in call for call in host.search_calls)
+    assert diagnostics["rounds"][1]["identified_count"] == 3
+    assert diagnostics["rounds"][1]["result_count"] == 2
+    assert diagnostics["original_search"]["checked"] is True
+    assert media.season is None and media.en_title == "All Creatures Great & Small"
+
+
+@pytest.mark.parametrize("season", [1, 7])
+@pytest.mark.parametrize("method", ["search_site_torrents", "_search_site_torrents_with_budget"])
+def test_translated_site_keyword_retains_subscription_season_and_pack_query_stays_broad(
+    plugin_host, monkeypatch, season, method,
+):
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    calls = []
+
+    def site_search(_self, **kwargs):
+        calls.append(kwargs["keyword"])
+        return []
+
+    monkeypatch.setattr(host.module.SearchChain, method, site_search, raising=False)
+    site = {"id": 5, "name": "英文站点", "language": "en"}
+    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site, focused_season=season)
+    search = getattr(chain, method)
+    # 模拟宿主把带季中文查询词替换为不带季的英文名。
+    search(site=site, keyword="All Creatures Great and Small")
+    search(site=site, keyword=f"All Creatures Great and Small S{season:02d}")
+    pack = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    getattr(pack, method)(site=site, keyword="All Creatures Great and Small")
+    assert calls == [f"All Creatures Great and Small S{season:02d}",
+                     f"All Creatures Great and Small S{season:02d}", "All Creatures Great and Small"]
+
+
+def test_search_name_fallback_is_bounded_and_original_search_error_keeps_target_results(plugin_host, monkeypatch):
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    subscribe = _subscribe(2)
+    media = SimpleNamespace(media_source="themoviedb", media_id="123", title="样例剧", en_title="Show")
+    monkeypatch.setattr(host.module.MediaChain, "recognize_media", lambda _self, **kwargs: media)
+    first = _context("Show.S01E01")
+    calls = []
+
+    def process(_self, **kwargs):
+        calls.append(kwargs["keyword"])
+        if kwargs["keyword"] == "Show S01":
+            return []
+        if kwargs["keyword"] == "样例剧 S01":
+            return kwargs["candidate_filter"]([first])
+        raise RuntimeError("补搜失败")
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    diagnostics = {}
+    assert plugin._search_unfiltered(subscribe, diagnostics=diagnostics) == [first]
+    assert calls == ["Show S01", "样例剧 S01", None]
+    assert diagnostics["supplemental_failed"] is True
+    assert diagnostics["original_search"]["checked"] is False
+
+
+@pytest.mark.parametrize("case,change_keyword", [
+    ("both", False), ("original_only", False), ("season_only", True), ("other_original_resource", True),
+])
+def test_confirmation_keeps_original_search_unless_only_season_search_recalls_selected_version(
+    plugin_host, monkeypatch, case, change_keyword,
+):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    subscribe = host.subscriptions[2]
+    subscribe.keyword = "Custom Original Search"
+    subscribe.search_imdbid = True
+    media = SimpleNamespace(media_source="themoviedb", media_id="123", title="样例剧", en_title="Show", imdb_id="tt123")
+    monkeypatch.setattr(host.module.MediaChain, "recognize_media", lambda _self, **_kwargs: media)
+    another = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM.Other")
+
+    def process(_self, **kwargs):
+        if kwargs["keyword"] == "Custom Original Search":
+            assert kwargs["area"] == "imdbid"
+            contexts = [chosen] if case in {"both", "original_only"} else (
+                [another] if case == "other_original_resource" else [])
+        else:
+            contexts = [] if case == "original_only" else [chosen]
+        return kwargs["candidate_filter"](contexts)
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    plugin.refresh_candidates()
+    assert plugin.preview_candidate(choice)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["search_keyword_changed"] is change_keyword
+    assert preview["search_keyword_verified"] is True
+    assert preview["search_keyword"] == ("Show S01" if change_keyword else "Custom Original Search")
+    assert subscribe.keyword == "Custom Original Search" and subscribe.search_imdbid is True
+    assert preview["matched_count"] == 1
+    assert "resource_keywords" not in json.dumps(host.storage)
+    assert "resource_ids" not in json.dumps(host.storage)
+    if case == "other_original_resource":
+        assert preview["rejected"][0]["reason"] == "未由确认后使用的搜索词召回"
+    submitted_search = []
+    monkeypatch.setattr(host.module.SubscribeChain, "search", lambda _self, **kwargs: submitted_search.append(
+        (host.subscriptions[kwargs["sid"]].keyword, host.subscriptions[kwargs["sid"]].search_imdbid)))
+    assert plugin.confirm_candidate(choice)[0]
+    plugin._search_approved(2)
+    assert submitted_search == [("Show S01" if change_keyword else "Custom Original Search", not change_keyword)]
+
+
+@pytest.mark.parametrize("reason", ["timeout", "missing_observation", "changed_original_keyword"])
+def test_failed_or_unverified_original_search_does_not_replace_subscription_keyword(plugin_host, reason):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    diagnostics = next(iter(plugin._preview_search_cache.values()))["diagnostics"]
+    if reason == "timeout":
+        diagnostics["original_search"].update(resource_ids=[], site_failures=[{"site_id": 5, "reason": "站点请求超时"}])
+    elif reason == "missing_observation":
+        diagnostics.pop("original_search")
+    else:
+        diagnostics["original_search"]["keyword"] = "Previous Custom Keyword"
+    assert plugin.preview_candidate(choice)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["search_keyword_changed"] is False
+    assert preview["search_keyword_verified"] is False
+    assert "不能判断必须加季号" in preview["search_keyword_notice"]
+    assert plugin.confirm_candidate(choice)[0]
+    assert getattr(host.subscriptions[2], "keyword", None) is None
+
+
+@pytest.mark.parametrize("field,value", [("keyword", "Changed Search"), ("search_imdbid", True)])
+def test_native_search_setting_changed_after_preview_requires_another_preview(plugin_host, field, value):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0]
+    setattr(host.subscriptions[2], field, value)
+    success, message = plugin.confirm_candidate(choice)
+    assert success is False
+    assert "预览" in message
+    assert host.subscriptions[2].state == "S"
+
+
+@pytest.mark.parametrize("outcome,seconds", [("timeout", 900), ("rate_limited", 14400)])
+def test_site_failure_stops_later_queries_and_other_subscriptions_until_cooldown(
+    plugin_host, monkeypatch, outcome, seconds,
+):
+    from contextlib import contextmanager
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    now = [1000.0]
+    monkeypatch.setattr(host.module.time, "time", lambda: now[0])
+    observations = []
+    calls = []
+
+    @contextmanager
+    def capture():
+        observation = SimpleNamespace(outcome="skipped", error=None)
+        observations.append(observation)
+        yield observation
+
+    module = ModuleType("app.application.site.observation")
+    module.capture_site_search_observation = capture
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    def site_search(_self, **kwargs):
+        calls.append(kwargs)
+        observations[-1].outcome = outcome
+        observations[-1].error = "HTTP 429 https://secret.example/?cookie=cookie-secret" if outcome == "rate_limited" else "超时"
+        return []
+
+    monkeypatch.setattr(host.module.SearchChain, "search_site_torrents", site_search, raising=False)
+    site = {"id": 5, "name": "天空"}
+    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    assert chain.search_site_torrents(site=site, keyword="Show S07") == []
+    assert chain.search_site_torrents(site=site, keyword="Show") == []
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    another = host.module.CandidateSearchChain(restarted._site_hold, restarted._hold_site)
+    assert another.search_site_torrents(site=site, keyword="Other Show") == []
+    assert len(calls) == 1
+    assert chain.site_reports[-1]["status"] == "paused"
+    assert host.storage["gate_state"]["site_holds"]["5"]["until"] == 1000 + seconds
+    assert "cookie-secret" not in json.dumps(host.storage)
+    assert "secret.example" not in json.dumps(host.storage)
+    now[0] += seconds + 1
+    another.search_site_torrents(site=site, keyword="Show S07")
+    assert len(calls) == 2
+
+
+def test_explicit_site_restriction_deadline_is_respected(plugin_host):
+    from datetime import datetime
+    now = datetime.now().timestamp()
+    expected = int(now + 3600)
+    deadline = datetime.fromtimestamp(expected).strftime("%Y-%m-%d %H:%M:%S")
+    until, reason = plugin_host.module.failure_hold(
+        "error", f"系统侦测到您的账户存在异常的浏览行为，限制该功能访问至：{deadline}。", now,
+    )
+    assert until == expected
+    assert reason == "站点限制访问或登录失效"
+
+
+def test_host_deferral_stops_later_queries_before_waiting_for_site_budget(plugin_host, monkeypatch):
+    from contextlib import contextmanager
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    observations = []
+    budget_calls = []
+
+    @contextmanager
+    def capture():
+        observation = SimpleNamespace(outcome="skipped", error=None)
+        observations.append(observation)
+        yield observation
+
+    module = ModuleType("app.application.site.observation")
+    module.capture_site_search_observation = capture
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    def budget_search(_self, **kwargs):
+        budget_calls.append(kwargs)
+        observations[-1].outcome = "deferred"
+        observations[-1].error = "站点已达到请求额度"
+        return []
+
+    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget", budget_search, raising=False)
+    site = {"id": 5, "name": "天空"}
+    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    assert chain._search_site_torrents_with_budget(site=site, keyword="Show S07") == []
+    assert chain._search_site_torrents_with_budget(site=site, keyword="Show") == []
+    assert len(budget_calls) == 1
+    assert plugin._site_hold(site) is not None
+    assert chain.site_reports[-1]["status"] == "paused"
+
+
+def test_candidate_observation_preserves_host_failure_and_pagination_facts(plugin_host, monkeypatch):
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    current = ContextVar("test_site_observation", default=None)
+
+    @contextmanager
+    def capture():
+        observation = SimpleNamespace(attempted=False, outcome="skipped", error=None, raw_count=None, has_more=None)
+        token = current.set(observation)
+        try:
+            yield observation
+        finally:
+            current.reset(token)
+
+    def report_outcome(**kwargs):
+        observation = current.get()
+        if observation:
+            observation.__dict__.update(kwargs)
+
+    def report_page(**kwargs):
+        report_outcome(**kwargs)
+
+    module = ModuleType("app.application.site.observation")
+    module.capture_site_search_observation = capture
+    module.report_site_search_outcome = report_outcome
+    module.report_site_search_page = report_page
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    def site_search(_self, **_kwargs):
+        report_outcome(attempted=True, outcome="timeout", error="请求超时")
+        report_page(raw_count=7, has_more=False)
+        return []
+
+    monkeypatch.setattr(host.module.SearchChain, "search_site_torrents", site_search, raising=False)
+    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    with capture() as outer:
+        assert chain.search_site_torrents(site={"id": 5, "name": "天空"}, keyword="Show S07") == []
+    assert outer.attempted is True
+    assert outer.outcome == "timeout" and outer.error == "请求超时"
+    assert outer.raw_count == 7 and outer.has_more is False

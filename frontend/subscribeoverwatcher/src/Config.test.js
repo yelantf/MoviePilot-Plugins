@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import Config from './Config.vue'
 import Page from './Page.vue'
 import RuleEditor from './RuleEditor.vue'
+import PreviewResults from './PreviewResults.vue'
 
 const Container = defineComponent({ template: '<div><slot /></div>' })
 const Button = defineComponent({
@@ -81,6 +82,35 @@ function previewSnapshot(draft) {
 }
 
 describe('custom configuration actions', () => {
+  it.each([
+    [false, null, '保持原设置', '原订阅搜索已召回所选版本'],
+    [true, 'Show S07', '调整', '原订阅搜索未召回，带季查询已召回'],
+  ])('shows the planned native search keyword and whether confirmation changes it (%s)', (changed, keyword, label, notice) => {
+    const preview = { ...previewSnapshot(''), search_keyword: keyword, search_keyword_changed: changed,
+      search_keyword_verified: true, search_keyword_notice: notice }
+    const wrapper = mount(PreviewResults, { props: { preview }, global: { components } })
+    expect(wrapper.text()).toContain(`确认后的订阅搜索词：${keyword || '默认使用剧名及别名'}`)
+    expect(wrapper.text()).toContain(label)
+    expect(wrapper.text()).toContain(notice)
+    expect(wrapper.text().includes('原搜索词：')).toBe(changed)
+    wrapper.unmount()
+  })
+
+  it('shows failed sites and actual search terms instead of suggesting immediate retries for an empty cache', () => {
+    const preview = { ...previewSnapshot(''), search_result_count: 0, matched_count: 0, rejected_count: 0,
+      search_diagnostics: { rounds: [{ keyword: 'All Creatures Great and Small S07', kind: 'target_season',
+        identified_count: 3, result_count: 0, seconds: 15 }],
+      site_failures: [{ site_id: 5, site_name: '天空', reason: '站点限制访问或登录失效', until: 1800000000 }] } }
+    const wrapper = mount(PreviewResults, { props: { preview }, global: { components } })
+    expect(wrapper.text()).toContain('天空：站点限制访问或登录失效')
+    expect(wrapper.text()).toContain('结果可能不完整')
+    expect(wrapper.text()).toContain('All Creatures Great and Small S07')
+    expect(wrapper.text()).toContain('媒体匹配 3 条，目标季保留 0 条')
+    expect(wrapper.text()).not.toContain('建议手动重新搜索')
+    expect(wrapper.find('button').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('views and refreshes the data page and returns to the same unsaved settings', async () => {
     const data = candidateSnapshot()
     let resourceTitle = '历史预览资源'

@@ -37,6 +37,7 @@ from .rules import (
     target_seasons,
 )
 from .rulegroups import UNFILTERED_GROUP_NAME, ensure_unfiltered_group, group_rejections, preview_group_policy
+from .search import CandidateSearchChain, failure_hold, search_names
 
 
 def _utc_now() -> str:
@@ -44,6 +45,17 @@ def _utc_now() -> str:
     返回适合排序和展示的 UTC 时间。
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _search_diagnostics_snapshot(diagnostics: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """每条资源的查询词仅随完整搜索缓存保存在内存，不扩大持久记录。"""
+    if diagnostics is None:
+        return None
+    snapshot = {key: value for key, value in diagnostics.items() if key != "resource_keywords"}
+    if snapshot.get("original_search"):
+        snapshot["original_search"] = {key: value for key, value in snapshot["original_search"].items()
+                                       if key not in {"resource_ids", "custom_words", "site_failures"}}
+    return snapshot
 
 
 def _identity(subscribe: Any) -> str:
@@ -167,6 +179,7 @@ def _rule_scope(subscribe: Any) -> str:
                 "quality", "resolution", "effect", "include", "exclude", "sites", "filter_groups",
                 "best_version", "best_version_full", "current_priority", "episode_priority",
                 "save_path", "downloader",
+                "keyword", "search_imdbid", "custom_words",
             )},
         },
         ensure_ascii=False, sort_keys=True, default=str,
@@ -327,6 +340,9 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
             "search_result_count", "search_trigger", "rule_groups_disabled",
             "rule_groups_checked", "rule_groups_auto_disabled", "rule_group_notice", "rule_group_comparison",
             "effective_rules", "rejection_summary", "search_source", "search_result_at", "search_sites",
+            "search_diagnostics",
+            "search_keyword", "original_search_keyword", "search_keyword_notice",
+            "search_keyword_changed", "search_keyword_verified",
         )},
         "subscription_id": sid, "table": _preview_table(preview),
         "matched_shown": len(preview.get("matched") or []),
@@ -345,7 +361,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.1"
+    plugin_version = "1.9.2"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -359,6 +375,7 @@ class SubscribeOverwatcher(_PluginBase):
         super().__init__()
         self._lock = threading.RLock()
         self._scan_lock = threading.Lock()
+        self._queued_scan_ids: set[int] = set()
         # 完整搜索上下文只在进程内复用，按容量保留，不写入插件持久数据。
         self._preview_search_cache: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
         self._search_cache_sequence = 0
@@ -385,6 +402,7 @@ class SubscribeOverwatcher(_PluginBase):
             selected = config["historical_subscription"]
             config["historical_subscription"] = [selected] if selected not in (None, "") else []
         with self._lock:
+            was_active = self._enabled
             saved = self.get_data("gate_state")
             if isinstance(saved, dict):
                 self._state = saved
@@ -522,7 +540,8 @@ class SubscribeOverwatcher(_PluginBase):
         elif historical_migrated or cache_setting_removed:
             self.update_config(config)
         self._reconcile_pending_states()
-        self._schedule_scan()
+        if not was_active:
+            self._schedule_scan()
 
     def _save_state(self) -> None:
         """
@@ -639,7 +658,7 @@ class SubscribeOverwatcher(_PluginBase):
             for subscribe in subscriptions:
                 if not self._ensure_pending(subscribe, force_historical=True):
                     return False, f"订阅 {subscribe.id} 纳入管理失败，请检查已纳入列表"
-        self._schedule_scan()
+        self._schedule_scan(ids)
         if len(ids) == 1:
             return True, f"订阅 {ids[0]} 已纳入管理，原有筛选规则暂未修改"
         return True, f"已纳入管理 {len(ids)} 条历史剧集订阅，原有筛选规则暂未修改"
@@ -673,7 +692,7 @@ class SubscribeOverwatcher(_PluginBase):
             return
         subscribe = self._subscribes.get(sid)
         if subscribe and self._ensure_pending(subscribe):
-            self._schedule_scan()
+            self._schedule_scan([sid])
 
     @eventmanager.register(ChainEventType.ResourceDownload, priority=1000)
     def intercept_download(self, event: Optional[Event] = None) -> None:
@@ -717,24 +736,55 @@ class SubscribeOverwatcher(_PluginBase):
         except Exception:
             logger.exception(f"查询订阅 {sid} 的确认状态失败，保持下载拦截")
 
-    def _schedule_scan(self) -> None:
+    def _schedule_scan(self, subscription_ids: Optional[list[int]] = None) -> None:
         """
-        合并短时间内的新增事件，安排一次候选扫描。
+        合并新增订阅；启动时只补收没有扫描过或已到四小时周期的订阅。
         """
+        if not self._enabled:
+            return
+        with self._lock:
+            if subscription_ids is None:
+                subscription_ids = []
+                cutoff = datetime.now(timezone.utc).timestamp() - 4 * 3600
+                for subscribe in self._subscribes.list():
+                    if subscribe.type != MediaType.TV.value or not self._is_managed(subscribe) \
+                            or self._is_approved(subscribe):
+                        continue
+                    entry = self._state["entries"].get(str(subscribe.id)) or {}
+                    try:
+                        last_scan = datetime.fromisoformat(entry.get("last_scan") or "")
+                        if last_scan.tzinfo is None:
+                            last_scan = last_scan.replace(tzinfo=timezone.utc)
+                        if last_scan.timestamp() > cutoff:
+                            continue
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                    subscription_ids.append(subscribe.id)
+            self._queued_scan_ids.update(subscription_ids)
+            if not self._queued_scan_ids:
+                return
         try:
             add_plugin_once_job(
-                self.__class__.__name__, "collect", self.refresh_candidates,
+                self.__class__.__name__, "collect", self._run_scheduled_scan,
                 "扫描待确认剧集版本", delay_seconds=15,
             )
         except RuntimeError:
             logger.warning("调度器尚未就绪，版本候选将在周期任务中扫描")
 
-    def refresh_candidates(self) -> None:
+    def _run_scheduled_scan(self) -> None:
+        """一次性任务只扫描合并后的新增目标；周期扫描正在运行时保留队列。"""
+        with self._lock:
+            ids = sorted(self._queued_scan_ids)
+            self._queued_scan_ids.clear()
+        if ids and not self.refresh_candidates(subscription_ids=ids):
+            self._schedule_scan(ids)
+
+    def refresh_candidates(self, *, subscription_ids: Optional[list[int]] = None) -> bool:
         """
         补收新增事件、更新目标季候选并执行待处理的补搜。
         """
         if not self._enabled or not self._scan_lock.acquire(blocking=False):
-            return
+            return False
         try:
             subscribes = self._subscribes.list()
             active_ids = {str(subscribe.id) for subscribe in subscribes}
@@ -773,6 +823,12 @@ class SubscribeOverwatcher(_PluginBase):
                     int(key) for key, entry in self._state["entries"].items()
                     if entry.get("status") == "pending" and entry.get("needs_search")
                 ]
+                if subscription_ids is not None:
+                    selected = set(subscription_ids)
+                    pending_ids = [sid for sid in pending_ids if sid in selected]
+                    pending_search_ids = [sid for sid in pending_search_ids if sid in selected]
+                    search_ids = [sid for sid in search_ids if sid in selected]
+                self._queued_scan_ids.difference_update(pending_ids)
             for sid in pending_ids:
                 self._scan_one(sid)
             for sid in pending_search_ids:
@@ -781,6 +837,7 @@ class SubscribeOverwatcher(_PluginBase):
                 self._search_approved(sid)
         finally:
             self._scan_lock.release()
+        return True
 
     def _prune_confirmed_records(self) -> bool:
         """扫描时清理批准满 24 小时的候选与确认预览；调用方持有状态锁。"""
@@ -821,7 +878,8 @@ class SubscribeOverwatcher(_PluginBase):
         if subscribe.type != MediaType.TV.value or not subscribe.media_source or not subscribe.media_id:
             return
         try:
-            contexts = self._search_unfiltered(subscribe)
+            diagnostics: dict[str, Any] = {}
+            contexts = self._search_unfiltered(subscribe, diagnostics=diagnostics)
             now = _utc_now()
             fresh = []
             for context in contexts:
@@ -839,8 +897,10 @@ class SubscribeOverwatcher(_PluginBase):
                 if entry and entry.get("status") == "pending" and entry.get("identity") == _identity(subscribe):
                     entry["candidates"] = merge_candidates(entry.get("candidates") or [], fresh)
                     entry["last_scan"] = now
+                    entry["last_scan_count"] = len(fresh)
+                    entry["search_diagnostics"] = _search_diagnostics_snapshot(diagnostics)
                     entry.pop("last_error", None)
-                    self._remember_search(subscribe, contexts, [], "候选扫描", now)
+                    self._remember_search(subscribe, contexts, [], "候选扫描", now, diagnostics)
                     self._save_state()
         except Exception:
             logger.exception(f"扫描订阅 {sid} 的目标季候选失败")
@@ -850,11 +910,32 @@ class SubscribeOverwatcher(_PluginBase):
                     entry["last_error"] = "搜索失败，详情见插件日志"
                     self._save_state()
 
-    @staticmethod
+    def _site_hold(self, site: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """冷却按站点共享，保存配置和重载插件不会提前解除。"""
+        with self._lock:
+            pause = (self._state.get("site_holds") or {}).get(str(site.get("id")))
+            return dict(pause) if pause and pause.get("until", 0) > time.time() else None
+
+    def _hold_site(self, site: dict[str, Any], outcome: str, detail: str) -> dict[str, Any]:
+        until, reason = failure_hold(outcome, detail, time.time())
+        with self._lock:
+            holds = self._state.setdefault("site_holds", {})
+            holds = {key: value for key, value in holds.items() if value.get("until", 0) > time.time()}
+            previous = holds.get(str(site.get("id"))) or {}
+            pause = {"until": max(until, previous.get("until", 0)), "reason": reason,
+                     "site_name": str(site.get("name") or "未知站点")[:100]}
+            holds[str(site.get("id"))] = pause
+            self._state["site_holds"] = holds
+            self._save_state()
+        logger.warning(f"站点 {site.get('name')} {reason}，插件候选搜索暂停至 "
+                       f"{datetime.fromtimestamp(pause['until']).astimezone().isoformat(timespec='seconds')}")
+        return pause
+
     def _search_unfiltered(
-        subscribe: Any, timings: Optional[dict[str, float]] = None, *, sites: Optional[list[int]] = None,
+        self, subscribe: Any, timings: Optional[dict[str, float]] = None, *, sites: Optional[list[int]] = None,
+        diagnostics: Optional[dict[str, Any]] = None,
     ) -> list[Any]:
-        """按媒体身份搜索各季，再保留包含目标季的资源。"""
+        """优先带季查询，再用原订阅搜索验证是否需要调整关键词并补收跨季包。"""
         started = time.perf_counter()
         media = MediaChain().recognize_media(
             media_source=MediaSource(subscribe.media_source),
@@ -866,31 +947,118 @@ class SubscribeOverwatcher(_PluginBase):
             return []
         target = copy.copy(media)
         season = subscribe.season or 1
-        # 宿主的目标季过滤要求种子的所有季均等于目标季，会先剔除跨季包。
-        # 取消该过滤，并在搜索结果处理中先按目标季筛选，保持别名搜索的命中判断准确。
+        # 用查询词限制站点返回量；媒体不绑定单季，以免宿主提前剔除跨季包。
         target.season = None
         media_source, media_id = resolve_media_identity(media=target)
         media_key = build_media_key(media_source, media_id)
         if not media_key:
             return []
         started = time.perf_counter()
-        contexts = SearchChain().process(
-            mediainfo=target,
-            rule_groups=[],
-            sites=sites or None,
-            candidate_filter=lambda contexts: [
-                context for context in contexts
-                if getattr(context, "match_status", None) in (None, "exact")
-                and target_seasons(getattr(context, "meta_info", None), season)
-                and (not sites or getattr(getattr(context, "torrent_info", None), "site", None) in sites)
-            ],
-        )
+        names = search_names(target, subscribe.name)
+        if not names:
+            return []
+        site_reports = []
+        resource_keywords: dict[str, list[str]] = {}
+        rounds = []
+        supplemental_failed = False
+        original_search: dict[str, Any] = {"checked": False, "resource_ids": []}
+
+        def search(name: str, *, focused: bool) -> list[Any]:
+            keyword = f"{name} S{season:02d}" if focused else (getattr(subscribe, "keyword", None) or None)
+            label = keyword or "原订阅默认关键词（剧名及别名）"
+            area = "imdbid" if not focused and getattr(subscribe, "search_imdbid", False) \
+                and getattr(target, "imdb_id", None) else "title"
+            counts = {"identified_count": 0, "target_count": 0}
+
+            def target_filter(contexts: list[Any]) -> list[Any]:
+                retained = [context for context in contexts
+                            if getattr(context, "match_status", None) in (None, "exact")
+                            and target_seasons(getattr(context, "meta_info", None), season)
+                            and (not sites or getattr(getattr(context, "torrent_info", None), "site", None) in sites)]
+                counts.update(identified_count=len(contexts), target_count=len(retained))
+                return retained
+
+            round_started = time.perf_counter()
+            chain = CandidateSearchChain(self._site_hold, self._hold_site, focused_season=season if focused else None)
+            original_arguments = {}
+            if not focused:
+                original_arguments = {
+                    "area": area,
+                    "custom_words": subscribe.custom_words.split("\n") if getattr(subscribe, "custom_words", None) else None,
+                }
+            try:
+                result = chain.process(mediainfo=copy.copy(target), keyword=keyword, rule_groups=[],
+                                       sites=sites or None, candidate_filter=target_filter, **original_arguments)
+            finally:
+                site_reports.extend(chain.site_reports)
+            for context in result:
+                try:
+                    item = preview_resource(context, season, subscribe.total_episode, _utc_now())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not item:
+                    continue
+                if not focused:
+                    original_search["resource_ids"].append(item["id"])
+                    continue
+                actual_keyword = next((report["keyword"] for report in chain.site_reports
+                                       if report.get("site_id") == item.get("site_id")
+                                       and report.get("count") and report.get("keyword")), keyword)
+                words = resource_keywords.setdefault(item["id"], [])
+                if actual_keyword not in words:
+                    words.append(actual_keyword)
+            rounds.append({"keyword": label, "kind": "target_season" if focused else "original_search",
+                           **counts, "result_count": len(result),
+                           "site_keywords": list(dict.fromkeys(report["keyword"] for report in chain.site_reports
+                                                                if report.get("keyword"))),
+                           "seconds": round(time.perf_counter() - round_started, 3)})
+            logger.info(f"订阅 {subscribe.id} {'带季搜索' if focused else '原订阅搜索验证'}：{label}，"
+                        f"媒体匹配 {counts['identified_count']} 条，目标季 {len(result)} 条")
+            # 同一站失败后，由请求边界跳过后续词；记录不包含 URL、Cookie 或响应原文。
+            failures = [item for item in chain.site_reports if item.get("reason")]
+            if not focused:
+                original_search.update(checked=True, keyword=keyword, search_imdbid=bool(getattr(subscribe, "search_imdbid", False)),
+                                       custom_words=getattr(subscribe, "custom_words", None) or None,
+                                       site_failures=failures)
+            if failures and not result:
+                logger.warning(f"订阅 {subscribe.id} 本轮有 {len(failures)} 个站点请求失败或处于冷却")
+            return result
+
+        contexts = search(names[0], focused=True)
+        if not contexts and len(names) > 1:
+            contexts = search(names[1], focused=True)
+        # 保留宿主原关键词和别名策略，验证无需带季也能召回的版本；同时补收跨季包。
+        try:
+            supplemental = search(names[0], focused=False)
+        except Exception:
+            if not contexts:
+                raise
+            supplemental = []
+            supplemental_failed = True
+            logger.exception(f"订阅 {subscribe.id} 原订阅搜索验证失败，保留已取得的目标季资源")
+        def resource_key(context: Any) -> tuple[Any, ...]:
+            torrent = getattr(context, "torrent_info", None)
+            meta = getattr(context, "meta_info", None)
+            return (getattr(torrent, "site", None), getattr(torrent, "title", None), getattr(torrent, "size", None),
+                    getattr(torrent, "description", None), getattr(torrent, "enclosure", None),
+                    tuple(getattr(meta, "season_list", None) or []),
+                    tuple(getattr(meta, "episode_list", None) or []))
+
+        # 只合并不同搜索词召回的相同资源；同一轮的不唯一记录保留给提交前校验。
+        focused_keys = {resource_key(context) for context in contexts}
+        contexts += [context for context in supplemental if resource_key(context) not in focused_keys]
+        if diagnostics is not None:
+            failures = {item["site_id"]: item for item in site_reports if item.get("reason")}
+            diagnostics.update(rounds=rounds, site_failures=list(failures.values()), target_season=season,
+                               supplemental_failed=supplemental_failed, resource_keywords=resource_keywords,
+                               original_search=original_search)
         if timings is not None:
             timings["search_seconds"] = time.perf_counter() - started
         return contexts
 
     def _remember_search(
         self, subscribe: Any, contexts: list[Any], sites: list[int], source: str, searched_at: str,
+        diagnostics: Optional[dict[str, Any]] = None,
     ) -> None:
         """每个媒体和站点范围只保留最新一轮结果，不合并历次搜索。"""
         with self._lock:
@@ -902,6 +1070,7 @@ class SubscribeOverwatcher(_PluginBase):
             self._preview_search_cache[key] = {
                 "at": time.monotonic(), "contexts": contexts, "source": source, "searched_at": searched_at,
                 "sequence": self._search_cache_sequence,
+                "diagnostics": diagnostics,
             }
 
     def _cached_search(self, subscribe: Any, sites: list[int]) -> Optional[dict[str, Any]]:
@@ -917,26 +1086,32 @@ class SubscribeOverwatcher(_PluginBase):
             if not compatible:
                 return None
             cached = max(compatible, key=lambda item: (item["at"], item["sequence"]))
-            return {**cached, "contexts": [
+            diagnostics = copy.deepcopy(cached.get("diagnostics"))
+            if sites and diagnostics:
+                diagnostics["site_failures"] = [item for item in diagnostics.get("site_failures", [])
+                                                if item.get("site_id") in selected_sites]
+            return {**cached, "diagnostics": diagnostics, "contexts": [
                 context for context in cached["contexts"]
                 if not sites or getattr(getattr(context, "torrent_info", None), "site", None) in sites
             ]}
 
     def _preview_contexts(
         self, subscribe: Any, refresh_search: bool, timings: dict[str, float], sites: list[int],
-    ) -> tuple[list[Any], bool, float, str, str]:
+    ) -> tuple[list[Any], bool, float, str, str, Any]:
         """单站可复用覆盖该站的扫描；全站预览不能复用不完整的单站搜索。"""
         cached = self._cached_search(subscribe, sites) if not refresh_search else None
         if cached is not None:
-            return cached["contexts"], True, time.monotonic() - cached["at"], cached["source"], cached["searched_at"]
+            return (cached["contexts"], True, time.monotonic() - cached["at"], cached["source"],
+                    cached["searched_at"], cached.get("diagnostics"))
         key = (_identity(subscribe), tuple(sorted(set(sites))))
         with self._lock:
             # 强制刷新失败时不能继续使用被要求淘汰的旧搜索。
             self._preview_search_cache.pop(key, None)
-        contexts = self._search_unfiltered(subscribe, timings, sites=sites)
+        diagnostics: dict[str, Any] = {}
+        contexts = self._search_unfiltered(subscribe, timings, sites=sites, diagnostics=diagnostics)
         searched_at = _utc_now()
-        self._remember_search(subscribe, contexts, sites, "规则预览搜索", searched_at)
-        return contexts, False, 0.0, "规则预览搜索", searched_at
+        self._remember_search(subscribe, contexts, sites, "规则预览搜索", searched_at, diagnostics)
+        return contexts, False, 0.0, "规则预览搜索", searched_at, diagnostics
 
     @staticmethod
     def _rule_rejection(
@@ -979,9 +1154,37 @@ class SubscribeOverwatcher(_PluginBase):
             elif field != "sites":
                 setattr(working, field, None)
         search_sites = getattr(working, "sites", None) or []
-        contexts, cached, cache_age, source, result_at = self._preview_contexts(
+        contexts, cached, cache_age, source, result_at, diagnostics = self._preview_contexts(
             subscribe, refresh_search, timings, search_sites,
         )
+        resource_keywords = (diagnostics or {}).get("resource_keywords") or {}
+        candidate_keywords = resource_keywords.get((candidate or {}).get("id")) or []
+        original_search = (diagnostics or {}).get("original_search") or {}
+        original_keyword = getattr(subscribe, "keyword", None) or None
+        original_checked = bool(original_search.get("checked")
+                                and original_search.get("keyword") == original_keyword
+                                and original_search.get("search_imdbid") == bool(getattr(subscribe, "search_imdbid", False))
+                                and original_search.get("custom_words") == (getattr(subscribe, "custom_words", None) or None))
+        original_ids = set(original_search.get("resource_ids") or []) if original_checked else set()
+        original_matched = bool(candidate and candidate.get("id") in original_ids)
+        site_failed = any((candidate or {}).get("site_id") is None
+                          or item.get("site_id") == candidate.get("site_id")
+                          for item in original_search.get("site_failures") or [])
+        original_completed = original_checked and not site_failed
+        search_keyword_changed = bool(candidate and not original_matched and candidate_keywords and original_completed)
+        search_keyword = candidate_keywords[0] if search_keyword_changed else original_keyword
+        search_keyword_verified = original_matched or search_keyword_changed
+        search_keyword_notice = ""
+        if candidate and original_matched:
+            search_keyword_notice = "原订阅搜索已召回所选版本，确认后保留原搜索词和搜索方式；当前按原订阅搜索结果预览。"
+        elif search_keyword_changed:
+            search_keyword_notice = "原订阅搜索正常完成但未召回所选版本，带季查询已召回；确认后才改用该带季搜索词。"
+            if getattr(subscribe, "search_imdbid", False):
+                search_keyword_notice += "同时从 IMDb ID 搜索改为已验证的标题搜索。"
+        elif candidate and original_completed:
+            search_keyword_notice = "本轮未召回所选版本，不会修改原订阅搜索词。"
+        elif candidate:
+            search_keyword_notice = "未能验证当前原订阅搜索（缓存缺少记录或站点失败），不能判断必须加季号；本次保留原搜索词，请重新搜索完成验证。"
         filtering_started = time.perf_counter()
         filter_params = SubscribeChain.get_params(working)
         groups_disabled = rules.get("filter_groups") == [] \
@@ -1000,7 +1203,11 @@ class SubscribeOverwatcher(_PluginBase):
                 continue
             if not item:
                 continue
-            if require_episodes and item["kind"] == "cross_season":
+            if search_keyword_changed and search_keyword not in resource_keywords.get(item["id"], []):
+                reason = "未由确认后使用的搜索词召回"
+            elif candidate and not search_keyword_changed and original_completed and item["id"] not in original_ids:
+                reason = "未被原订阅搜索策略召回"
+            elif require_episodes and item["kind"] == "cross_season":
                 reason = "跨季资源无法确定目标季集数，不能手动选集"
             elif require_episodes and not item["episodes"]:
                 reason = "未明确识别集数，不能手动选集"
@@ -1028,6 +1235,9 @@ class SubscribeOverwatcher(_PluginBase):
                       "已自动选择“不使用规则组”，当前展示跳过规则组的预览。确认后才会修改订阅的规则组设置。")
             summary = rule_summary(filter_params, getattr(working, "sites", None) or [], candidate,
                                    working=working, rules=rules, group_policy=policy)
+        if candidate:
+            summary.append({"field": "keyword", "label": "搜索词", "value": search_keyword or "默认使用剧名及别名",
+                            "source": "仅带季查询命中，确认后修改" if search_keyword_changed else "保留原订阅"})
         matched: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         for context, item, reason in records:
@@ -1078,6 +1288,10 @@ class SubscribeOverwatcher(_PluginBase):
                 "with_groups_count": with_groups_count, "without_groups_count": len(base_matches),
             } if policy["names"] else None,
             "search_source": source, "search_result_at": result_at, "search_sites": search_sites,
+            "search_diagnostics": _search_diagnostics_snapshot(diagnostics),
+            "search_keyword": search_keyword, "original_search_keyword": getattr(subscribe, "keyword", None),
+            "search_keyword_notice": search_keyword_notice,
+            "search_keyword_changed": search_keyword_changed, "search_keyword_verified": search_keyword_verified,
             "timings": {key: round(value, 3) for key, value in timings.items()},
             "effective_rules": summary,
             "rejection_summary": [{"reason": reason, "count": count}
@@ -1205,11 +1419,19 @@ class SubscribeOverwatcher(_PluginBase):
                 item.get("id") for item in preview.get("matched") or []
             }:
                 return False, "所选版本未通过当前规则，请修改规则并重新预览"
+            if "search_keyword_changed" not in preview:
+                return False, "请重新预览，确认是否需要调整原订阅搜索词"
+            if preview["search_keyword_changed"] and (not preview.get("search_keyword") or not preview.get("search_keyword_verified")):
+                return False, "请先重新搜索并预览，以验证带季搜索词"
             if candidate.get("kind") == "full_season" and _full_season_version_count(
                 preview.get("matched") or []
             ) > 1:
                 return False, "规则仍匹配多个全集版本，请缩小规则后重新预览"
             payload = {field: value for field, value in rules.items() if field != "sites" or value is not None}
+            if preview["search_keyword_changed"]:
+                payload["keyword"] = preview["search_keyword"]
+                if getattr(subscribe, "search_imdbid", False):
+                    payload["search_imdbid"] = False
             if download_directory:
                 payload["save_path"] = download_directory
             return self._approve(sid, entry, payload, candidate_id)
@@ -1287,7 +1509,8 @@ class SubscribeOverwatcher(_PluginBase):
         else:
             return True, f"订阅 {sid} 已批准；原本由用户暂停，仍保持暂停"
         if candidate_id:
-            return True, f"订阅 {sid} 已回填规则并恢复，将补齐缺集后继续追更"
+            search_note = "已改用验证通过的带季搜索词" if payload and "keyword" in payload else "保留原搜索词"
+            return True, f"订阅 {sid} 已回填规则并恢复，{search_note}，将补齐缺集后继续追更"
         return True, f"订阅 {sid} 已直接批准，原有规则保持不变，将补齐缺集后继续追更"
 
     def _schedule_approved_search(self, sid: int) -> None:
@@ -1581,6 +1804,10 @@ class SubscribeOverwatcher(_PluginBase):
                 status = "manual" if config.get("refresh_search") else (
                     "cache_miss" if cached is None else "cached" if cached["contexts"] else "cached_empty"
                 )
+                paused = [pause for sid, pause in (self._state.get("site_holds") or {}).items()
+                          if pause.get("until", 0) > time.time() and (not sites or sid in {str(site) for site in sites})]
+                if status == "cached_empty" and paused:
+                    status = "cached_paused"
                 return {"success": True, "status": status, "search_sites": sites,
                         "search_result_count": len(cached["contexts"]) if cached is not None else None}
         except (ValueError, TypeError) as error:
@@ -1905,9 +2132,17 @@ class SubscribeOverwatcher(_PluginBase):
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
                         f"候选 {len(entry.get('candidates') or [])} 条、合并展示 {len(groups)} 行（含历史扫描记录） · "
                         f"最近扫描 {entry.get('last_scan') or '等待中'}"
+                        + (f" · 本轮发现候选 {entry['last_scan_count']} 条" if "last_scan_count" in entry else "")
                         + (" · 已撤销，等待重新批准" if entry.get("revoked") else "")
                         + (f" · 扫描错误：{entry['last_error']}" if entry.get("last_error") else ""),
             }})
+            failures = (entry.get("search_diagnostics") or {}).get("site_failures") or []
+            if failures:
+                page.append({"component": "VAlert", "props": {
+                    "type": "warning", "variant": "tonal",
+                    "text": "最近扫描有失败或暂停的站点，结果可能不完整："
+                            + "；".join(f"{item['site_name']}：{item['reason']}" for item in failures),
+                }})
             rows = [
                 {"component": "tr", "content": [
                     {"component": "td", "text": _candidate_label(item)},
@@ -1943,6 +2178,12 @@ class SubscribeOverwatcher(_PluginBase):
                 if preview.get("rule_group_notice"):
                     page.append({"component": "VAlert", "props": {
                         "type": "warning", "variant": "tonal", "text": preview["rule_group_notice"],
+                    }})
+                if preview.get("search_keyword_notice"):
+                    page.append({"component": "VAlert", "props": {
+                        "type": "info" if preview.get("search_keyword_verified") else "warning", "variant": "tonal",
+                        "text": f"确认后的订阅搜索词：{preview.get('search_keyword') or '默认使用剧名及别名'}。"
+                                + preview["search_keyword_notice"],
                     }})
                 page.append(_preview_table(preview))
                 if _full_season_version_count(preview.get("matched") or []) > 1:
@@ -2045,6 +2286,7 @@ class SubscribeOverwatcher(_PluginBase):
         """
         with self._lock:
             self._preview_search_cache.clear()
+            self._queued_scan_ids.clear()
         try:
             remove_plugin_once_job(self.__class__.__name__, "collect")
         except RuntimeError:

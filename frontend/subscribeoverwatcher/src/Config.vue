@@ -84,7 +84,7 @@
               </v-col>
             </v-row>
             <p class="text-caption text-medium-emphasis mt-2 mb-4">
-              候选按媒体身份搜索后筛选包含目标季的资源，跳过全局搜索规则组及本订阅的站点和筛选规则；列出首集、整季及跨季资源，并保留历史扫描版本。
+              候选比较带季查询与原订阅搜索，并收集包含目标季的合集；跳过全局搜索规则组及本订阅的站点和筛选规则，保留历史扫描版本。
               候选选择项和详情页均显示种子大小及精确字节数。跨站资源只在标题、字节大小、集数和解析规格一致时合并展示；这里仍逐站点选择。
               <span v-if="selectedCandidateUrl" class="ms-2">站点详情：</span>
               <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
@@ -101,6 +101,7 @@
             <p class="text-caption text-medium-emphasis mt-2 mb-0">
               只用所选站点时，预览仅搜索和筛选该站；“不限站点”保留其他规则选项。
               有对应范围的候选扫描或预览搜索缓存就复用，每次都会重新核对生效规则和下载目录；点击“重新搜索”获取新资源。
+              原订阅能搜到所选版本时保留搜索词；只有原搜索正常完成却未命中、带季查询命中时，确认才调整搜索词。
               确认后的候选和确认预览保留 24 小时，期满后定期清理。
             默认预览应用原订阅或系统默认规则组；结果不符合预期时可选择“不使用规则组”。
             </p>
@@ -463,6 +464,7 @@ async function showSearchProgress(submitted) {
       cache_miss: '当前站点范围没有可复用缓存，已触发搜索；正在等待站点响应和资源解析，可能需要较长时间。',
       cached: '正在复用搜索缓存并按当前规则筛选，无需重新搜索站点。',
       cached_empty: '当前站点范围的搜索缓存为空，本次将复用空结果；建议手动重新搜索。',
+      cached_paused: '当前搜索缓存为空，相关站点仍在冷却期间；本次复用空结果，重新搜索也会跳过暂停的站点。',
     }
     previewProgress.value = status?.success && messages[status.status] ||
       '正在执行预览；缓存状态暂无法确认，若需要搜索，需等待站点响应和资源解析。'

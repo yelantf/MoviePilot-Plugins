@@ -4,6 +4,13 @@
     <v-alert v-if="stale" type="warning" variant="tonal" density="compact" class="mb-3">
       规则、站点或目录已修改；以下是上次预览，请重新预览后确认。
     </v-alert>
+    <v-alert v-if="preview.search_keyword_notice" :type="preview.search_keyword_verified ? 'info' : 'warning'"
+      variant="tonal" density="compact" class="mb-3">
+      <div>确认后的订阅搜索词：<strong>{{ preview.search_keyword || '默认使用剧名及别名' }}</strong>
+        （{{ preview.search_keyword_changed ? '调整' : '保持原设置' }}）</div>
+      <div v-if="preview.search_keyword_changed">原搜索词：{{ preview.original_search_keyword || '默认使用剧名及别名' }}。</div>
+      {{ preview.search_keyword_notice }}
+    </v-alert>
     <v-alert v-if="preview.rule_groups_auto_disabled" type="warning" variant="tonal" density="compact" class="mb-3">
       {{ preview.rule_group_notice }}
     </v-alert>
@@ -13,10 +20,25 @@
       考虑规则组通过 {{ preview.rule_group_comparison.with_groups_count }} 条，
       不使用规则组通过 {{ preview.rule_group_comparison.without_groups_count }} 条。
     </p>
-    <v-alert v-if="preview.search_cached && preview.search_result_count === 0" type="warning"
+    <v-alert v-if="preview.search_diagnostics?.site_failures?.length" type="warning"
+      variant="tonal" density="compact" class="mb-3">
+      该次搜索有失败或暂停的站点，结果可能不完整。插件在冷却期间跳过这些站点的请求。
+      <div v-for="site in preview.search_diagnostics.site_failures" :key="site.site_id">
+        {{ site.site_name }}：{{ site.reason }}；{{ preview.search_cached ? '当时暂停至' : '暂停至' }} {{ localTime(site.until) }}。
+      </div>
+    </v-alert>
+    <v-alert v-else-if="preview.search_cached && preview.search_result_count === 0" type="warning"
       variant="tonal" density="compact" class="mb-3">
       当前站点范围的搜索缓存中没有资源；本次复用了空结果，建议手动重新搜索以获取最新资源。
       <v-btn variant="text" size="small" :disabled="disabled" @click="emit('refresh-search')">{{ refreshLabel }}</v-btn>
+    </v-alert>
+    <v-alert v-else-if="preview.search_result_count === 0" type="info"
+      variant="tonal" density="compact" class="mb-3">
+      本轮没有取得目标季资源；可能搜索未命中，或资源被宿主媒体识别过滤。版本列表保留的历史候选不代表本轮仍能搜到。
+    </v-alert>
+    <v-alert v-if="preview.search_diagnostics?.supplemental_failed" type="warning"
+      variant="tonal" density="compact" class="mb-3">
+      原订阅搜索验证失败，当前保留带季查询取得的资源；无法据此判断必须修改搜索词，跨季候选也可能不完整。
     </v-alert>
     <p class="text-caption text-medium-emphasis mb-2">
       预览生成于 {{ preview.searched_at }} · {{ preview.search_cached ? `复用 ${age(preview.search_age_seconds)}前的搜索结果`
@@ -33,6 +55,16 @@
       站点搜索与资源解析 {{ seconds(preview.timings.search_seconds) }} 秒，
       规则筛选 {{ seconds(preview.timings.filter_seconds) }} 秒，目录计算 {{ seconds(preview.timings.directory_seconds) }} 秒。
     </p>
+    <details v-if="preview.search_diagnostics?.rounds?.length" class="mb-3">
+      <summary>搜索词与目标季结果（{{ preview.search_cached ? '原缓存搜索轮次' : '本轮搜索' }}）</summary>
+      <ul class="ms-5 mt-2">
+        <li v-for="(round, index) in preview.search_diagnostics.rounds" :key="index">
+          {{ round.kind === 'target_season' ? '带季搜索' : round.kind === 'original_search' ? '原订阅搜索' : '合集补搜' }}：{{ round.keyword }} ·
+          媒体匹配 {{ round.identified_count }} 条，目标季保留 {{ round.result_count }} 条 · {{ seconds(round.seconds) }} 秒
+          <span v-if="round.site_keywords?.length"> · 实际关键词：{{ round.site_keywords.join('、') }}</span>
+        </li>
+      </ul>
+    </details>
     <p v-if="preview.request_seconds !== undefined" class="text-caption text-medium-emphasis mb-3">
       含设置保存和列表刷新，本次操作共 {{ seconds(preview.request_seconds) }} 秒。
     </p>
@@ -74,6 +106,7 @@ defineProps({
 })
 const emit = defineEmits(['refresh-search'])
 const seconds = value => Number(value || 0).toFixed(2)
+const localTime = value => value ? new Date(value * 1000).toLocaleString() : '未知'
 const age = value => {
   const seconds = Math.max(0, Number(value || 0))
   if (seconds < 60) return `${Math.round(seconds)} 秒`
