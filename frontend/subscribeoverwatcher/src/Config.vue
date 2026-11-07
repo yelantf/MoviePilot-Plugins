@@ -89,6 +89,12 @@
             <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
               class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>
           </p>
+          <v-select v-model="form.download_directory" label="下载目录（留空保留原目录）"
+            :items="options.download_directory" :disabled="!form.candidate_subscription" clearable
+            density="comfortable" hint="确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理。"
+            persistent-hint class="mb-4" />
+          <v-alert v-if="form.download_directory && !selectedDownloadDirectory" type="warning"
+            variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
           <v-textarea v-model="form.rule_json" label="草稿规则 JSON；留空使用候选规格"
             rows="3" auto-grow density="comfortable" hide-details />
           <p class="text-caption text-medium-emphasis mt-2 mb-0">
@@ -192,7 +198,7 @@ import { CANDIDATE_SELECTION_EVENT, takeCandidateSelection } from './candidateSe
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
   'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
-  'historical_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json',
+  'historical_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json', 'download_directory',
   'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
 ]
@@ -216,12 +222,14 @@ const form = reactive({
   enabled: false, confirm_full_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
   candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_json: '',
+  download_directory: '',
   direct_subscription: '', revoke_subscription: '',
   replace_subscription: '', replace_resource: '', replace_episodes: '',
 })
 const options = reactive({
   notice_hour: [], notice_minute: [], historical_subscription: [],
   candidate_subscription: [], candidate: [],
+  download_directory: [],
   direct_subscription: [], revoke_subscription: [], replace_subscription: [], replace_resource: [],
 })
 const managedSummary = ref('正在读取已纳入管理的剧集…')
@@ -238,6 +246,8 @@ function candidateSubscriptionId(item) {
 const candidateChoices = computed(() => options.candidate.filter(item =>
   form.candidate_subscription && candidateSubscriptionId(item) === form.candidate_subscription))
 const selectedCandidate = computed(() => candidateChoices.value.find(item => item.value === form.candidate))
+const selectedDownloadDirectory = computed(() => options.download_directory.find(
+  item => item.value === form.download_directory))
 const selectedCandidateUrl = computed(() => {
   const url = selectedCandidate.value?.page_url
   return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : ''
@@ -248,6 +258,7 @@ function selectCandidateSubscription(subscription) {
   form.candidate_subscription = subscription || ''
   form.candidate = ''
   form.rule_json = ''
+  form.download_directory = ''
   handoffNotice.value = ''
 }
 
@@ -322,6 +333,7 @@ function applyCandidateSelection() {
     feedback.text = '所选版本已不在待确认列表，请重新选择'
     return false
   }
+  if (form.candidate_subscription !== subscriptionId) form.download_directory = ''
   form.candidate_subscription = subscriptionId
   form.candidate = candidateId
   form.rule_mode = 'candidate'

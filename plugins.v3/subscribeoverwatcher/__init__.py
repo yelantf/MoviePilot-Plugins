@@ -23,6 +23,7 @@ from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
+from .directory import directory_choices, preview_download_path, selected_directory_root
 from .preview import normalize_draft_rules, parse_episode_selection, preview_resource
 from .rules import (
     candidate_is_eligible, is_complete_season_download, merge_candidates, public_page_url, resource_candidate,
@@ -156,6 +157,7 @@ def _rule_scope(subscribe: Any) -> str:
             "rules": {name: getattr(subscribe, name, None) for name in (
                 "quality", "resolution", "effect", "include", "exclude", "sites", "filter_groups",
                 "best_version", "best_version_full", "current_priority", "episode_priority",
+                "save_path", "downloader",
             )},
         },
         ensure_ascii=False, sort_keys=True, default=str,
@@ -288,6 +290,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
             _site_cell(group),
             {"component": "td", "text": item.get("title") or ""},
             _size_cell(item),
+            {"component": "td", "text": item.get("download_path") or item.get("download_path_error") or "—"},
             {"component": "td", "text": item.get("reason") or "符合当前规则"},
         ]}
         for accepted, items in ((True, preview.get("matched") or []), (False, preview.get("rejected") or []))
@@ -297,7 +300,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     return {"component": "VTable", "props": {"hover": True}, "content": [
         {"component": "thead", "content": [{"component": "tr", "content": [
             {"component": "th", "text": title}
-            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "原因")
+            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "预计下载目录", "原因")
         ]}]},
         {"component": "tbody", "content": rows},
     ]}
@@ -314,7 +317,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.5.8"
+    plugin_version = "1.6.0"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -403,6 +406,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "preview_replace": False, "submit_replace": False,
                     "historical_subscription": [], "candidate_subscription": "", "candidate": "",
                     "direct_subscription": "",
+                    "download_directory": "",
                     "revoke_subscription": "", "rule_json": "", "replace_subscription": "",
                     "replace_resource": "", "replace_episodes": "", "operation_request_id": "",
                 })
@@ -419,11 +423,13 @@ class SubscribeOverwatcher(_PluginBase):
                 success, message, normalized_rules = self.preview_candidate(
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
                     str(config.get("rule_mode") or "candidate"),
+                    str(config.get("download_directory") or ""),
                 )
             elif actions[0] == "confirm":
                 success, message = self.confirm_candidate(
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
                     str(config.get("rule_mode") or "candidate"),
+                    str(config.get("download_directory") or ""),
                 )
             elif actions[0] == "direct_approve":
                 success, message = self.approve_subscription(config.get("direct_subscription"))
@@ -466,6 +472,7 @@ class SubscribeOverwatcher(_PluginBase):
                     updated_config["candidate"] = ""
                     updated_config["rule_mode"] = "candidate"
                     updated_config["rule_json"] = ""
+                    updated_config["download_directory"] = ""
                 elif actions == ["preview_replace"]:
                     updated_config["replace_resource"] = ""
                     updated_config["replace_episodes"] = ""
@@ -813,6 +820,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def _search_rule_preview(
         self, subscribe: Any, rules: dict[str, Any], *, require_episodes: bool = False,
+        download_directory: str = "",
     ) -> dict[str, Any]:
         """
         只搜索并筛选当前资源，不更新订阅或提交下载。
@@ -820,6 +828,7 @@ class SubscribeOverwatcher(_PluginBase):
         :param subscribe: 待预览的订阅
         :param rules: 候选规格生成的临时规则
         :param require_episodes: 手动选集下载时要求明确识别集数
+        :param download_directory: 可选的资源根目录；留空预览订阅原目录或宿主默认目录
         :return: 通过、拒绝及统计信息
         """
         working = copy.copy(subscribe)
@@ -849,6 +858,14 @@ class SubscribeOverwatcher(_PluginBase):
                     reason = self._rule_rejection(working, context)
                 except (TypeError, ValueError, AttributeError):
                     reason = "资源字段不完整，无法核对规则"
+                if reason is None:
+                    try:
+                        item["download_path"] = preview_download_path(
+                            getattr(context, "media_info", None),
+                            download_directory or getattr(subscribe, "save_path", None),
+                        )
+                    except ValueError as error:
+                        item["download_path_error"] = str(error)
             if reason:
                 item["reason"] = reason
                 rejected.append(item)
@@ -866,6 +883,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def preview_candidate(
         self, choice: str, rule_json: str = "", rule_mode: str = "candidate",
+        download_directory: str = "",
     ) -> tuple[bool, str, str]:
         """
         生成候选规格的只读匹配预览，保持订阅暂停和原规则不变。
@@ -873,6 +891,7 @@ class SubscribeOverwatcher(_PluginBase):
         :param choice: 订阅 ID 与候选 ID
         :param rule_json: 用户调整的草稿规则 JSON
         :param rule_mode: 选择所选站点或所有站点
+        :param download_directory: 从目录卡片选择的资源根目录；留空保留订阅原目录
         :return: 是否成功、结果消息和规范化草稿 JSON
         """
         try:
@@ -893,11 +912,13 @@ class SubscribeOverwatcher(_PluginBase):
             self._save_state()
             try:
                 rules = _draft_rules(candidate, rule_json, rule_mode)
+                if download_directory:
+                    selected_directory_root(download_directory)
             except ValueError as error:
                 return False, str(error), rule_json
             scope = _rule_scope(subscribe)
         try:
-            preview = self._search_rule_preview(subscribe, rules)
+            preview = self._search_rule_preview(subscribe, rules, download_directory=download_directory)
         except Exception:
             logger.exception(f"预览订阅 {sid} 的规则匹配失败")
             return False, "搜索失败，请查看插件日志后重试", rule_json
@@ -907,13 +928,18 @@ class SubscribeOverwatcher(_PluginBase):
             if not current or entry.get("status") != "pending" or _rule_scope(current) != scope:
                 return False, "预览期间订阅发生变化，请重新预览", rule_json
             preview.update({"choice": choice, "rules": rules, "scope": scope, "rule_mode": rule_mode})
+            preview["download_directory"] = download_directory
             entry["preview"] = preview
             self._save_state()
         normalized_json = json.dumps(rules, ensure_ascii=False, indent=2)
-        return True, f"当前匹配 {preview['matched_count']} 条，排除 {preview['rejected_count']} 条；订阅仍保持待确认", normalized_json
+        selected = next((item for item in preview["matched"] if item["id"] == candidate_id), {})
+        path = selected.get("download_path") or selected.get("download_path_error")
+        destination = f"；预计下载目录：{path}" if path else ""
+        return True, f"当前匹配 {preview['matched_count']} 条，排除 {preview['rejected_count']} 条；订阅仍保持待确认{destination}", normalized_json
 
     def confirm_candidate(
         self, choice: str, rule_json: Optional[str] = None, rule_mode: str = "candidate",
+        download_directory: str = "",
     ) -> tuple[bool, str]:
         """
         回填所选版本的规则，再恢复订阅并安排补搜。
@@ -921,6 +947,7 @@ class SubscribeOverwatcher(_PluginBase):
         :param choice: 配置页传入的“订阅 ID:候选 ID”
         :param rule_json: 用户当前提交的草稿规则；变更后必须重新预览
         :param rule_mode: 必须与本次预览使用的站点范围一致
+        :param download_directory: 必须与预览时选择的资源根目录一致
         :return: 是否确认成功及可展示的结果
         """
         try:
@@ -941,6 +968,13 @@ class SubscribeOverwatcher(_PluginBase):
             if not subscribe or subscribe.type != MediaType.TV.value or entry.get("identity") != _identity(subscribe):
                 return False, "订阅身份已变化，请重新扫描"
             preview = entry.get("preview") or {}
+            if preview.get("download_directory", "") != download_directory:
+                return False, "下载目录已修改，请重新预览后确认"
+            if download_directory:
+                try:
+                    selected_directory_root(download_directory)
+                except ValueError as error:
+                    return False, str(error)
             if preview.get("choice") != choice or preview.get("scope") != _rule_scope(subscribe) \
                     or preview.get("rule_mode", "candidate") != rule_mode \
                     or not isinstance(preview.get("searched_ts"), (int, float)) \
@@ -962,6 +996,8 @@ class SubscribeOverwatcher(_PluginBase):
             ) > 1:
                 return False, "规则仍匹配多个全集版本，请缩小规则后重新预览"
             payload = {field: value for field, value in rules.items() if field != "sites" or value is not None}
+            if download_directory:
+                payload["save_path"] = download_directory
             return self._approve(sid, entry, payload, candidate_id)
 
     def approve_subscription(self, sid_value: Any) -> tuple[bool, str]:
@@ -992,6 +1028,12 @@ class SubscribeOverwatcher(_PluginBase):
         写入批准记录、恢复订阅并安排一次缺集补搜。
 
         调用方须持有状态锁，并已核实订阅身份和待确认状态。
+
+        :param sid: 订阅 ID
+        :param entry: 待确认的插件状态
+        :param payload: 要回填的规则及保存目录；空值保留订阅参数
+        :param candidate_id: 确认的候选 ID；空值表示直接批准
+        :return: 是否批准成功及结果消息
         """
         previous = copy.deepcopy(entry)
         resume_state = "S" if entry.get("source") == "historical" and entry.get("original_state") == "S" else "R"
@@ -1452,6 +1494,12 @@ class SubscribeOverwatcher(_PluginBase):
                 ]), md=3),
             ),
             row(
+                col(select("download_directory", "下载目录（留空保留原目录）", directory_choices(),
+                           clearable=True, **{"hide-details": False,
+                           "hint": "确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理",
+                           "persistent-hint": True})),
+            ),
+            row(
                 col(field("VTextarea", {
                     "model": "rule_json", "label": "草稿规则 JSON；留空使用候选规格，可编辑后重新预览",
                     "rows": 3, "auto-grow": True,
@@ -1496,6 +1544,7 @@ class SubscribeOverwatcher(_PluginBase):
             "notice_hour": 9, "notice_minute": 0,
             "historical_subscription": [], "candidate_subscription": "", "candidate": "",
             "rule_mode": "candidate", "rule_json": "",
+            "download_directory": "",
             "direct_subscription": "", "revoke_subscription": "",
             "replace_subscription": "", "replace_resource": "", "replace_episodes": "",
             "operation": "save", "operation_request_id": "",

@@ -34,6 +34,8 @@ def plugin_host(monkeypatch):
     search_calls = []
     downloads = []
     messages = []
+    directories = []
+    directory_calls = []
 
     for name in ("app", "app.application", "app.application.torrent", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
@@ -195,6 +197,98 @@ def plugin_host(monkeypatch):
             downloads.append((context, kwargs))
             return ("fake-hash", None)
 
+    class DirectoryHelper:
+        """
+        提供隔离的宿主目录查询接口，记录分类路径委派。
+        """
+
+        def get_download_dirs(self):
+            """
+            返回按优先级排列的内存目录卡片。
+            """
+            return sorted(directories, key=lambda item: item.priority)
+
+        def get_download_dir(self, media):
+            """
+            返回首个适用的默认下载目录。
+            """
+            return next((item for item in self.get_download_dirs() if self.matches_media(item, media)), None)
+
+        @staticmethod
+        def has_fixed_category(directory):
+            """
+            返回目录是否指定固定类别。
+            """
+            return bool(directory.media_category_id or directory.media_category)
+
+        def matches_media(self, directory, media):
+            """
+            按替身媒体标记核对卡片适用范围。
+            """
+            return not getattr(media, "directory_mismatch", False) and directory.media_type in (None, "", "tv", "电视剧")
+
+        def get_download_dir_by_save_path(self, media, path):
+            """
+            模拟宿主只让精确资源根目录继承分类开关的合同。
+            """
+            return next((item for item in self.get_download_dirs()
+                         if path == file_uri(item.storage, item.download_path)
+                         and self.matches_media(item, media)), None)
+
+    def file_uri(storage, path):
+        """
+        将内存目录投影为本地或远端保存路径。
+        """
+        return str(path) if storage in (None, "local") else f"{storage}:{path}"
+
+    def build_media_download_path(root, directory, media, helper):
+        """
+        记录所选卡片，返回宿主替身预设的分类结果。
+        """
+        del helper
+        directory_calls.append(directory.name)
+        relative = getattr(media, "download_relative", "") if directory.download_category_folder else ""
+        return root / relative
+
+    def validate_download_save_path(path):
+        """
+        只允许内存配置资源根目录及其子路径。
+        """
+        roots = [file_uri(item.storage, item.download_path) for item in directories]
+        if any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots):
+            return path
+        raise ValueError("保存路径不在允许的下载目录范围内")
+
+    class FileURI:
+        """
+        提供宿主保存路径的存储前缀投影。
+
+        :param storage: 内存存储类型
+        :param path: 资源保存路径
+        """
+
+        def __init__(self, storage, path):
+            """
+            保存与宿主 URI 合同一致的路径。
+
+            :param storage: 存储类型
+            :param path: 资源保存路径
+            """
+            self.storage = storage
+            self.path = path
+            self.uri = file_uri(storage, path)
+
+        @classmethod
+        def from_uri(cls, uri):
+            """
+            解析测试使用的本地或远端下载路径。
+
+            :param uri: 已校验的保存路径
+            :return: 含存储和路径字段的 URI 对象
+            """
+            storage, path = uri.split(":", 1) if ":" in uri else ("local", uri)
+            return cls(storage, path)
+
     def register(_event_type, priority=10):
         """
         保留事件处理器供测试直接调用。
@@ -216,6 +310,11 @@ def plugin_host(monkeypatch):
         jobs.pop(job_id, None)
 
     exports = {
+        "app.application.directory": {
+            "DirectoryHelper": DirectoryHelper, "build_media_download_path": build_media_download_path,
+            "validate_download_save_path": validate_download_save_path,
+        },
+        "app.schemas.file": {"FileURI": FileURI},
         "app.application.torrent.download": {"TorrentHelper": TorrentHelper},
         "app.chain.download": {"DownloadChain": DownloadChain},
         "app.chain.media": {"MediaChain": MediaChain},
@@ -250,11 +349,17 @@ def plugin_host(monkeypatch):
     )
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
+    directory_spec = importlib.util.spec_from_file_location(f"{name}.directory", PLUGIN_DIR / "directory.py")
+    directory_module = importlib.util.module_from_spec(directory_spec)
+    monkeypatch.setitem(sys.modules, f"{name}.directory", directory_module)
+    directory_spec.loader.exec_module(directory_module)
     spec.loader.exec_module(module)
     return SimpleNamespace(
         module=module, subscriptions=subscriptions, storage=storage, jobs=jobs,
         search_results=search_results, search_calls=search_calls, downloads=downloads,
         messages=messages,
+        directories=directories, directory_calls=directory_calls,
+        directory_module=directory_module,
     )
 
 
@@ -317,6 +422,196 @@ def _form_field(plugin, model):
 def _form_items(plugin, model):
     """读取指定选择控件的选项。"""
     return _form_field(plugin, model)["props"]["items"]
+
+
+def _directory(name, root, **overrides):
+    """
+    建立可修改的目录卡片替身。
+
+    :param name: 目录卡片名称
+    :param root: MoviePilot 侧的资源根目录
+    :param overrides: 分类开关、存储类型等配置覆盖值
+    :return: 具有宿主目录配置字段的内存对象
+    """
+    return SimpleNamespace(**{
+        "name": name, "download_path": root, "storage": "local", "priority": 0,
+        "media_type": None, "media_category": None, "media_category_id": None,
+        "download_type_folder": True, "download_category_folder": True,
+        "library_path": f"/library/{name}", "library_storage": "local", "transfer_type": "link",
+        **overrides,
+    })
+
+
+def _prepare_directory_confirmation(host):
+    """
+    准备一个有完整媒体分类信息的待确认版本。
+
+    :param host: 隔离宿主替身
+    :return: 插件、候选选择值和下载上下文
+    """
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    host.subscriptions[2].save_path = "/old/downloads"
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    context = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")
+    context.media_info = SimpleNamespace(download_relative="电视剧/国产剧")
+    host.search_results.append(context)
+    plugin.refresh_candidates()
+    return plugin, _form_items(plugin, "candidate")[0]["value"], context
+
+
+def test_directory_confirmation_previews_full_path_and_only_fills_root(plugin_host):
+    """
+    预览显示分类全路径，确认只回填根目录，重载后也不改写下载事件。
+    """
+    host = plugin_host
+    host.directories.extend([_directory("A盘", "/diskA/downloads"),
+                             _directory("B盘", "/PtResourceDir2/bt/downloads", priority=1)])
+    plugin, choice, context = _prepare_directory_confirmation(host)
+    root = _form_items(plugin, "download_directory")[1]["value"]
+    assert root == "/PtResourceDir2/bt/downloads"
+    config = {"enabled": True, "candidate": choice, "download_directory": root, "operation": "preview"}
+    plugin.init_plugin(config)
+    assert host.subscriptions[2].save_path == "/old/downloads"
+    assert "预计下载目录：/PtResourceDir2/bt/downloads/电视剧/国产剧" in \
+        host.storage["gate_state"]["last_confirmation"]["message"]
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "预计下载目录" in page
+    assert "/PtResourceDir2/bt/downloads/电视剧/国产剧" in page
+    plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
+    assert host.storage["gate_state"]["last_confirmation"]["success"] is True
+    assert host.subscriptions[2].save_path == root
+    assert host.storage["config"]["download_directory"] == ""
+    assert "download_directory" not in host.storage["gate_state"]["entries"]["2"]
+
+    reloaded = host.module.SubscribeOverwatcher()
+    reloaded.init_plugin({"enabled": True})
+    event = _download_event(2, context=context)
+    event.event_data.options = {"save_path": root}
+    host.directory_calls.clear()
+    reloaded.intercept_download(event)
+    assert event.event_data.cancel is False
+    assert event.event_data.options["save_path"] == root
+    assert host.directory_calls == []
+
+
+@pytest.mark.parametrize("saved, expected", [
+    (None, "/a/电视剧/国产剧"), ("", "/a/电视剧/国产剧"),
+    ("/b", "/b/电视剧/国产剧"), ("/b/custom", "/b/custom"),
+])
+def test_unselected_directory_previews_original_or_default_without_filling(plugin_host, saved, expected):
+    """
+    留空目录选择时预览原保存位置或宿主默认目录，确认保持原值。
+
+    :param plugin_host: 隔离宿主替身
+    :param saved: 原订阅保存路径，空值代表默认目录
+    :param expected: 宿主规则预期生成的完整路径
+    """
+    host = plugin_host
+    host.directories.extend([_directory("A", "/a"), _directory("B", "/b", priority=1)])
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    host.subscriptions[2].save_path = saved
+    assert plugin.preview_candidate(choice)[0] is True
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched"][0]["download_path"] == expected
+    assert plugin.confirm_candidate(choice)[0] is True
+    assert host.subscriptions[2].save_path == saved
+
+
+@pytest.mark.parametrize("change", ["delete", "folder", "save_path"])
+def test_directory_changes_after_confirmation_remain_host_owned(plugin_host, change):
+    """
+    批准后目录卡片或保存路径变化时，插件只核对版本规则，不额外取消或改写路径。
+
+    :param plugin_host: 隔离宿主替身
+    :param change: 本次下载前模拟的目录变化
+    """
+    host = plugin_host
+    host.directories.append(_directory("B", "/b"))
+    plugin, choice, context = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice, download_directory="/b")[0] is True
+    assert plugin.confirm_candidate(choice, download_directory="/b")[0] is True
+    if change == "delete":
+        host.directories.clear()
+    elif change == "folder":
+        host.directories[0].download_category_folder = False
+    else:
+        host.subscriptions[2].save_path = "/manual"
+    event = _download_event(2, context=context)
+    event.event_data.options = {"save_path": host.subscriptions[2].save_path}
+    host.directory_calls.clear()
+    plugin.intercept_download(event)
+    assert event.event_data.cancel is False
+    assert event.event_data.options["save_path"] == host.subscriptions[2].save_path
+    assert host.directory_calls == []
+
+
+def test_directory_selection_changes_require_preview_and_removed_roots_cannot_be_filled(plugin_host):
+    """
+    变更目录选择需要重新预览，已删除的根目录不能在确认时回填。
+    """
+    host = plugin_host
+    host.directories.extend([_directory("A", "/a"), _directory("B", "/b")])
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice, download_directory="/a")[0] is True
+    assert plugin.confirm_candidate(choice, download_directory="/b")[0] is False
+    host.directories.pop(0)
+    assert plugin.confirm_candidate(choice, download_directory="/a")[0] is False
+    assert host.subscriptions[2].save_path == "/old/downloads"
+
+
+def test_directory_options_deduplicate_roots_and_preview_uses_host_matching(plugin_host):
+    """
+    同根卡片按根目录去重，预览遵循宿主匹配结果，名称及分类开关不形成插件绑定。
+    """
+    host = plugin_host
+    host.directories.extend([
+        _directory("直接保存", "/downloads", download_category_folder=False),
+        _directory("分类保存", "/downloads", priority=1),
+        _directory("电影", "/movies", media_type="电影"),
+    ])
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    assert _form_items(plugin, "download_directory") == [
+        {"title": "直接保存 · /downloads", "value": "/downloads"},
+    ]
+    assert plugin.preview_candidate(choice, download_directory="/downloads")[0] is True
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched"][0]["download_path"] == "/downloads"
+    host.directories[0].name = "改名"
+    host.directories[0].download_category_folder = True
+    assert plugin.confirm_candidate(choice, download_directory="/downloads")[0] is True
+    assert host.subscriptions[2].save_path == "/downloads"
+
+
+def test_remote_directory_preview_preserves_prefix_but_fills_only_root(plugin_host):
+    """
+    远端目录预览保留存储前缀及分类子目录，确认仅写入完整根目录 URI。
+    """
+    host = plugin_host
+    host.directories.append(_directory("远端", "/downloads", storage="rclone"))
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    root = _form_items(plugin, "download_directory")[0]["value"]
+    assert plugin.preview_candidate(choice, download_directory=root)[0] is True
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched"][0]["download_path"] == "rclone:/downloads/电视剧/国产剧"
+    assert plugin.confirm_candidate(choice, download_directory=root)[0] is True
+    assert host.subscriptions[2].save_path == "rclone:/downloads"
+
+
+def test_missing_media_information_is_shown_without_changing_rule_matches(plugin_host):
+    """
+    路径预览失败只显示原因，不改变版本规则的匹配结果。
+    """
+    host = plugin_host
+    plugin, choice, context = _prepare_directory_confirmation(host)
+    context.media_info = None
+    assert plugin.preview_candidate(choice)[0] is True
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["download_path_error"] == "缺少媒体信息，无法预览下载目录"
+    assert plugin.confirm_candidate(choice)[0] is True
 
 
 def test_version_confirmation_lists_only_pending_series_with_candidates(plugin_host):

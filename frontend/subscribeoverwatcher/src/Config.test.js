@@ -48,6 +48,48 @@ function snapshot({ managed, historical, result = null }) {
 }
 
 describe('custom configuration actions', () => {
+  it('submits the chosen directory card with preview and confirmation and clears it when changing series', async () => {
+    const data = snapshot({ managed: '已纳入管理 2 条剧集订阅', historical: [] })
+    data.conf[0].content.push(
+      { component: 'VSelect', props: { model: 'candidate_subscription', items: [
+        { title: '#2 剧集甲', value: '2' }, { title: '#3 剧集乙', value: '3' },
+      ] } },
+      { component: 'VSelect', props: { model: 'candidate', items: [
+        { title: '甲版本', value: '2:a', subscription_id: '2' },
+        { title: '乙版本', value: '3:b', subscription_id: '3' },
+      ] } },
+      { component: 'VSelect', props: { model: 'download_directory', items: [
+        { title: 'A盘 · /a/downloads', value: '/a/downloads' },
+        { title: 'B盘 · /b/downloads', value: '/b/downloads' },
+      ] } },
+    )
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockResolvedValue({ success: true, message: '操作完成' }),
+    }
+    const wrapper = mount(Config, {
+      props: { api }, global: { components: { ...components, VSelect: Select } },
+    })
+    await flushPromises()
+    const series = wrapper.find('select[aria-label="选择有版本的剧集"]')
+    const directory = wrapper.find('select[aria-label="下载目录（留空保留原目录）"]')
+    expect(directory.attributes('disabled')).toBeDefined()
+    await series.setValue('2')
+    await wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').setValue('2:a')
+    expect(directory.findAll('option').map(option => option.text())).toContain(
+      'B盘 · /b/downloads')
+    await directory.setValue('/b/downloads')
+    await wrapper.findAll('button').find(button => button.text().includes('预览匹配')).trigger('click')
+    await flushPromises()
+    expect(api.post.mock.calls[0][1]).toMatchObject({ operation: 'preview', download_directory: '/b/downloads' })
+    await wrapper.findAll('button').find(button => button.text().includes('确认并恢复')).trigger('click')
+    await flushPromises()
+    expect(api.post.mock.calls[1][1]).toMatchObject({ operation: 'confirm', download_directory: '/b/downloads' })
+    await series.setValue('3')
+    expect(directory.element.value).toBe('')
+    wrapper.unmount()
+  })
+
   it('opens a chosen page version in config with its site rules ready to edit', async () => {
     window.sessionStorage.clear()
     const pageApi = { get: vi.fn().mockResolvedValue({ page: [{
