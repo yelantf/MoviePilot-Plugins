@@ -27,15 +27,16 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .directory import directory_choices, preview_download_path, selected_directory_root
 from .preview import (
-    SUBSCRIPTION_RULE_OPTIONS, display_draft_rules, editor_draft_rules,
+    SUBSCRIPTION_RULE_OPTIONS, candidate_default_rules, display_draft_rules, editor_draft_rules,
     normalize_draft_rules, parse_episode_selection, preview_resource,
     readable_rejection, rule_summary,
 )
 from .rules import (
-    candidate_is_eligible, candidate_rule_names, is_complete_season_download, merge_candidates,
+    candidate_is_eligible, candidate_rule_names, candidate_team_pattern, is_complete_season_download, merge_candidates,
     public_page_url, resource_candidate,
     target_seasons,
 )
+from .rulegroups import UNFILTERED_GROUP_NAME, ensure_unfiltered_group
 
 
 def _utc_now() -> str:
@@ -147,7 +148,7 @@ def _draft_rules(candidate: dict[str, Any], raw: str, mode: str) -> dict[str, An
     """选择所选站点或所有站点，其他候选规格照常回填。"""
     if mode not in {"candidate", "all_sites"}:
         raise ValueError("站点范围无效，请重新选择")
-    rules = normalize_draft_rules(candidate.get("rules") or {}, raw, candidate_rule_names(candidate))
+    rules = normalize_draft_rules(candidate_default_rules(candidate), raw, candidate_rule_names(candidate))
     if mode == "all_sites":
         rules["sites"] = []
     return rules
@@ -322,7 +323,7 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
         **{key: preview.get(key) for key in (
             "choice", "rule_mode", "download_directory", "draft_json", "searched_at", "searched_ts",
             "matched_count", "rejected_count", "search_cached", "search_age_seconds", "timings",
-            "search_result_count", "search_trigger",
+            "search_result_count", "search_trigger", "rule_groups_disabled",
             "effective_rules", "rejection_summary", "search_source", "search_result_at", "search_sites",
         )},
         "subscription_id": sid, "table": _preview_table(preview),
@@ -342,7 +343,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.8.0"
+    plugin_version = "1.9.0"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1042,6 +1043,8 @@ class SubscribeOverwatcher(_PluginBase):
             "search_cached": cached, "search_age_seconds": round(cache_age, 1),
             "search_result_count": len(contexts),
             "search_trigger": "cache" if cached else "manual" if refresh_search else "cache_miss",
+            "rule_groups_disabled": rules.get("filter_groups") == []
+                or getattr(working, "filter_groups", None) == [UNFILTERED_GROUP_NAME],
             "search_source": source, "search_result_at": result_at, "search_sites": search_sites,
             "timings": {key: round(value, 3) for key, value in timings.items()},
             "effective_rules": summary,
@@ -1209,6 +1212,13 @@ class SubscribeOverwatcher(_PluginBase):
         :return: 是否批准成功及结果消息
         """
         previous = copy.deepcopy(entry)
+        if payload is not None and payload.get("filter_groups") == []:
+            try:
+                payload = {**payload, "filter_groups": [ensure_unfiltered_group()]}
+            except Exception as error:
+                logger.exception(f"订阅 {sid} 无法设置不使用规则组")
+                detail = str(error) if isinstance(error, ValueError) else "请查看插件日志"
+                return False, f"不使用规则组设置失败：{detail}；订阅仍保持待确认"
         resume_state = "S" if entry.get("source") == "historical" and entry.get("original_state") == "S" else "R"
         try:
             if payload is not None:
@@ -1630,13 +1640,18 @@ class SubscribeOverwatcher(_PluginBase):
                     "value": f"{sid}:{item['id']}",
                     "subscription_id": sid,
                     "rule_names": candidate_rule_names(item),
+                    "rule_patterns": item.get("rules") or {},
                     "rules": display_draft_rules(item, {
-                        key: value for key, value in (item.get("rules") or {}).items()
+                        key: value for key, value in candidate_default_rules(item).items()
                         if key in {"quality", "resolution", "effect", "include", "exclude", "sites"}
                         and value is not None
                     }),
                     "page_url": public_page_url(item.get("page_url")),
                     "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
+                    "site_id": item.get("site_id"),
+                    "original_sites": getattr(current.get(sid), "sites", None) or [],
+                    "original_filter_groups": getattr(current.get(sid), "filter_groups", None) or [],
+                    "team": item.get("release_team", item.get("team")), "team_pattern": candidate_team_pattern(item),
                 }
                 for sid, entry in candidate_entries
                 for item in entry.get("candidates") or []

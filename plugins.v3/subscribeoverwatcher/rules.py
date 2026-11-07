@@ -56,6 +56,14 @@ def candidate_rule_names(candidate: dict[str, Any]) -> dict[str, str]:
     return names
 
 
+def candidate_team_pattern(candidate: dict[str, Any]) -> Optional[str]:
+    """只提供能在所选标题中验证的制作组字面匹配，独立于组合包含规则。"""
+    team = candidate.get("release_team", candidate.get("team"))
+    if team and re.search(re.escape(team), candidate.get("title") or "", re.I):
+        return re.escape(team)
+    return None
+
+
 def _short(value: Any, limit: int = 100) -> str:
     """
     将搜索结果中的展示字段限制到固定长度。
@@ -294,6 +302,7 @@ def resource_candidate(
         "resolution": resolution,
         "effect": effect,
         "team": team or customization,
+        "release_team": team if has_team else None,
         "rule_names": {
             "include": " + ".join(dict.fromkeys(
                 value for value, present in ((team, has_team), (customization, has_customization)) if present

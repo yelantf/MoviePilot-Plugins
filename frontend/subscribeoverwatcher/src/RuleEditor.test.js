@@ -23,15 +23,16 @@ const Combo = defineComponent({
   </div>`,
 })
 const Button = defineComponent({ emits: ['click'], template: '<button @click="$emit(\'click\')"><slot /></button>' })
-function editor(modelValue = '') {
+function editor(modelValue = '', candidateChanges = {}) {
   const candidate = { value: '2:a', rules: {
     quality: { candidate: 'WEB-DL / WEBRip' }, resolution: { candidate: '1080p / 1080i' },
     include: { candidate: 'TEAM + CUSTOM' }, sites: [5],
-  } }
+  }, ...candidateChanges }
   let wrapper
   wrapper = mount(RuleEditor, { props: {
     candidate, modelValue, options: {
-      quality: [{ title: '全部', value: null }, { title: 'BluRay', value: 'Blu-?Ray' }],
+      quality: [{ title: '全部', value: null }, { title: 'BluRay', value: 'Blu-?Ray' },
+        { title: 'WEB-DL', value: 'WEB-?DL|WEB-?RIP' }],
       resolution: [{ title: '全部', value: null }, { title: '4K', value: '4K|2160p|x2160' }],
     },
     'onUpdate:modelValue': value => wrapper.setProps({ modelValue: value }),
@@ -88,6 +89,49 @@ describe('subscription style rule editor', () => {
     expect(wrapper.find('input[aria-label="自定义质量正则"]').element.value).toBe('CUSTOM.*SOURCE')
     expect(wrapper.find('input[aria-label="排除（关键字、正则式）"]').element.value).toBe('sample|preview')
     expect(wrapper.emitted('update:modelValue')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('selects the built-in quality by default and shows the chosen site in the rules', async () => {
+    const candidate = {
+      rules: { quality: 'WEB-?DL|WEB-?RIP', sites: [5] },
+      rule_patterns: { quality: 'WEB[- .]?(?:DL|RIP)' },
+      rule_names: { quality: 'WEB-DL / WEBRip' }, site_id: 5, site_name: '测试站',
+    }
+    const wrapper = editor('', candidate)
+    const quality = wrapper.find('select[aria-label="质量"]')
+    expect(quality.element.value).toBe('WEB-?DL|WEB-?RIP')
+    expect(wrapper.find('input[aria-label="自定义质量正则"]').exists()).toBe(false)
+    const sites = wrapper.find('input[aria-label="站点"]')
+    expect(sites.element.value).toBe('测试站（5）')
+    expect(sites.attributes('readonly')).toBeDefined()
+    await wrapper.setProps({ modelValue: '{"sites":[]}' })
+    expect(sites.element.value).toBe('不限站点')
+    await wrapper.setProps({ modelValue: '{"quality":{"candidate":"WEB-DL / WEBRip"},"sites":[5]}' })
+    expect(quality.element.value).toBe('WEB-?DL|WEB-?RIP')
+    await wrapper.setProps({ modelValue: '{"quality":"WEB[- .]?(?:DL|RIP)"}' })
+    expect(quality.element.value).toBe('@candidate')
+    expect(wrapper.find('input[aria-label="自定义质量正则"]').exists()).toBe(false)
+    expect(wrapper.props('modelValue')).toBe('{"quality":"WEB[- .]?(?:DL|RIP)"}')
+    wrapper.unmount()
+  })
+
+  it('can use only the selected team and choose to disable or keep subscription rule groups', async () => {
+    const wrapper = editor('', {
+      team: 'TEAM.A', team_pattern: 'TEAM\\.A', original_filter_groups: ['严格规则组'],
+    })
+    await wrapper.findAll('button').find(button => button.text() === '只用制作组：TEAM.A').trigger('click')
+    await flushPromises()
+    expect(JSON.parse(wrapper.props('modelValue')).include).toBe('TEAM\\.A')
+    const groups = wrapper.find('select[aria-label="规则组"]')
+    expect(groups.element.value).toBe('@subscription')
+    await groups.setValue('@no-groups')
+    await flushPromises()
+    expect(JSON.parse(wrapper.props('modelValue')).filter_groups).toEqual([])
+    expect(JSON.parse(wrapper.props('modelValue')).include).toBe('TEAM\\.A')
+    await groups.setValue('@subscription')
+    await flushPromises()
+    expect(JSON.parse(wrapper.props('modelValue')).filter_groups).toEqual({ subscription: true })
     wrapper.unmount()
   })
 })

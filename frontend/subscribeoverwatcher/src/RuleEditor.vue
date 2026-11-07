@@ -18,12 +18,22 @@
           density="comfortable" hint="可选择候选标识、保留原订阅，或直接输入关键字/正则表达式。"
           persistent-hint @update:model-value="updateText(field.name, $event)" />
       </v-col>
+      <v-col cols="12" md="6">
+        <v-text-field :model-value="siteSummary" label="站点" readonly :disabled="disabled"
+          density="comfortable" hint="与上方站点范围同步。" persistent-hint />
+      </v-col>
+      <v-col cols="12" md="6">
+        <v-select :model-value="groupSelection" :items="groupOptions" label="规则组" :disabled="disabled"
+          density="comfortable" :hint="groupHint" persistent-hint
+          @update:model-value="updateRule('filter_groups', $event === NO_GROUPS ? [] : { subscription: true })" />
+      </v-col>
     </v-row>
     <div class="d-flex justify-end mt-2">
       <v-btn variant="text" size="small" :disabled="disabled" @click="resetRules">重置为候选规则</v-btn>
     </div>
     <p class="text-caption text-medium-emphasis mt-2 mb-0">
-      质量、分辨率和特效选项采用订阅卡片的规则；候选规格保留该版本原有匹配方式。
+      常见质量默认采用订阅卡片的内置选项；候选匹配方式和明确输入的自定义正则可继续使用。
+      制作组可在“包含”中选择，也可输入 TEAM|GROUP 等正则。
       “保留原订阅”不回填该项；“全部”或清空会清除订阅该项，宿主默认条件仍可能生效。
     </p>
   </div>
@@ -42,6 +52,11 @@ const emit = defineEmits(['update:modelValue'])
 const KEEP = '@subscription'
 const CANDIDATE = '@candidate'
 const CUSTOM = '@custom'
+const NO_GROUPS = '@no-groups'
+const groupOptions = [
+  { title: '保留原订阅 / 默认规则组', value: KEEP },
+  { title: '清空并不使用规则组（确认后生效）', value: NO_GROUPS },
+]
 const specFields = [
   { name: 'quality', label: '质量' }, { name: 'resolution', label: '分辨率' }, { name: 'effect', label: '特效' },
 ]
@@ -57,6 +72,18 @@ const parsed = computed(() => {
 })
 const invalidDraft = computed(() => parsed.value === null)
 const rules = computed(() => ({ ...props.candidate.rules, ...parsed.value }))
+const groupSelection = computed(() => Array.isArray(rules.value.filter_groups) && !rules.value.filter_groups.length
+  ? NO_GROUPS : KEEP)
+const groupHint = computed(() => groupSelection.value === NO_GROUPS
+  ? '确认后不再应用规则组，继续按站点、质量、分辨率、特效和包含/排除条件追更。'
+  : `当前：${props.candidate.original_filter_groups?.join('、') || '宿主默认规则组'}。预览不模拟规则组。`)
+const siteSummary = computed(() => {
+  const sites = rules.value.sites ?? props.candidate.original_sites ?? []
+  if (!sites.length) return '不限站点'
+  const candidateSite = props.candidate.site_id ?? props.candidate.rules?.sites?.[0]
+  return sites.map(id => id === candidateSite && props.candidate.site_name
+    ? `${props.candidate.site_name}（${id}）` : `站点 ${id}`).join('、')
+})
 
 function candidateName(field) {
   const value = props.candidate.rules?.[field]
@@ -64,7 +91,8 @@ function candidateName(field) {
 }
 function specOptions(field) {
   const items = [{ title: '保留原订阅', value: KEEP }]
-  if (props.candidate.rules?.[field]) {
+  const original = props.candidate.rule_patterns?.[field] ?? props.candidate.rules?.[field]
+  if (original && !(props.options[field] || []).some(item => item.value === original)) {
     items.push({ title: `${candidateName(field)}（候选规格）`, value: CANDIDATE })
   }
   items.push(...(props.options[field] || [{ title: '全部', value: null }]).map(item => ({
@@ -77,9 +105,14 @@ function selection(field) {
   const value = rules.value[field]
   if (value?.subscription || value === undefined) return KEEP
   if (customEditing[field]) return CUSTOM
-  if (value?.candidate || value === props.candidate.rules?.[field] && value) return CANDIDATE
   if (value === null || value === '') return ''
-  return (props.options[field] || []).some(item => item.value === value) ? value : CUSTOM
+  if ((props.options[field] || []).some(item => item.value === value)) return value
+  if (value?.candidate) {
+    const standard = props.candidate.rules?.[field]
+    return (props.options[field] || []).some(item => item.value === standard) ? standard : CANDIDATE
+  }
+  if (value === props.candidate.rule_patterns?.[field] || value === props.candidate.rules?.[field]) return CANDIDATE
+  return CUSTOM
 }
 function customValue(field) {
   const value = rules.value[field]
@@ -91,7 +124,7 @@ function updateRule(field, value) {
 function selectSpec(field, value) {
   customEditing[field] = value === CUSTOM
   if (value === KEEP) updateRule(field, { subscription: true })
-  else if (value === CANDIDATE) updateRule(field, props.candidate.rules[field])
+  else if (value === CANDIDATE) updateRule(field, props.candidate.rule_patterns?.[field] ?? props.candidate.rules[field])
   else if (value === CUSTOM) updateRule(field, customValue(field))
   else updateRule(field, value || null)
 }
@@ -99,6 +132,9 @@ function textOptions(field) {
   const items = [{ title: '保留原订阅', value: { subscription: true } }]
   if (props.candidate.rules?.[field]) {
     items.push({ title: `${candidateName(field)}（候选标识）`, value: props.candidate.rules[field] })
+  }
+  if (field === 'include' && props.candidate.team_pattern) {
+    items.push({ title: `只用制作组：${props.candidate.team}`, value: props.candidate.team_pattern })
   }
   return items
 }

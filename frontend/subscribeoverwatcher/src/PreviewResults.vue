@@ -44,7 +44,8 @@
     <p class="text-caption text-medium-emphasis mb-2">
       当前展示前 {{ preview.matched_shown ?? Math.min(preview.matched_count, 80) }} 条通过、
       前 {{ preview.rejected_shown ?? Math.min(preview.rejected_count, 40) }} 条排除资源；跨站相同版本合并展示，统计按资源条数计算。
-      正式追更还会应用订阅规则组。
+      <span v-if="preview.rule_groups_disabled">确认后不使用规则组，按站点及基础条件追更。</span>
+      <span v-else>正式追更还会应用原订阅或宿主默认规则组。</span>
     </p>
     <div v-if="preview.table" class="overflow-x-auto">
       <schema-node :node="preview.table" />

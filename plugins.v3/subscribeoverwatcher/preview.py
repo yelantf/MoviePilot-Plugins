@@ -10,11 +10,12 @@ from hashlib import sha256
 from typing import Any, Optional
 
 from .rules import candidate_rule_names, public_page_url, resource_candidate, target_seasons
+from .rulegroups import UNFILTERED_GROUP_NAME
 
 
-RULE_FIELDS = ("quality", "resolution", "effect", "include", "exclude", "sites")
+RULE_FIELDS = ("quality", "resolution", "effect", "include", "exclude", "sites", "filter_groups")
 RULE_LABELS = {"quality": "质量", "resolution": "分辨率", "effect": "特效",
-               "include": "包含", "exclude": "排除", "sites": "站点",
+               "include": "包含", "exclude": "排除", "sites": "站点", "filter_groups": "规则组",
                "tv_size": "剧集大小", "movie_size": "电影大小", "size": "大小",
                "min_seeders": "最少做种人数", "min_seeders_time": "做种检查时间"}
 
@@ -41,6 +42,23 @@ SUBSCRIPTION_RULE_OPTIONS = {
     ],
 }
 
+_QUALITY_OPTION_NAMES = {
+    r"WEB[- .]?(?:DL|RIP)": "WEB-DL", r"REMUX": "Remux",
+    r"Blu[- .]?Ray|BluRay": "BluRay", r"UHD|Ultra[- .]?HD": "UHD",
+    r"HDTV": "HDTV", r"MiniBD": "蓝光原盘",
+    r"HEVC|[Hx][ ._-]?265": "H265", r"AVC|[Hx][ ._-]?264": "H264",
+}
+
+
+def candidate_default_rules(candidate: dict[str, Any]) -> dict[str, Any]:
+    """常见候选质量优先采用内置规则，仍须能匹配所选资源标题。"""
+    rules = dict(candidate.get("rules") or {})
+    name = _QUALITY_OPTION_NAMES.get(rules.get("quality"))
+    option = next((item for item in SUBSCRIPTION_RULE_OPTIONS["quality"] if item["title"] == name), None)
+    if option and re.search(option["value"], candidate.get("title") or "", re.I):
+        rules["quality"] = option["value"]
+    return rules
+
 
 def normalize_draft_rules(
     defaults: dict[str, Any], raw: str, names: Optional[dict[str, str]] = None,
@@ -58,7 +76,7 @@ def normalize_draft_rules(
     except (TypeError, ValueError) as error:
         raise ValueError("规则 JSON 格式错误") from error
     if not isinstance(changes, dict) or set(changes) - set(RULE_FIELDS):
-        raise ValueError("规则 JSON 只能包含质量、分辨率、特效、包含、排除和站点字段")
+        raise ValueError("规则 JSON 只能包含质量、分辨率、特效、包含、排除、站点和规则组字段")
     # 未识别出的候选属性不应清空订阅已有规则；用户仍可显式提交 null 清空。
     result = {key: value for key, value in defaults.items() if key in RULE_FIELDS and value is not None}
     result.update(changes)
@@ -74,6 +92,10 @@ def normalize_draft_rules(
                     or value["candidate"] != names[key] or not defaults.get(key):
                 raise ValueError(f"{key} 的候选规则引用已失效，请重新选择版本并重新预览")
             value = result[key] = defaults[key]
+        if key == "filter_groups":
+            if value != []:
+                raise ValueError("规则组只能选择保留原订阅或不使用规则组")
+            continue
         if key == "sites":
             if value is not None and (
                 not isinstance(value, list)
@@ -102,11 +124,12 @@ def editor_draft_rules(candidate: dict[str, Any], rules: dict[str, Any], raw: st
 
 def display_draft_rules(candidate: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
     """把与所选候选完全一致的规则显示成名称引用，自定义规则保留原文。"""
-    defaults = candidate.get("rules") or {}
+    defaults = candidate_default_rules(candidate)
     names = candidate_rule_names(candidate)
     return {
         field: {"candidate": names[field]}
-        if field in names and value and value == defaults.get(field) else value
+        if field in names and value and value == defaults.get(field)
+        and not any(item["value"] == value for item in SUBSCRIPTION_RULE_OPTIONS.get(field, [])) else value
         for field, value in rules.items()
     }
 
@@ -120,7 +143,20 @@ def rule_summary(
     rules = rules or {}
     summary = [{"field": "sites", "label": "站点", "value": ", ".join(map(str, sites)) or "不限站点",
                 "source": "候选 / 草稿" if rules.get("sites") is not None else "原订阅"}]
+    groups = getattr(working, "filter_groups", None) or []
+    if rules.get("filter_groups") == []:
+        group_label, group_source = "不使用规则组（确认后生效）", "草稿"
+    elif groups == [UNFILTERED_GROUP_NAME]:
+        group_label, group_source = "不使用规则组", "原订阅"
+    elif groups:
+        group_label, group_source = "、".join(groups) + "（预览未模拟）", "原订阅"
+    else:
+        group_label, group_source = "使用宿主默认规则组（预览未模拟）", "宿主默认"
+    summary.append({"field": "filter_groups", "label": "规则组", "value": group_label, "source": group_source})
+    defaults = candidate_default_rules(candidate or {})
     for field, value in displayed.items():
+        if field == "filter_groups":
+            continue
         if value is None or value == "":
             continue
         if isinstance(value, dict) and "candidate" in value:
@@ -129,6 +165,8 @@ def rule_summary(
             (item for item in SUBSCRIPTION_RULE_OPTIONS[field] if item["value"] == value), None,
         )):
             text = option["title"]
+        elif field == "quality" and isinstance(value, str) and value in _QUALITY_OPTION_NAMES:
+            text = f"{_QUALITY_OPTION_NAMES[value]}（候选匹配方式）"
         elif field in RULE_FIELDS:
             text = f"自定义正则：{value}"
         else:
@@ -137,7 +175,7 @@ def rule_summary(
         if working is not None and getattr(working, field, None):
             source = "原订阅"
             if field in rules and rules[field] == params[field]:
-                source = "候选规格" if isinstance(value, dict) else "草稿"
+                source = "候选规格" if field in defaults and params[field] == defaults[field] else "草稿"
         summary.append({"field": field, "label": RULE_LABELS.get(field, field), "value": text, "source": source})
     return summary
 

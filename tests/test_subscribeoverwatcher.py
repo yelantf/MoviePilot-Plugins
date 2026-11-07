@@ -371,7 +371,7 @@ def _subscribe(sid, mtype="电视剧"):
         id=sid, type=mtype, media_source="themoviedb", media_id="123",
         season=1, episode_group=None, activity_key=f"activity-{sid}", name="样例剧", state="N",
         total_episode=8, lack_episode=8, start_episode=1, best_version=0,
-        quality=None, resolution=None, effect=None, include=None, sites=[],
+        quality=None, resolution=None, effect=None, include=None, sites=[], filter_groups=[],
     )
 
 
@@ -680,7 +680,7 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
     updated = host.subscriptions[2]
     assert updated.state == "R"
-    assert updated.quality == r"WEB[- .]?(?:DL|RIP)"
+    assert updated.quality == "WEB-?DL|WEB-?RIP"
     assert updated.resolution == r"1080[pi]?|x1080"
     assert updated.effect == "HDR"
     assert updated.include == "TEAM"
@@ -759,7 +759,7 @@ def test_fake_downloader_receives_task_only_after_confirming_a_version(plugin_ho
     plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
     subscribe = host.subscriptions[42]
     assert subscribe.state == "R"
-    assert subscribe.quality == r"Blu[- .]?Ray|BluRay"
+    assert subscribe.quality == "Blu-?Ray"
     assert subscribe.resolution == r"2160[pi]?|4K|x2160"
     assert subscribe.effect is not None
     assert subscribe.include == "GROUP"
@@ -1803,7 +1803,7 @@ def test_all_sites_mode_clears_site_filter_and_keeps_candidate_specs(plugin_host
     assert preview["rules"]["sites"] == []
     plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
     assert subscribe.sites == []
-    assert subscribe.quality == r"WEB[- .]?(?:DL|RIP)"
+    assert subscribe.quality == "WEB-?DL|WEB-?RIP"
     assert subscribe.resolution == r"1080[pi]?|x1080"
     assert subscribe.effect == "HDR"
     assert subscribe.include == "TEAM"
@@ -2080,17 +2080,17 @@ def test_expired_previews_and_changed_approved_rules_do_not_release_download(plu
     assert not host.downloads
 
 
-def test_named_candidate_draft_round_trips_without_changing_regex_or_custom_edits(plugin_host):
-    """名称引用保持原匹配语义；自定义正则原样保留，错误引用拒绝回填。"""
+def test_standard_quality_and_named_candidate_draft_round_trip_without_changing_custom_edits(plugin_host):
+    """常见质量用内置规则，其他候选保持名称引用，自定义正则原样保留。"""
     host = plugin_host
     plugin, choice, _context_value = _prepare_directory_confirmation(host)
     candidate = host.storage["gate_state"]["entries"]["2"]["candidates"][0]
     displayed = _form_items(plugin, "candidate")[0]["rules"]
-    assert displayed["quality"] == {"candidate": "WEB-DL / WEBRip"}
+    assert displayed["quality"] == "WEB-?DL|WEB-?RIP"
     assert displayed["include"] == {"candidate": "TEAM"}
     success, _message, draft = plugin.preview_candidate(choice, json.dumps(displayed))
     assert success
-    assert host.storage["gate_state"]["entries"]["2"]["preview"]["rules"] == candidate["rules"]
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["rules"] == host.module.candidate_default_rules(candidate)
     custom = {**displayed, "include": "TEAM|GROUP", "effect": None}
     normalized = host.module._draft_rules(candidate, json.dumps(custom), "all_sites")
     assert normalized["include"] == "TEAM|GROUP"
@@ -2100,7 +2100,7 @@ def test_named_candidate_draft_round_trips_without_changing_regex_or_custom_edit
     with pytest.raises(ValueError, match="候选规则引用已失效"):
         host.module._draft_rules(candidate, '{"quality":{"candidate":"1080p"}}', "candidate")
     assert plugin.confirm_candidate(choice, draft)[0]
-    assert host.subscriptions[2].quality == candidate["rules"]["quality"]
+    assert host.subscriptions[2].quality == "WEB-?DL|WEB-?RIP"
     assert host.subscriptions[2].include == "TEAM"
 
 
@@ -2425,3 +2425,161 @@ def test_scan_expires_confirmed_candidates_and_previews_after_24_hours_without_r
     pending = host.storage["gate_state"]["entries"]["3"]
     assert pending["status"] == "pending"
     assert pending["candidates"] and pending["preview"]
+
+
+@pytest.mark.parametrize("quality,title,expected", [
+    ("WEB-DL", "Show.S01E01.1080p.WEB-DL.HDR-TEAM", "WEB-?DL|WEB-?RIP"),
+    ("WEB-DL", "Show.S01E01.1080p.WEB.DL.HDR-TEAM", r"WEB[- .]?(?:DL|RIP)"),
+    ("BluRay", "Show.S01E01.1080p.BluRay.HDR-TEAM", "Blu-?Ray"),
+    ("Remux", "Show.S01E01.1080p.Remux.HDR-TEAM", "Remux"),
+    ("H265", "Show.S01E01.1080p.H.265.HDR-TEAM", "[Hx].?265|HEVC"),
+])
+def test_candidate_quality_defaults_to_builtin_only_when_it_matches_selected_title(plugin_host, quality, title, expected):
+    """内置质量仍须匹配所选标题，带特殊分隔符的标题继续保留兼容候选匹配。"""
+    host = plugin_host
+    context = _context(title)
+    context.meta_info.resource_type = quality
+    rules_module = importlib.import_module(f"{host.module.__name__}.rules")
+    candidate = rules_module.resource_candidate(context, 1, "now")
+    original = copy.deepcopy(candidate)
+    default_rules = host.module._draft_rules(candidate, "", "candidate")
+    assert default_rules["quality"] == expected
+    assert re.search(default_rules["quality"], title, re.I)
+    assert candidate == original
+    raw = json.dumps({"quality": candidate["rules"]["quality"]})
+    explicit = host.module._draft_rules(candidate, raw, "candidate")
+    assert explicit["quality"] == candidate["rules"]["quality"]
+    redisplayed = host.module.editor_draft_rules(candidate, explicit, raw)
+    assert host.module._draft_rules(candidate, json.dumps(redisplayed), "candidate")["quality"] == explicit["quality"]
+    summary = host.module.rule_summary(explicit, [5], candidate, working=SimpleNamespace(**explicit), rules=explicit)
+    assert not next(item["value"] for item in summary if item["field"] == "quality").startswith("自定义正则")
+
+
+def test_team_preset_is_literal_and_independent_of_combined_include_rule(plugin_host):
+    host = plugin_host
+    context = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM.A.CUSTOM")
+    context.meta_info.resource_team = "TEAM.A"
+    context.meta_info.customization = "CUSTOM"
+    rules_module = importlib.import_module(f"{host.module.__name__}.rules")
+    candidate = rules_module.resource_candidate(context, 1, "now")
+    team_pattern = rules_module.candidate_team_pattern(candidate)
+    assert team_pattern == r"TEAM\.A"
+    assert re.search(team_pattern, context.torrent_info.title.replace("CUSTOM", "OTHER"))
+    assert not re.search(candidate["rules"]["include"], context.torrent_info.title.replace("CUSTOM", "OTHER"))
+    custom = host.module._draft_rules(candidate, json.dumps({"include": team_pattern}), "candidate")
+    assert custom["include"] == team_pattern
+    assert rules_module.candidate_team_pattern({**candidate, "release_team": "MISSING"}) is None
+    context.meta_info.resource_team = ""
+    custom_only = rules_module.resource_candidate(context, 1, "now")
+    assert custom_only["team"] == "CUSTOM"
+    assert rules_module.candidate_team_pattern(custom_only) is None
+
+
+@pytest.fixture
+def rule_group_settings(plugin_host, monkeypatch):
+    """模拟宿主的规则组注册表和独立的普通/洗版默认选择。"""
+    values = {
+        "UserFilterRuleGroups": [{"name": "严格规则组", "rule_string": "WEBDL & 4K"}],
+        "SubscribeFilterRuleGroups": ["严格规则组"], "BestVersionFilterRuleGroups": ["洗版规则组"],
+    }
+    writes = []
+
+    class SystemConfigOper:
+        def get(self, key):
+            return copy.deepcopy(values.get(key))
+
+        def set(self, key, value):
+            writes.append(key)
+            values[key] = copy.deepcopy(value)
+            return True
+
+        def update_atomically(self, key, mutation):
+            result, updated = mutation(None, copy.deepcopy(values.get(key)))
+            self.set(key, updated)
+            return result
+
+    module = ModuleType("app.db.oper.systemconfig")
+    module.SystemConfigOper = SystemConfigOper
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(sys.modules["app.schemas.types"], "SystemConfigKey", SimpleNamespace(
+        UserFilterRuleGroups="UserFilterRuleGroups",
+    ), raising=False)
+    return SimpleNamespace(values=values, writes=writes, oper=SystemConfigOper)
+
+
+@pytest.mark.parametrize("atomic", [True, False])
+def test_disable_rule_groups_only_applies_after_confirmation_and_prevents_default_fallback(
+    plugin_host, rule_group_settings, monkeypatch, atomic,
+):
+    """预览只记录选择；确认显式使用合法全放行组，不修改其他组或默认选择。"""
+    host, settings = plugin_host, rule_group_settings
+    if not atomic:
+        monkeypatch.setattr(settings.oper, "update_atomically", None)
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    host.subscriptions[2].filter_groups = ["严格规则组"]
+    original = copy.deepcopy(settings.values)
+    success, _message, draft = plugin.preview_candidate(choice, '{"filter_groups":[]}')
+    assert success
+    assert settings.writes == []
+    assert host.subscriptions[2].filter_groups == ["严格规则组"]
+    preview = plugin.get_form()[1]["_candidate_preview"]
+    assert preview["rule_groups_disabled"] is True
+    groups = next(item for item in preview["effective_rules"] if item["field"] == "filter_groups")
+    assert groups["value"] == "不使用规则组（确认后生效）"
+    assert plugin.confirm_candidate(choice, '{"filter_groups":{"subscription":true}}')[0] is False
+    assert settings.writes == []
+    assert plugin.confirm_candidate(choice, draft)[0]
+    name = host.module.UNFILTERED_GROUP_NAME
+    assert host.subscriptions[2].filter_groups == [name]
+    # 宿主的“订阅组 or 默认组”选择现在得到显式组，不能再落回严格默认组。
+    assert (host.subscriptions[2].filter_groups or settings.values["SubscribeFilterRuleGroups"]) == [name]
+    assert settings.values["UserFilterRuleGroups"][:-1] == original["UserFilterRuleGroups"]
+    assert settings.values["SubscribeFilterRuleGroups"] == original["SubscribeFilterRuleGroups"]
+    assert settings.values["BestVersionFilterRuleGroups"] == original["BestVersionFilterRuleGroups"]
+    assert plugin.preview_replacements("2")[0]
+    replacement = plugin.get_form()[1]["_replacement_preview"]
+    assert replacement["rule_groups_disabled"] is True
+    assert next(item for item in replacement["effective_rules"] if item["field"] == "filter_groups")["value"] == "不使用规则组"
+    # 下一条订阅选择相同策略时复用该组，不累积注册表记录。
+    assert host.module.ensure_unfiltered_group() == name
+    assert settings.writes == ["UserFilterRuleGroups"]
+
+
+def test_keep_rule_groups_preserves_subscription_groups_and_editor_choice(plugin_host, rule_group_settings):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    host.subscriptions[2].filter_groups = ["严格规则组"]
+    success, _message, draft = plugin.preview_candidate(choice, '{"filter_groups":{"subscription":true}}')
+    assert success
+    assert json.loads(draft)["filter_groups"] == {"subscription": True}
+    assert plugin.confirm_candidate(choice, draft)[0]
+    assert host.subscriptions[2].filter_groups == ["严格规则组"]
+    assert rule_group_settings.writes == []
+    with pytest.raises(ValueError, match="规则组只能选择"):
+        host.module._draft_rules({}, '{"filter_groups":["随意组名"]}', "candidate")
+
+
+@pytest.mark.parametrize("failure", ["name_collision", "save_failed"])
+def test_failed_rule_group_configuration_keeps_subscription_pending_and_cache(
+    plugin_host, rule_group_settings, monkeypatch, failure,
+):
+    host, settings = plugin_host, rule_group_settings
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    if failure == "name_collision":
+        settings.values["UserFilterRuleGroups"].append({
+            "name": host.module.UNFILTERED_GROUP_NAME, "rule_string": "WEBDL & 4K",
+        })
+    else:
+        monkeypatch.setattr(settings.oper, "update_atomically", None)
+        monkeypatch.setattr(settings.oper, "set", lambda *_args: False)
+    original = copy.deepcopy(settings.values)
+    success, _message, draft = plugin.preview_candidate(choice, '{"filter_groups":[]}')
+    assert success
+    success, message = plugin.confirm_candidate(choice, draft)
+    assert success is False
+    assert "不使用规则组设置失败" in message
+    assert host.subscriptions[2].state == "S"
+    assert host.subscriptions[2].quality is None
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+    assert plugin._preview_search_cache
+    assert settings.values == original
