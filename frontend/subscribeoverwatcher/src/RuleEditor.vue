@@ -55,7 +55,7 @@ const CUSTOM = '@custom'
 const NO_GROUPS = '@no-groups'
 const groupOptions = [
   { title: '保留原订阅 / 默认规则组', value: KEEP },
-  { title: '清空并不使用规则组（确认后生效）', value: NO_GROUPS },
+  { title: '不使用规则组（预览及确认后生效）', value: NO_GROUPS },
 ]
 const specFields = [
   { name: 'quality', label: '质量' }, { name: 'resolution', label: '分辨率' }, { name: 'effect', label: '特效' },
@@ -75,8 +75,8 @@ const rules = computed(() => ({ ...props.candidate.rules, ...parsed.value }))
 const groupSelection = computed(() => Array.isArray(rules.value.filter_groups) && !rules.value.filter_groups.length
   ? NO_GROUPS : KEEP)
 const groupHint = computed(() => groupSelection.value === NO_GROUPS
-  ? '确认后不再应用规则组，继续按站点、质量、分辨率、特效和包含/排除条件追更。'
-  : `当前：${props.candidate.original_filter_groups?.join('、') || '宿主默认规则组'}。预览不模拟规则组。`)
+  ? '本次预览跳过规则组；确认后按站点、质量、分辨率、特效和包含/排除条件追更。'
+  : `当前：${props.candidate.original_filter_groups?.join('、') || '宿主默认规则组'}。预览会应用规则组；结果不符合预期时可选择“不使用规则组”。`)
 const siteSummary = computed(() => {
   const sites = rules.value.sites ?? props.candidate.original_sites ?? []
   if (!sites.length) return '不限站点'

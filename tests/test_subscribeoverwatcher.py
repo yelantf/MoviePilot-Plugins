@@ -36,6 +36,8 @@ def plugin_host(monkeypatch):
     messages = []
     directories = []
     directory_calls = []
+    group_filter_calls = []
+    system_values = {}
 
     for name in ("app", "app.application", "app.application.torrent", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
@@ -113,6 +115,15 @@ def plugin_host(monkeypatch):
             contexts = list(search_results)
             callback = kwargs.get("candidate_filter")
             return callback(contexts) if callback else contexts
+
+        def filter_torrents(self, **kwargs):
+            """记录规则组调用，默认保留资源；具体组行为由场景提供。"""
+            group_filter_calls.append(kwargs)
+            return kwargs["torrent_list"]
+
+    class SystemConfigOper:
+        def get(self, key):
+            return copy.deepcopy(system_values.get(key))
 
     class MediaChain:
         """返回与订阅身份对应的媒体信息。"""
@@ -321,6 +332,7 @@ def plugin_host(monkeypatch):
         "app.chain.search": {"SearchChain": SearchChain},
         "app.chain.subscribe": {"SubscribeChain": SubscribeChain},
         "app.db.oper.subscribe": {"SubscribeOper": SubscribeOper},
+        "app.db.oper.systemconfig": {"SystemConfigOper": SystemConfigOper},
         "app.plugins": {"_PluginBase": PluginBase},
         "app.schemas.media": {"build_media_key": build_media_key,
                               "resolve_media_identity": resolve_media_identity},
@@ -331,6 +343,11 @@ def plugin_host(monkeypatch):
             "MediaSource": lambda value: value,
             "MediaType": SimpleNamespace(TV=SimpleNamespace(value="电视剧")),
             "MessageType": SimpleNamespace(Plugin="plugin"),
+            "SystemConfigKey": SimpleNamespace(
+                UserFilterRuleGroups="UserFilterRuleGroups", CustomFilterRules="CustomFilterRules",
+                SubscribeFilterRuleGroups="SubscribeFilterRuleGroups",
+                BestVersionFilterRuleGroups="BestVersionFilterRuleGroups",
+            ),
         },
         "app.sdk.events": {"Event": SimpleNamespace, "eventmanager": SimpleNamespace(register=register)},
         "app.sdk.logging": {"logger": SimpleNamespace(
@@ -360,6 +377,7 @@ def plugin_host(monkeypatch):
         messages=messages,
         directories=directories, directory_calls=directory_calls,
         directory_module=directory_module,
+        group_filter_calls=group_filter_calls, system_values=system_values,
     )
 
 
@@ -2503,6 +2521,8 @@ def rule_group_settings(plugin_host, monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(sys.modules["app.schemas.types"], "SystemConfigKey", SimpleNamespace(
         UserFilterRuleGroups="UserFilterRuleGroups",
+        CustomFilterRules="CustomFilterRules", SubscribeFilterRuleGroups="SubscribeFilterRuleGroups",
+        BestVersionFilterRuleGroups="BestVersionFilterRuleGroups",
     ), raising=False)
     return SimpleNamespace(values=values, writes=writes, oper=SystemConfigOper)
 
@@ -2583,3 +2603,214 @@ def test_failed_rule_group_configuration_keeps_subscription_pending_and_cache(
     assert plugin._state["entries"]["2"]["status"] == "pending"
     assert plugin._preview_search_cache
     assert settings.values == original
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_preview_compares_groups_and_only_updates_draft_when_groups_remove_every_match(
+    plugin_host, rule_group_settings, monkeypatch, explicit,
+):
+    """同一缓存比较两种策略，自动回填草稿但确认前不修改订阅或共享资源。"""
+    host, settings = plugin_host, rule_group_settings
+    plugin, choice, context = _prepare_directory_confirmation(host)
+    if explicit:
+        host.subscriptions[2].filter_groups = ["自选规则组"]
+    expected_groups = ["自选规则组"] if explicit else ["严格规则组"]
+    origin = "原订阅规则组" if explicit else "系统默认规则组"
+    calls = []
+
+    def reject_all(_self, **kwargs):
+        calls.append(kwargs)
+        for torrent in kwargs["torrent_list"]:
+            torrent.pri_order = 999
+            torrent.labels.append("仅在副本中出现")
+        return []
+
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", reject_all)
+    round_count = len(host.search_calls)
+    plugin.init_plugin({
+        "enabled": True, "operation": "preview", "candidate": choice, "rule_mode": "all_sites",
+        "rule_json": '{"filter_groups":{"subscription":true}}',
+    })
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    draft = host.storage["config"]["rule_json"]
+    assert json.loads(draft)["filter_groups"] == []
+    assert preview["rules"]["filter_groups"] == []
+    assert preview["matched_count"] == 1
+    assert preview["rule_groups_checked"] is True
+    assert preview["rule_groups_auto_disabled"] is True
+    assert preview["rule_groups_disabled"] is True
+    assert preview["rule_group_comparison"] == {
+        "names": expected_groups, "source": "原订阅" if explicit else "宿主默认",
+        "with_groups_count": 0, "without_groups_count": 1,
+    }
+    assert origin in preview["rule_group_notice"]
+    assert "已自动选择" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert len(host.search_calls) == round_count
+    assert len(calls) == 1
+    assert calls[0]["rule_groups"] == expected_groups
+    assert calls[0]["torrent_list"][0] is not context.torrent_info
+    assert "仅在副本中出现" not in context.torrent_info.labels
+    assert getattr(context.torrent_info, "pri_order", None) != 999
+    assert host.subscriptions[2].filter_groups == (expected_groups if explicit else [])
+    assert host.subscriptions[2].state == "S"
+    assert settings.writes == []
+    assert plugin.confirm_candidate(choice, draft, "all_sites")[0]
+    assert host.subscriptions[2].filter_groups == [host.module.UNFILTERED_GROUP_NAME]
+
+
+def test_preview_keeps_groups_when_some_resources_pass_and_can_explicitly_skip_them(
+    plugin_host, rule_group_settings, monkeypatch,
+):
+    host = plugin_host
+    plugin, choice, _context_chosen = _prepare_directory_confirmation(host)
+    host.search_results.append(_context("Show.S01E02.1080p.WEB-DL.HDR-TEAM.blocked", episodes=(2,)))
+    calls = []
+
+    def filter_groups(_self, **kwargs):
+        calls.append(kwargs)
+        return [torrent for torrent in kwargs["torrent_list"] if "blocked" not in torrent.title]
+
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", filter_groups)
+    success, _message, draft = plugin.preview_candidate(
+        choice, '{"filter_groups":{"subscription":true}}', "all_sites", refresh_search=True,
+    )
+    assert success
+    preview = plugin.get_form()[1]["_candidate_preview"]
+    assert preview["matched_count"] == 1
+    assert preview["rejected_count"] == 1
+    assert preview["rule_group_comparison"]["with_groups_count"] == 1
+    assert preview["rule_group_comparison"]["without_groups_count"] == 2
+    assert preview["rule_groups_disabled"] is False
+    assert preview["rule_groups_auto_disabled"] is False
+    assert preview["rule_group_notice"] == ""
+    assert json.loads(draft)["filter_groups"] == {"subscription": True}
+    assert preview["rejection_summary"] == [{"reason": "不符合系统默认规则组：严格规则组", "count": 1}]
+    assert next(item for item in preview["effective_rules"] if item["field"] == "filter_groups") == {
+        "field": "filter_groups", "label": "规则组", "value": "严格规则组", "source": "宿主默认",
+    }
+    calls.clear()
+    assert plugin.preview_candidate(choice, '{"filter_groups":[]}', "all_sites")[0]
+    preview = plugin.get_form()[1]["_candidate_preview"]
+    assert preview["matched_count"] == 2
+    assert preview["rule_groups_disabled"] is True
+    assert preview["rule_groups_auto_disabled"] is False
+    assert preview["rule_group_comparison"] is None
+    assert calls == []
+
+
+def test_no_base_matches_does_not_blame_or_disable_rule_groups(plugin_host, rule_group_settings, monkeypatch):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+
+    def should_not_filter(*_args, **_kwargs):
+        pytest.fail("没有基础条件通过的资源时不应调用规则组筛选")
+
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", should_not_filter)
+    success, _message, draft = plugin.preview_candidate(choice, '{"include":"MISSING"}', "all_sites")
+    assert success
+    preview = plugin.get_form()[1]["_candidate_preview"]
+    assert preview["matched_count"] == 0
+    assert preview["rule_groups_auto_disabled"] is False
+    assert preview["rule_groups_disabled"] is False
+    assert preview["rule_group_comparison"]["without_groups_count"] == 0
+    assert "filter_groups" not in json.loads(draft)
+    assert "缺少包含标识" in preview["rejection_summary"][0]["reason"]
+
+
+def test_rule_group_failure_is_reported_without_automatically_changing_the_policy(
+    plugin_host, rule_group_settings, monkeypatch,
+):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+
+    def broken_groups(*_args, **_kwargs):
+        raise RuntimeError("无效的规则表达式")
+
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", broken_groups)
+    raw = '{"filter_groups":{"subscription":true}}'
+    success, message, draft = plugin.preview_candidate(choice, raw, "all_sites")
+    assert success is False
+    assert "规则组筛选失败" in message
+    assert draft == raw
+    assert "preview" not in host.storage["gate_state"]["entries"]["2"]
+    assert host.subscriptions[2].filter_groups == []
+    assert rule_group_settings.writes == []
+    assert plugin.preview_candidate(choice, '{"filter_groups":[]}', "all_sites")[0]
+
+
+@pytest.mark.parametrize("changed", ["selection", "definition", "custom_rule"])
+def test_rule_group_changes_invalidate_confirmation(plugin_host, rule_group_settings, changed):
+    host, settings = plugin_host, rule_group_settings
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    success, _message, draft = plugin.preview_candidate(choice)
+    assert success
+    if changed == "selection":
+        settings.values["SubscribeFilterRuleGroups"] = ["其他规则组"]
+    elif changed == "definition":
+        settings.values["UserFilterRuleGroups"][0]["rule_string"] = "WEBDL & HDR"
+    else:
+        settings.values["CustomFilterRules"] = [{"id": "TEAM", "include": "CHANGED"}]
+    assert plugin.confirm_candidate(choice, draft)[0] is False
+    assert host.subscriptions[2].state == "S"
+    assert host.subscriptions[2].quality is None
+
+
+def test_rule_group_changes_during_filtering_require_a_new_preview(plugin_host, rule_group_settings, monkeypatch):
+    host, settings = plugin_host, rule_group_settings
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+
+    def change_configuration(_self, **kwargs):
+        settings.values["UserFilterRuleGroups"][0]["rule_string"] = "WEBDL & HDR"
+        return kwargs["torrent_list"]
+
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", change_configuration)
+    success, message, _draft = plugin.preview_candidate(choice)
+    assert success is False
+    assert "规则组配置已变化" in message
+    assert "preview" not in host.storage["gate_state"]["entries"]["2"]
+
+
+def test_replacement_preview_applies_groups_without_changing_an_approved_subscription(
+    plugin_host, rule_group_settings, monkeypatch,
+):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    success, _message, draft = plugin.preview_candidate(choice)
+    assert success and plugin.confirm_candidate(choice, draft)[0]
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", lambda *_args, **_kwargs: [])
+    assert plugin.preview_replacements("2")[0]
+    preview = plugin.get_form()[1]["_replacement_preview"]
+    assert preview["matched_count"] == 0
+    assert preview["rule_group_comparison"]["without_groups_count"] == 1
+    assert preview["rule_groups_auto_disabled"] is False
+    assert host.subscriptions[2].filter_groups == []
+
+
+def test_preview_uses_subscription_groups_before_normal_or_best_version_defaults(plugin_host, rule_group_settings):
+    host = plugin_host
+    subscribe = _subscribe(2)
+    assert host.module.preview_group_policy(subscribe)["names"] == ["严格规则组"]
+    subscribe.best_version = 1
+    assert host.module.preview_group_policy(subscribe)["names"] == ["洗版规则组"]
+    subscribe.filter_groups = ["自选规则组"]
+    assert host.module.preview_group_policy(subscribe)["names"] == ["自选规则组"]
+
+
+def test_replacement_rechecks_rule_groups_against_the_fresh_resource_before_downloading(
+    plugin_host, rule_group_settings, monkeypatch,
+):
+    host = plugin_host
+    plugin, choice, context = _prepare_directory_confirmation(host)
+    context.torrent_info.labels = ["allowed"]
+    monkeypatch.setattr(host.module.SearchChain, "filter_torrents", lambda _self, **kwargs: [
+        torrent for torrent in kwargs["torrent_list"] if "allowed" in torrent.labels
+    ])
+    success, _message, draft = plugin.preview_candidate(choice)
+    assert success and plugin.confirm_candidate(choice, draft)[0]
+    assert plugin.preview_replacements("2")[0]
+    resource = plugin._state["entries"]["2"]["replacement_preview"]["matched"][0]
+    context.torrent_info.labels = ["blocked"]
+    success, message = plugin.submit_replacement(f"2:{resource['id']}", "1")
+    assert success is False
+    assert "系统默认规则组" in message
+    assert host.downloads == []

@@ -4,6 +4,15 @@
     <v-alert v-if="stale" type="warning" variant="tonal" density="compact" class="mb-3">
       规则、站点或目录已修改；以下是上次预览，请重新预览后确认。
     </v-alert>
+    <v-alert v-if="preview.rule_groups_auto_disabled" type="warning" variant="tonal" density="compact" class="mb-3">
+      {{ preview.rule_group_notice }}
+    </v-alert>
+    <p v-if="preview.rule_group_comparison" class="text-body-2 mb-3">
+      规则组对比（{{ preview.rule_group_comparison.source === '原订阅' ? '原订阅' : '系统默认' }}：
+      {{ preview.rule_group_comparison.names.join('、') }}）：
+      考虑规则组通过 {{ preview.rule_group_comparison.with_groups_count }} 条，
+      不使用规则组通过 {{ preview.rule_group_comparison.without_groups_count }} 条。
+    </p>
     <v-alert v-if="preview.search_cached && preview.search_result_count === 0" type="warning"
       variant="tonal" density="compact" class="mb-3">
       当前站点范围的搜索缓存中没有资源；本次复用了空结果，建议手动重新搜索以获取最新资源。
@@ -45,7 +54,8 @@
       当前展示前 {{ preview.matched_shown ?? Math.min(preview.matched_count, 80) }} 条通过、
       前 {{ preview.rejected_shown ?? Math.min(preview.rejected_count, 40) }} 条排除资源；跨站相同版本合并展示，统计按资源条数计算。
       <span v-if="preview.rule_groups_disabled">确认后不使用规则组，按站点及基础条件追更。</span>
-      <span v-else>正式追更还会应用原订阅或宿主默认规则组。</span>
+      <span v-else-if="preview.rule_groups_checked">本次预览已考虑规则组，正式追更沿用相同选择。</span>
+      <span v-else>这条历史预览未考虑规则组，请重新预览。</span>
     </p>
     <div v-if="preview.table" class="overflow-x-auto">
       <schema-node :node="preview.table" />

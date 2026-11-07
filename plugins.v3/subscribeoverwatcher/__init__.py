@@ -36,7 +36,7 @@ from .rules import (
     public_page_url, resource_candidate,
     target_seasons,
 )
-from .rulegroups import UNFILTERED_GROUP_NAME, ensure_unfiltered_group
+from .rulegroups import UNFILTERED_GROUP_NAME, ensure_unfiltered_group, group_rejections, preview_group_policy
 
 
 def _utc_now() -> str:
@@ -162,6 +162,7 @@ def _rule_scope(subscribe: Any) -> str:
         {
             "identity": _identity(subscribe),
             "total_episode": subscribe.total_episode,
+            "rule_groups": preview_group_policy(subscribe),
             "rules": {name: getattr(subscribe, name, None) for name in (
                 "quality", "resolution", "effect", "include", "exclude", "sites", "filter_groups",
                 "best_version", "best_version_full", "current_priority", "episode_priority",
@@ -324,6 +325,7 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
             "choice", "rule_mode", "download_directory", "draft_json", "searched_at", "searched_ts",
             "matched_count", "rejected_count", "search_cached", "search_age_seconds", "timings",
             "search_result_count", "search_trigger", "rule_groups_disabled",
+            "rule_groups_checked", "rule_groups_auto_disabled", "rule_group_notice", "rule_group_comparison",
             "effective_rules", "rejection_summary", "search_source", "search_result_at", "search_sites",
         )},
         "subscription_id": sid, "table": _preview_table(preview),
@@ -343,7 +345,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.0"
+    plugin_version = "1.9.1"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -957,6 +959,7 @@ class SubscribeOverwatcher(_PluginBase):
         self, subscribe: Any, rules: dict[str, Any], *, require_episodes: bool = False,
         download_directory: str = "",
         refresh_search: bool = False, candidate: Optional[dict[str, Any]] = None,
+        auto_disable_rule_groups: bool = False,
     ) -> dict[str, Any]:
         """
         只搜索并筛选当前资源，不更新订阅或提交下载。
@@ -981,12 +984,14 @@ class SubscribeOverwatcher(_PluginBase):
         )
         filtering_started = time.perf_counter()
         filter_params = SubscribeChain.get_params(working)
+        groups_disabled = rules.get("filter_groups") == [] \
+            or getattr(working, "filter_groups", None) == [UNFILTERED_GROUP_NAME]
+        policy = preview_group_policy(working, disabled=groups_disabled)
         summary = rule_summary(filter_params, getattr(working, "sites", None) or [], candidate,
-                               working=working, rules=rules)
+                               working=working, rules=rules, group_policy=policy)
         directory_seconds = 0.0
         now = _utc_now()
-        matched: list[dict[str, Any]] = []
-        rejected: list[dict[str, Any]] = []
+        records = []
         for context in contexts:
             try:
                 item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, now)
@@ -1004,21 +1009,44 @@ class SubscribeOverwatcher(_PluginBase):
                     reason = self._rule_rejection(working, context, filter_params)
                 except (TypeError, ValueError, AttributeError):
                     reason = "资源字段不完整，无法核对规则"
-                if reason is None:
-                    directory_started = time.perf_counter()
-                    try:
-                        item["download_path"] = preview_download_path(
-                            getattr(context, "media_info", None),
-                            download_directory or getattr(subscribe, "save_path", None),
-                        )
-                    except ValueError as error:
-                        item["download_path_error"] = str(error)
-                    finally:
-                        directory_seconds += time.perf_counter() - directory_started
+            records.append((context, item, reason))
+
+        base_matches = [context for context, _item, reason in records if reason is None]
+        group_failures = group_rejections(base_matches, policy)
+        if preview_group_policy(working, disabled=groups_disabled) != policy:
+            raise ValueError("预览期间规则组配置已变化，请重新预览")
+        with_groups_count = len(base_matches) - len(group_failures)
+        auto_disabled = bool(auto_disable_rule_groups and not groups_disabled and policy["names"]
+                             and base_matches and with_groups_count == 0)
+        notice = ""
+        if auto_disabled:
+            rules["filter_groups"] = []
+            working.filter_groups = []
+            groups_disabled = True
+            origin = "原订阅规则组" if policy["source"] == "原订阅" else "系统默认规则组"
+            notice = (f"{origin}（{'、'.join(policy['names'])}）过滤了全部 {len(base_matches)} 条可匹配资源；"
+                      "已自动选择“不使用规则组”，当前展示跳过规则组的预览。确认后才会修改订阅的规则组设置。")
+            summary = rule_summary(filter_params, getattr(working, "sites", None) or [], candidate,
+                                   working=working, rules=rules, group_policy=policy)
+        matched: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for context, item, reason in records:
+            if reason is None and not groups_disabled:
+                reason = group_failures.get(id(context))
             if reason:
                 item["reason"] = readable_rejection(reason, summary)
                 rejected.append(item)
             else:
+                directory_started = time.perf_counter()
+                try:
+                    item["download_path"] = preview_download_path(
+                        getattr(context, "media_info", None),
+                        download_directory or getattr(subscribe, "save_path", None),
+                    )
+                except ValueError as error:
+                    item["download_path_error"] = str(error)
+                finally:
+                    directory_seconds += time.perf_counter() - directory_started
                 matched.append(item)
         priority = {"full_season": 4, "cross_season": 3, "suspected_full": 2,
                     "first_episode": 1, "episode": 0}
@@ -1043,8 +1071,12 @@ class SubscribeOverwatcher(_PluginBase):
             "search_cached": cached, "search_age_seconds": round(cache_age, 1),
             "search_result_count": len(contexts),
             "search_trigger": "cache" if cached else "manual" if refresh_search else "cache_miss",
-            "rule_groups_disabled": rules.get("filter_groups") == []
-                or getattr(working, "filter_groups", None) == [UNFILTERED_GROUP_NAME],
+            "rule_groups_checked": True, "rule_groups_disabled": groups_disabled,
+            "rule_groups_auto_disabled": auto_disabled, "rule_group_notice": notice,
+            "rule_group_comparison": {
+                "names": policy["names"], "source": policy["source"],
+                "with_groups_count": with_groups_count, "without_groups_count": len(base_matches),
+            } if policy["names"] else None,
             "search_source": source, "search_result_at": result_at, "search_sites": search_sites,
             "timings": {key: round(value, 3) for key, value in timings.items()},
             "effective_rules": summary,
@@ -1093,7 +1125,11 @@ class SubscribeOverwatcher(_PluginBase):
             preview = self._search_rule_preview(
                 subscribe, rules, download_directory=download_directory,
                 refresh_search=refresh_search, candidate=candidate,
+                auto_disable_rule_groups=True,
             )
+        except ValueError as error:
+            logger.exception(f"预览订阅 {sid} 的规则匹配失败")
+            return False, str(error), rule_json
         except Exception:
             logger.exception(f"预览订阅 {sid} 的规则匹配失败")
             return False, "搜索失败，请查看插件日志后重试", rule_json
@@ -1111,7 +1147,8 @@ class SubscribeOverwatcher(_PluginBase):
         selected = next((item for item in preview["matched"] if item["id"] == candidate_id), {})
         path = selected.get("download_path") or selected.get("download_path_error")
         destination = f"；预计下载目录：{path}" if path else ""
-        return True, f"当前匹配 {preview['matched_count']} 条，排除 {preview['rejected_count']} 条；订阅仍保持待确认{destination}", normalized_json
+        notice = f"；{preview['rule_group_notice']}" if preview.get("rule_group_notice") else ""
+        return True, f"当前匹配 {preview['matched_count']} 条，排除 {preview['rejected_count']} 条；订阅仍保持待确认{destination}{notice}", normalized_json
 
     def confirm_candidate(
         self, choice: str, rule_json: Optional[str] = None, rule_mode: str = "candidate",
@@ -1152,6 +1189,7 @@ class SubscribeOverwatcher(_PluginBase):
                 except ValueError as error:
                     return False, str(error)
             if preview.get("choice") != choice or preview.get("scope") != _rule_scope(subscribe) \
+                    or preview.get("rule_groups_checked") is not True \
                     or preview.get("rule_mode", "candidate") != rule_mode \
                     or not isinstance(preview.get("searched_ts"), (int, float)) \
                     or datetime.now(timezone.utc).timestamp() - preview["searched_ts"] > 1800:
@@ -1331,6 +1369,9 @@ class SubscribeOverwatcher(_PluginBase):
             scope = _rule_scope(subscribe)
         try:
             preview = self._search_rule_preview(subscribe, {}, require_episodes=True, refresh_search=refresh_search)
+        except ValueError as error:
+            logger.exception(f"预览订阅 {sid} 的回刷资源失败")
+            return False, str(error)
         except Exception:
             logger.exception(f"预览订阅 {sid} 的回刷资源失败")
             return False, "搜索失败，请查看插件日志后重试"
@@ -1369,6 +1410,7 @@ class SubscribeOverwatcher(_PluginBase):
                 return False, str(error)
             scope = _rule_scope(subscribe)
             if preview.get("scope") != scope or not isinstance(preview.get("searched_ts"), (int, float)) \
+                    or preview.get("rule_groups_checked") is not True \
                     or datetime.now(timezone.utc).timestamp() - preview["searched_ts"] > 1800:
                 return False, "当前规则或订阅已变化，请在 30 分钟内重新预览"
             if resource_id not in {item.get("id") for item in preview.get("matched") or []}:
@@ -1403,8 +1445,15 @@ class SubscribeOverwatcher(_PluginBase):
             if not current or not self._is_approved(current) or _rule_scope(current) != scope:
                 return False, "提交前订阅或规则已变化，未开始下载"
             reason = self._rule_rejection(current, context)
+            if reason is None:
+                try:
+                    reason = group_rejections([context], preview_group_policy(current)).get(id(context))
+                except ValueError as error:
+                    return False, f"{error}；未开始下载"
             if reason:
                 return False, f"资源已不匹配当前规则：{reason}；未开始下载"
+            if _rule_scope(current) != scope:
+                return False, "提交前规则组配置已变化，未开始下载"
             try:
                 result = DownloadChain().download_single(
                     context, episodes=episodes,
@@ -1891,6 +1940,10 @@ class SubscribeOverwatcher(_PluginBase):
                             f"{preview.get('matched_count', 0)} 条，排除 {preview.get('rejected_count', 0)} 条。"
                             "仅显示前 80 条通过和前 40 条排除资源；确认前若修改规则，需重新预览。",
                 }})
+                if preview.get("rule_group_notice"):
+                    page.append({"component": "VAlert", "props": {
+                        "type": "warning", "variant": "tonal", "text": preview["rule_group_notice"],
+                    }})
                 page.append(_preview_table(preview))
                 if _full_season_version_count(preview.get("matched") or []) > 1:
                     page.append({"component": "VAlert", "props": {

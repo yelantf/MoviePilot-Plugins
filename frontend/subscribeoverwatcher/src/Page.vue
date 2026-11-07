@@ -4,7 +4,7 @@
       <span class="text-subtitle-1">剧集守门员</span>
       <v-spacer />
       <v-btn variant="tonal" color="primary" :loading="loading" @click="refreshPage">刷新</v-btn>
-      <v-btn variant="tonal" @click="emit('switch')">配置</v-btn>
+      <v-btn variant="tonal" @click="emit('switch')">{{ embedded ? '返回设置' : '配置' }}</v-btn>
     </div>
     <v-alert v-if="error" type="error" variant="tonal" class="mb-4">{{ error }}</v-alert>
     <v-progress-linear v-if="loading && !page.length" indeterminate color="primary" />
@@ -20,13 +20,20 @@ import { CANDIDATE_SELECTION_EVENT, queueCandidateSelection } from './candidateS
 import SchemaNode from './schemaNode'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
-const props = defineProps({ api: { type: [Object, Function], required: true } })
-const emit = defineEmits(['switch'])
+const props = defineProps({
+  api: { type: [Object, Function], required: true },
+  embedded: { type: Boolean, default: false },
+})
+const emit = defineEmits(['switch', 'select-candidate'])
 const page = ref([])
 const loading = ref(false)
 const error = ref('')
 
 function selectCandidate(candidateId) {
+  if (props.embedded) {
+    emit('select-candidate', candidateId)
+    return
+  }
   if (!queueCandidateSelection(candidateId)) {
     error.value = '无法暂存所选版本，请在配置页手动选择'
     return

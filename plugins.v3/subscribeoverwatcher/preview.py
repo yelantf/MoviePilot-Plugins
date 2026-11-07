@@ -137,6 +137,7 @@ def display_draft_rules(candidate: dict[str, Any], rules: dict[str, Any]) -> dic
 def rule_summary(
     params: dict[str, Any], sites: list[int], candidate: Optional[dict[str, Any]] = None,
     *, working: Any = None, rules: Optional[dict[str, Any]] = None,
+    group_policy: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, str]]:
     """展示本次筛选的实际条件，包括宿主默认条件。"""
     displayed = display_draft_rules(candidate or {}, params)
@@ -149,9 +150,12 @@ def rule_summary(
     elif groups == [UNFILTERED_GROUP_NAME]:
         group_label, group_source = "不使用规则组", "原订阅"
     elif groups:
-        group_label, group_source = "、".join(groups) + "（预览未模拟）", "原订阅"
+        group_label, group_source = "、".join(groups), "原订阅"
+    elif group_policy is not None:
+        group_label = "、".join(group_policy["names"]) or "未配置规则组"
+        group_source = group_policy["source"]
     else:
-        group_label, group_source = "使用宿主默认规则组（预览未模拟）", "宿主默认"
+        group_label, group_source = "使用宿主默认规则组", "宿主默认"
     summary.append({"field": "filter_groups", "label": "规则组", "value": group_label, "source": group_source})
     defaults = candidate_default_rules(candidate or {})
     for field, value in displayed.items():

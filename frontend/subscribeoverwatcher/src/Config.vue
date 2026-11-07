@@ -1,212 +1,218 @@
 <template>
-  <div class="subscribe-overwatcher pa-3 pa-sm-4">
-    <v-alert v-if="feedback.section === 'settings'" :type="feedback.type" variant="tonal"
-      density="comfortable" class="mb-4">{{ feedback.text }}</v-alert>
-    <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-4" />
+  <div class="subscribe-overwatcher">
+    <div v-show="!dataPageVisible" class="pa-3 pa-sm-4">
+      <v-alert v-if="feedback.section === 'settings'" :type="feedback.type" variant="tonal"
+        density="comfortable" class="mb-4">{{ feedback.text }}</v-alert>
+      <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-4" />
 
-    <template v-else>
-      <v-card variant="outlined" class="mb-4">
-        <v-card-title class="text-subtitle-1">基础设置</v-card-title>
-        <v-card-text>
-          <v-row>
-            <v-col cols="12" sm="6">
-              <v-switch v-model="form.enabled" label="接管新增剧集订阅" density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="12" sm="6">
-              <v-switch v-model="form.confirm_full_pack" label="全集种子也需确认" density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="12" sm="6">
-              <v-switch v-model="form.daily_notice" label="每天推送待确认订阅汇总" density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="6" sm="3">
-              <v-select v-model="form.notice_hour" label="通知小时" :items="options.notice_hour"
-                density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="6" sm="3">
-              <v-select v-model="form.notice_minute" label="通知分钟" :items="options.notice_minute"
-                density="comfortable" hide-details />
-            </v-col>
-          </v-row>
-          <v-alert type="info" variant="tonal" density="compact" class="mt-3">
-            开启全集确认后，新剧集暂停；关闭后仍拦截分集下载，只允许符合原规则的整季资源自动下载。
-            目标季候选每 4 小时更新。
-          </v-alert>
-        </v-card-text>
-        <v-card-actions class="px-4 pb-4">
-          <v-btn variant="text" @click="emit('switch')">查看详情与预览结果</v-btn>
-          <v-spacer />
-          <v-btn color="primary" variant="tonal" :loading="busy === 'save'" :disabled="!!busy"
-            @click="submit('save')">保存设置</v-btn>
-        </v-card-actions>
-      </v-card>
+      <template v-else>
+        <v-card variant="outlined" class="mb-4">
+          <v-card-title class="text-subtitle-1">基础设置</v-card-title>
+          <v-card-text>
+            <v-row>
+              <v-col cols="12" sm="6">
+                <v-switch v-model="form.enabled" label="接管新增剧集订阅" density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="12" sm="6">
+                <v-switch v-model="form.confirm_full_pack" label="全集种子也需确认" density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="12" sm="6">
+                <v-switch v-model="form.daily_notice" label="每天推送待确认订阅汇总" density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="6" sm="3">
+                <v-select v-model="form.notice_hour" label="通知小时" :items="options.notice_hour"
+                  density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="6" sm="3">
+                <v-select v-model="form.notice_minute" label="通知分钟" :items="options.notice_minute"
+                  density="comfortable" hide-details />
+              </v-col>
+            </v-row>
+            <v-alert type="info" variant="tonal" density="compact" class="mt-3">
+              开启全集确认后，新剧集暂停；关闭后仍拦截分集下载，只允许符合原规则的整季资源自动下载。
+              目标季候选每 4 小时更新。
+            </v-alert>
+          </v-card-text>
+          <v-card-actions class="px-4 pb-4">
+            <v-btn variant="text" @click="dataPageVisible = true">查看数据页面</v-btn>
+            <v-spacer />
+            <v-btn color="primary" variant="tonal" :loading="busy === 'save'" :disabled="!!busy"
+              @click="submit('save')">保存设置</v-btn>
+          </v-card-actions>
+        </v-card>
 
-      <v-alert type="info" variant="tonal" density="compact" class="mb-4">{{ managedSummary }}</v-alert>
+        <v-alert type="info" variant="tonal" density="compact" class="mb-4">{{ managedSummary }}</v-alert>
 
-      <v-card variant="outlined" class="mb-4">
-        <v-card-title class="text-subtitle-1">纳入历史剧集</v-card-title>
-        <v-card-text>
-          <v-autocomplete v-model="form.historical_subscription" label="选择历史剧集（可多选，按进度排序）"
-            :items="options.historical_subscription" multiple chips closable-chips clearable
-            density="comfortable" hide-details no-data-text="暂无可纳入管理的历史剧集订阅" />
-          <v-alert v-if="feedback.section === 'history'" :type="feedback.type" variant="tonal"
-            density="compact" class="mt-3">{{ feedback.text }}</v-alert>
-        </v-card-text>
-        <v-card-actions class="px-4 pb-4">
-          <v-spacer />
-          <v-btn color="primary" variant="tonal" :loading="busy === 'adopt'"
-            :disabled="!!busy || !form.historical_subscription.length" @click="submit('adopt')">
-            纳入所选剧集
-          </v-btn>
-        </v-card-actions>
-      </v-card>
+        <v-card variant="outlined" class="mb-4">
+          <v-card-title class="text-subtitle-1">纳入历史剧集</v-card-title>
+          <v-card-text>
+            <v-autocomplete v-model="form.historical_subscription" label="选择历史剧集（可多选，按进度排序）"
+              :items="options.historical_subscription" multiple chips closable-chips clearable
+              density="comfortable" hide-details no-data-text="暂无可纳入管理的历史剧集订阅" />
+            <v-alert v-if="feedback.section === 'history'" :type="feedback.type" variant="tonal"
+              density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+          </v-card-text>
+          <v-card-actions class="px-4 pb-4">
+            <v-spacer />
+            <v-btn color="primary" variant="tonal" :loading="busy === 'adopt'"
+              :disabled="!!busy || !form.historical_subscription.length" @click="submit('adopt')">
+              纳入所选剧集
+            </v-btn>
+          </v-card-actions>
+        </v-card>
 
-      <v-card ref="candidateCard" variant="outlined" class="mb-4">
-        <v-card-title class="text-subtitle-1">候选规则确认</v-card-title>
-        <v-card-text>
-          <v-alert v-if="handoffNotice" type="info" variant="tonal" density="compact" class="mb-4">
-            {{ handoffNotice }}
-          </v-alert>
-          <v-row>
-            <v-col cols="12" md="4">
-              <v-select v-model="form.candidate_subscription" label="选择有版本的剧集"
-                :items="options.candidate_subscription" :disabled="!!busy" clearable density="comfortable" hide-details
-                no-data-text="暂无有版本的待确认剧集" @update:model-value="selectCandidateSubscription" />
-            </v-col>
-            <v-col cols="12" md="5">
-              <v-select v-model="form.candidate" label="选择该剧集版本（全集优先）" :items="candidateChoices"
-                :disabled="!!busy || !form.candidate_subscription" clearable density="comfortable" hide-details
-                @update:model-value="selectCandidate" />
-            </v-col>
-            <v-col cols="12" md="3">
-              <v-select v-model="form.rule_mode" label="站点范围" :items="ruleModes"
-                :disabled="!!busy" density="comfortable" hide-details @update:model-value="updateSiteScope" />
-            </v-col>
-          </v-row>
-          <p class="text-caption text-medium-emphasis mt-2 mb-4">
-            候选按媒体身份搜索后筛选包含目标季的资源，跳过全局搜索规则组及本订阅的站点和筛选规则；列出首集、整季及跨季资源，并保留历史扫描版本。
-            候选选择项和详情页均显示种子大小及精确字节数。跨站资源只在标题、字节大小、集数和解析规格一致时合并展示；这里仍逐站点选择。
-            <span v-if="selectedCandidateUrl" class="ms-2">站点详情：</span>
-            <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
-              class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>
-          </p>
-          <v-select v-model="form.download_directory" label="下载目录（留空保留原目录）"
-            :items="options.download_directory" :disabled="!!busy || !form.candidate_subscription" clearable
-            density="comfortable" hint="确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理。"
-            persistent-hint class="mb-4" />
-          <v-alert v-if="form.download_directory && !selectedDownloadDirectory" type="warning"
-            variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
-          <rule-editor v-if="selectedCandidate" v-model="form.rule_json" :candidate="selectedCandidate"
-            :options="ruleOptions" :disabled="!!busy" />
-          <p class="text-caption text-medium-emphasis mt-2 mb-0">
-            只用所选站点时，预览仅搜索和筛选该站；“不限站点”保留其他规则选项。
-            有对应范围的候选扫描或预览搜索缓存就复用，每次都会重新核对生效规则和下载目录；点击“重新搜索”获取新资源。
-            确认后的候选和确认预览保留 24 小时，期满后定期清理。
-          </p>
-          <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
-            density="compact" class="mt-3">{{ feedback.text }}</v-alert>
-          <v-alert v-if="busy === 'preview'" type="info" variant="tonal" density="compact"
-            class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
-        </v-card-text>
-        <v-card-actions class="px-4 pb-4 flex-wrap ga-2">
-          <v-spacer />
-          <v-btn v-if="selectedPreview" variant="text" :disabled="!!busy || !selectedCandidate"
-            @click="submit('preview', true)">重新搜索并预览</v-btn>
-          <v-btn color="info" variant="tonal" :loading="busy === 'preview'"
-            :disabled="!!busy || !selectedCandidate" @click="submit('preview')">预览匹配</v-btn>
-          <v-btn color="primary" variant="tonal" :loading="busy === 'confirm'"
-            :disabled="!!busy || !selectedCandidate" @click="submit('confirm')">确认并恢复</v-btn>
-        </v-card-actions>
-      </v-card>
+        <v-card ref="candidateCard" variant="outlined" class="mb-4">
+          <v-card-title class="text-subtitle-1">候选规则确认</v-card-title>
+          <v-card-text>
+            <v-alert v-if="handoffNotice" type="info" variant="tonal" density="compact" class="mb-4">
+              {{ handoffNotice }}
+            </v-alert>
+            <v-row>
+              <v-col cols="12" md="4">
+                <v-select v-model="form.candidate_subscription" label="选择有版本的剧集"
+                  :items="options.candidate_subscription" :disabled="!!busy" clearable density="comfortable" hide-details
+                  no-data-text="暂无有版本的待确认剧集" @update:model-value="selectCandidateSubscription" />
+              </v-col>
+              <v-col cols="12" md="5">
+                <v-select v-model="form.candidate" label="选择该剧集版本（全集优先）" :items="candidateChoices"
+                  :disabled="!!busy || !form.candidate_subscription" clearable density="comfortable" hide-details
+                  @update:model-value="selectCandidate" />
+              </v-col>
+              <v-col cols="12" md="3">
+                <v-select v-model="form.rule_mode" label="站点范围" :items="ruleModes"
+                  :disabled="!!busy" density="comfortable" hide-details @update:model-value="updateSiteScope" />
+              </v-col>
+            </v-row>
+            <p class="text-caption text-medium-emphasis mt-2 mb-4">
+              候选按媒体身份搜索后筛选包含目标季的资源，跳过全局搜索规则组及本订阅的站点和筛选规则；列出首集、整季及跨季资源，并保留历史扫描版本。
+              候选选择项和详情页均显示种子大小及精确字节数。跨站资源只在标题、字节大小、集数和解析规格一致时合并展示；这里仍逐站点选择。
+              <span v-if="selectedCandidateUrl" class="ms-2">站点详情：</span>
+              <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
+                class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>
+            </p>
+            <v-select v-model="form.download_directory" label="下载目录（留空保留原目录）"
+              :items="options.download_directory" :disabled="!!busy || !form.candidate_subscription" clearable
+              density="comfortable" hint="确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理。"
+              persistent-hint class="mb-4" />
+            <v-alert v-if="form.download_directory && !selectedDownloadDirectory" type="warning"
+              variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
+            <rule-editor v-if="selectedCandidate" v-model="form.rule_json" :candidate="selectedCandidate"
+              :options="ruleOptions" :disabled="!!busy" />
+            <p class="text-caption text-medium-emphasis mt-2 mb-0">
+              只用所选站点时，预览仅搜索和筛选该站；“不限站点”保留其他规则选项。
+              有对应范围的候选扫描或预览搜索缓存就复用，每次都会重新核对生效规则和下载目录；点击“重新搜索”获取新资源。
+              确认后的候选和确认预览保留 24 小时，期满后定期清理。
+            默认预览应用原订阅或系统默认规则组；结果不符合预期时可选择“不使用规则组”。
+            </p>
+            <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
+              density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+            <v-alert v-if="busy === 'preview'" type="info" variant="tonal" density="compact"
+              class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
+          </v-card-text>
+          <v-card-actions class="px-4 pb-4 flex-wrap ga-2">
+            <v-spacer />
+            <v-btn v-if="selectedPreview" variant="text" :disabled="!!busy || !selectedCandidate"
+              @click="submit('preview', true)">重新搜索并预览</v-btn>
+            <v-btn color="info" variant="tonal" :loading="busy === 'preview'"
+              :disabled="!!busy || !selectedCandidate" @click="submit('preview')">预览匹配</v-btn>
+            <v-btn color="primary" variant="tonal" :loading="busy === 'confirm'"
+              :disabled="!!busy || !selectedCandidate" @click="submit('confirm')">确认并恢复</v-btn>
+          </v-card-actions>
+        </v-card>
 
-      <v-card v-if="selectedPreview" ref="previewCard" variant="outlined" class="mb-4">
-        <v-card-text>
-          <preview-results :preview="selectedPreview" :stale="previewStale" :disabled="!!busy"
-            @refresh-search="submit('preview', true)" />
-        </v-card-text>
-      </v-card>
+        <v-card v-if="selectedPreview" ref="previewCard" variant="outlined" class="mb-4">
+          <v-card-text>
+            <preview-results :preview="selectedPreview" :stale="previewStale" :disabled="!!busy"
+              @refresh-search="submit('preview', true)" />
+          </v-card-text>
+        </v-card>
 
-      <v-row>
-        <v-col cols="12" md="6">
-          <v-card variant="outlined" class="mb-4 h-100">
-            <v-card-title class="text-subtitle-1">直接批准</v-card-title>
-            <v-card-text>
-              <v-select v-model="form.direct_subscription" label="选择待确认订阅"
-                :items="options.direct_subscription" clearable density="comfortable" hide-details />
-              <v-alert v-if="feedback.section === 'approve'" :type="feedback.type" variant="tonal"
-                density="compact" class="mt-3">{{ feedback.text }}</v-alert>
-            </v-card-text>
-            <v-card-actions class="px-4 pb-4">
-              <v-spacer />
-              <v-btn color="primary" variant="tonal" :loading="busy === 'direct_approve'"
-                :disabled="!!busy || !form.direct_subscription" @click="submit('direct_approve')">
-                批准并保留原规则
-              </v-btn>
-            </v-card-actions>
-          </v-card>
-        </v-col>
-        <v-col cols="12" md="6">
-          <v-card variant="outlined" class="mb-4 h-100">
-            <v-card-title class="text-subtitle-1">撤销批准</v-card-title>
-            <v-card-text>
-              <v-select v-model="form.revoke_subscription" label="选择已批准订阅"
-                :items="options.revoke_subscription" clearable density="comfortable" hide-details />
-              <v-alert v-if="feedback.section === 'revoke'" :type="feedback.type" variant="tonal"
-                density="compact" class="mt-3">{{ feedback.text }}</v-alert>
-            </v-card-text>
-            <v-card-actions class="px-4 pb-4">
-              <v-spacer />
-              <v-btn color="warning" variant="tonal" :loading="busy === 'revoke'"
-                :disabled="!!busy || !form.revoke_subscription" @click="submit('revoke')">
-                撤销并暂停
-              </v-btn>
-            </v-card-actions>
-          </v-card>
-        </v-col>
-      </v-row>
+        <v-row>
+          <v-col cols="12" md="6">
+            <v-card variant="outlined" class="mb-4 h-100">
+              <v-card-title class="text-subtitle-1">直接批准</v-card-title>
+              <v-card-text>
+                <v-select v-model="form.direct_subscription" label="选择待确认订阅"
+                  :items="options.direct_subscription" clearable density="comfortable" hide-details />
+                <v-alert v-if="feedback.section === 'approve'" :type="feedback.type" variant="tonal"
+                  density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+              </v-card-text>
+              <v-card-actions class="px-4 pb-4">
+                <v-spacer />
+                <v-btn color="primary" variant="tonal" :loading="busy === 'direct_approve'"
+                  :disabled="!!busy || !form.direct_subscription" @click="submit('direct_approve')">
+                  批准并保留原规则
+                </v-btn>
+              </v-card-actions>
+            </v-card>
+          </v-col>
+          <v-col cols="12" md="6">
+            <v-card variant="outlined" class="mb-4 h-100">
+              <v-card-title class="text-subtitle-1">撤销批准</v-card-title>
+              <v-card-text>
+                <v-select v-model="form.revoke_subscription" label="选择已批准订阅"
+                  :items="options.revoke_subscription" clearable density="comfortable" hide-details />
+                <v-alert v-if="feedback.section === 'revoke'" :type="feedback.type" variant="tonal"
+                  density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+              </v-card-text>
+              <v-card-actions class="px-4 pb-4">
+                <v-spacer />
+                <v-btn color="warning" variant="tonal" :loading="busy === 'revoke'"
+                  :disabled="!!busy || !form.revoke_subscription" @click="submit('revoke')">
+                  撤销并暂停
+                </v-btn>
+              </v-card-actions>
+            </v-card>
+          </v-col>
+        </v-row>
 
-      <v-card variant="outlined" class="mb-4">
-        <v-card-title class="text-subtitle-1">回刷已入库集数</v-card-title>
-        <v-card-text>
-          <v-alert type="info" variant="tonal" density="compact" class="mb-4">
-            先预览已批准订阅的当前规则，再选择资源和集数提交。插件不删除旧文件，最终替换由 MoviePilot 整理流程决定。
-          </v-alert>
-          <v-row>
-            <v-col cols="12" md="8">
-              <v-select v-model="form.replace_subscription" label="选择已批准订阅"
-                :items="options.replace_subscription" clearable density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="12" md="4" class="d-flex align-center justify-end">
-              <v-btn color="info" variant="tonal" :loading="busy === 'preview_replace'"
-                :disabled="!!busy || !form.replace_subscription" @click="submit('preview_replace')">
-                预览可回刷资源
-              </v-btn>
-              <v-btn v-if="selectedReplacementPreview" variant="text" :disabled="!!busy"
-                @click="submit('preview_replace', true)">重新搜索回刷资源</v-btn>
-            </v-col>
-            <v-col cols="12" md="8">
-              <v-select v-model="form.replace_resource" label="选择预览通过的资源"
-                :items="options.replace_resource" clearable density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="12" md="4">
-              <v-text-field v-model="form.replace_episodes" label="重新下载集数（如 1,3-5）"
-                density="comfortable" hide-details />
-            </v-col>
-          </v-row>
-          <v-alert v-if="feedback.section === 'replace'" :type="feedback.type" variant="tonal"
-            density="compact" class="mt-3">{{ feedback.text }}</v-alert>
-          <v-alert v-if="busy === 'preview_replace'" type="info" variant="tonal" density="compact"
-            class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
-          <preview-results v-if="selectedReplacementPreview" :preview="selectedReplacementPreview" class="mt-4"
-            :disabled="!!busy" refresh-label="重新搜索回刷资源" @refresh-search="submit('preview_replace', true)" />
-        </v-card-text>
-        <v-card-actions class="px-4 pb-4">
-          <v-spacer />
-          <v-btn color="warning" variant="tonal" :loading="busy === 'submit_replace'"
-            :disabled="!!busy || !form.replace_resource || !String(form.replace_episodes || '').trim()"
-            @click="submit('submit_replace')">提交所选资源和集数</v-btn>
-        </v-card-actions>
-      </v-card>
-    </template>
+        <v-card variant="outlined" class="mb-4">
+          <v-card-title class="text-subtitle-1">回刷已入库集数</v-card-title>
+          <v-card-text>
+            <v-alert type="info" variant="tonal" density="compact" class="mb-4">
+              先预览已批准订阅的当前规则，再选择资源和集数提交。插件不删除旧文件，最终替换由 MoviePilot 整理流程决定。
+            </v-alert>
+            <v-row>
+              <v-col cols="12" md="8">
+                <v-select v-model="form.replace_subscription" label="选择已批准订阅"
+                  :items="options.replace_subscription" clearable density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="12" md="4" class="d-flex align-center justify-end">
+                <v-btn color="info" variant="tonal" :loading="busy === 'preview_replace'"
+                  :disabled="!!busy || !form.replace_subscription" @click="submit('preview_replace')">
+                  预览可回刷资源
+                </v-btn>
+                <v-btn v-if="selectedReplacementPreview" variant="text" :disabled="!!busy"
+                  @click="submit('preview_replace', true)">重新搜索回刷资源</v-btn>
+              </v-col>
+              <v-col cols="12" md="8">
+                <v-select v-model="form.replace_resource" label="选择预览通过的资源"
+                  :items="options.replace_resource" clearable density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="12" md="4">
+                <v-text-field v-model="form.replace_episodes" label="重新下载集数（如 1,3-5）"
+                  density="comfortable" hide-details />
+              </v-col>
+            </v-row>
+            <v-alert v-if="feedback.section === 'replace'" :type="feedback.type" variant="tonal"
+              density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+            <v-alert v-if="busy === 'preview_replace'" type="info" variant="tonal" density="compact"
+              class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
+            <preview-results v-if="selectedReplacementPreview" :preview="selectedReplacementPreview" class="mt-4"
+              :disabled="!!busy" refresh-label="重新搜索回刷资源" @refresh-search="submit('preview_replace', true)" />
+          </v-card-text>
+          <v-card-actions class="px-4 pb-4">
+            <v-spacer />
+            <v-btn color="warning" variant="tonal" :loading="busy === 'submit_replace'"
+              :disabled="!!busy || !form.replace_resource || !String(form.replace_episodes || '').trim()"
+              @click="submit('submit_replace')">提交所选资源和集数</v-btn>
+          </v-card-actions>
+        </v-card>
+      </template>
+
+    </div>
+    <data-page v-if="dataPageVisible" :api="api" embedded @switch="dataPageVisible = false"
+      @select-candidate="selectDataCandidate" />
   </div>
 </template>
 
@@ -215,6 +221,7 @@ import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, reactive, 
 import { CANDIDATE_SELECTION_EVENT, takeCandidateSelection } from './candidateSelection'
 import PreviewResults from './PreviewResults.vue'
 import RuleEditor from './RuleEditor.vue'
+import DataPage from './Page.vue'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
@@ -264,6 +271,7 @@ const candidatePreview = ref(null)
 const replacementPreview = ref(null)
 const ruleOptions = ref({})
 const handoffNotice = ref('')
+const dataPageVisible = ref(false)
 const feedback = reactive({ section: '', type: 'info', text: '' })
 function candidateSubscriptionId(item) {
   return String(item.subscription_id ?? String(item.value).split(':')[0])
@@ -343,18 +351,20 @@ function walk(nodes, visit) {
   }
 }
 
-function applySnapshot(snapshot) {
+function applySnapshot(snapshot, { preserveForm = false } = {}) {
   const source = snapshot?.data?.conf ? snapshot.data : snapshot
   if (!source?.conf || !source?.model) throw new Error('配置数据未返回完整表单')
   const model = { ...props.initialConfig, ...source.model }
   candidatePreview.value = source.model._candidate_preview || null
   replacementPreview.value = source.model._replacement_preview || null
   ruleOptions.value = source.model._rule_options || {}
-  for (const name of fields) {
-    if (Object.prototype.hasOwnProperty.call(model, name)) form[name] = model[name]
-  }
-  if (!Array.isArray(form.historical_subscription)) {
-    form.historical_subscription = form.historical_subscription ? [form.historical_subscription] : []
+  if (!preserveForm) {
+    for (const name of fields) {
+      if (Object.prototype.hasOwnProperty.call(model, name)) form[name] = model[name]
+    }
+    if (!Array.isArray(form.historical_subscription)) {
+      form.historical_subscription = form.historical_subscription ? [form.historical_subscription] : []
+    }
   }
   walk(source.conf, node => {
     const name = node.props?.model
@@ -367,23 +377,24 @@ function applySnapshot(snapshot) {
       managedSummary.value = summary
     }
   })
-  const candidate = options.candidate.find(item => item.value === form.candidate)
-  if (candidate) {
-    form.candidate_subscription = candidateSubscriptionId(candidate)
-  } else {
-    if (form.candidate) {
-      form.candidate = ''
-      form.rule_json = ''
-    }
-    if (!options.candidate_subscription.some(item => item.value === form.candidate_subscription)) {
-      form.candidate_subscription = ''
+  if (!preserveForm) {
+    const candidate = options.candidate.find(item => item.value === form.candidate)
+    if (candidate) {
+      form.candidate_subscription = candidateSubscriptionId(candidate)
+    } else {
+      if (form.candidate) {
+        form.candidate = ''
+        form.rule_json = ''
+      }
+      if (!options.candidate_subscription.some(item => item.value === form.candidate_subscription)) {
+        form.candidate_subscription = ''
+      }
     }
   }
   return source.model._last_confirmation
 }
 
-function applyCandidateSelection() {
-  const candidateId = takeCandidateSelection()
+function applyCandidateSelection(candidateId = takeCandidateSelection()) {
   if (!candidateId) return false
   handoffNotice.value = ''
   const candidate = options.candidate.find(item => item.value === candidateId)
@@ -406,9 +417,28 @@ function applyCandidateSelection() {
   return true
 }
 
-async function refreshForm() {
+async function refreshForm(options) {
   const snapshot = await props.api.get(`plugin/form/${PLUGIN_ID}`)
-  return applySnapshot(snapshot)
+  return applySnapshot(snapshot, options)
+}
+
+async function selectDataCandidate(candidateId) {
+  if (busy.value) return
+  dataPageVisible.value = false
+  busy.value = 'select_data_candidate'
+  try {
+    await refreshForm({ preserveForm: true })
+    if (applyCandidateSelection(candidateId)) {
+      await nextTick()
+      candidateCard.value?.$el?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
+    }
+  } catch (error) {
+    feedback.section = 'settings'
+    feedback.type = 'error'
+    feedback.text = error?.message || '读取所选版本失败，请稍后重试'
+  } finally {
+    busy.value = ''
+  }
 }
 
 function payload(action, requestId, refreshSearch) {

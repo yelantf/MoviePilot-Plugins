@@ -81,6 +81,93 @@ function previewSnapshot(draft) {
 }
 
 describe('custom configuration actions', () => {
+  it('views and refreshes the data page and returns to the same unsaved settings', async () => {
+    const data = candidateSnapshot()
+    let resourceTitle = '历史预览资源'
+    const api = {
+      get: vi.fn().mockImplementation(async url => url === 'plugin/page/SubscribeOverwatcher'
+        ? { data: { page: [{ component: 'VTable', content: [{ component: 'tbody', content: [
+          { component: 'tr', content: [{ component: 'td', text: resourceTitle }] },
+        ] }] }] } } : data),
+      post: vi.fn(),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    await wrapper.find('select[aria-label="站点范围"]').setValue('all_sites')
+    const draft = '{"quality":"CUSTOM.*SOURCE","exclude":"sample|preview","sites":[]}'
+    await setRuleDraft(wrapper, draft)
+    const editorElement = wrapper.find('.rule-editor').element
+
+    await wrapper.findAll('button').find(button => button.text() === '查看数据页面').trigger('click')
+    await flushPromises()
+    expect(wrapper.findComponent(Page).text()).toContain('历史预览资源')
+    expect(wrapper.find('.pa-3.pa-sm-4').attributes('style')).toContain('display: none')
+    resourceTitle = '最新预览资源'
+    await wrapper.findComponent(Page).findAll('button').find(button => button.text() === '刷新').trigger('click')
+    await flushPromises()
+    expect(wrapper.findComponent(Page).text()).toContain('最新预览资源')
+    await wrapper.findComponent(Page).findAll('button').find(button => button.text() === '返回设置').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findComponent(Page).exists()).toBe(false)
+    expect(wrapper.find('.pa-3.pa-sm-4').attributes('style') || '').not.toContain('display: none')
+    expect(wrapper.find('.rule-editor').element).toBe(editorElement)
+    expect(wrapper.findComponent(RuleEditor).props('modelValue')).toBe(draft)
+    expect(wrapper.find('select[aria-label="站点范围"]').element.value).toBe('all_sites')
+    expect(api.get.mock.calls.filter(([url]) => url === 'plugin/form/SubscribeOverwatcher')).toHaveLength(1)
+    expect(api.post).not.toHaveBeenCalled()
+    expect(wrapper.emitted('switch')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it.each([false, true])('returns a data-page candidate to settings without discarding other inputs (refresh fails: %s)', async refreshFails => {
+    window.sessionStorage.clear()
+    const initial = candidateSnapshot()
+    initial.conf[0].content.push({ component: 'VSelect', props: { model: 'download_directory', items: [
+      { title: '所选目录', value: '/chosen' }, { title: '服务器默认目录', value: '/saved' },
+    ] } })
+    const fresh = structuredClone(initial)
+    const rules = { quality: 'Blu-?Ray', sites: [7] }
+    fresh.conf[0].content.find(node => node.props?.model === 'candidate').props.items.push({
+      title: '新扫描的版本', value: '2:b', subscription_id: '2', rules,
+    })
+    fresh.model.download_directory = '/saved'
+    let formReads = 0
+    const api = {
+      get: vi.fn().mockImplementation(async url => {
+        if (url === 'plugin/page/SubscribeOverwatcher') return { page: [{
+          component: 'VBtn', props: { 'data-candidate-id': '2:b' },
+          content: [{ component: 'span', text: '选择新版本' }],
+        }] }
+        if (++formReads === 1) return initial
+        if (refreshFails) throw new Error('刷新版本失败')
+        return fresh
+      }),
+      post: vi.fn(),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    await wrapper.find('select[aria-label="下载目录（留空保留原目录）"]').setValue('/chosen')
+    const draft = '{"include":"MY.*TEAM","sites":[5]}'
+    await setRuleDraft(wrapper, draft)
+    await wrapper.findAll('button').find(button => button.text() === '查看数据页面').trigger('click')
+    await flushPromises()
+    await wrapper.findComponent(Page).find('button[data-candidate-id="2:b"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findComponent(Page).exists()).toBe(false)
+    expect(wrapper.find('select[aria-label="下载目录（留空保留原目录）"]').element.value).toBe('/chosen')
+    expect(wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe(refreshFails ? '2:a' : '2:b')
+    expect(wrapper.findComponent(RuleEditor).props('modelValue')).toBe(refreshFails ? draft : JSON.stringify(rules, null, 2))
+    expect(wrapper.text()).toContain(refreshFails ? '刷新版本失败' : '可修改规则草稿，再预览匹配')
+    expect(api.post).not.toHaveBeenCalled()
+    expect(window.sessionStorage.length).toBe(0)
+    expect(wrapper.emitted('switch')).toBeUndefined()
+    wrapper.unmount()
+  })
+
   it('changes only sites, preserves rule selections, and can reset an invalid legacy draft without showing JSON', async () => {
     const data = candidateSnapshot()
     const api = { get: vi.fn().mockResolvedValue(data), post: vi.fn().mockResolvedValue({ success: false }) }
@@ -146,6 +233,41 @@ describe('custom configuration actions', () => {
     expect(wrapper.text()).not.toContain('以下是上次预览')
     wrapper.unmount()
     window.HTMLElement.prototype.scrollIntoView = previousScroll
+  })
+
+  it.each([false, true])('shows rule group comparison and only switches the draft after all matches are filtered (automatic: %s)', async automatic => {
+    const data = candidateSnapshot()
+    const notice = '系统默认规则组过滤了全部可匹配资源；已自动选择“不使用规则组”，确认后才会修改订阅。'
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(async (url, submitted) => {
+        if (url.endsWith('/preview-status')) return { success: true, status: 'cached' }
+        const draft = JSON.parse(submitted.rule_json)
+        if (automatic) draft.filter_groups = []
+        const preview = { ...previewSnapshot(JSON.stringify(draft)),
+          rule_groups_checked: true, rule_groups_disabled: automatic, rule_groups_auto_disabled: automatic,
+          rule_group_notice: automatic ? notice : '',
+          rule_group_comparison: { names: ['严格规则组'], source: '宿主默认',
+            with_groups_count: automatic ? 0 : 1, without_groups_count: 2 },
+        }
+        return { success: true, message: '预览完成', preview }
+      }),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
+    await flushPromises()
+    const text = wrapper.find('.preview-results').text()
+    expect(text).toContain(`考虑规则组通过 ${automatic ? 0 : 1} 条`)
+    expect(text).toContain('不使用规则组通过 2 条')
+    expect(text).toContain('系统默认： 严格规则组')
+    expect(text.includes('已自动选择')).toBe(automatic)
+    expect(wrapper.find('select[aria-label="规则组"]').element.value).toBe(automatic ? '@no-groups' : '@subscription')
+    expect(wrapper.text()).not.toContain('以下是上次预览')
+    expect(wrapper.text()).toContain('结果不符合预期时可选择“不使用规则组”')
+    expect(api.post.mock.calls.filter(([url]) => url.endsWith('/apply'))).toHaveLength(1)
+    wrapper.unmount()
   })
 
   it.each([
