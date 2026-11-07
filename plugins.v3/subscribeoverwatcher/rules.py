@@ -15,6 +15,46 @@ _SECRET_PATH_SEGMENT = re.compile(
     r"^(?:(?=[0-9]*[A-Fa-f])[0-9A-Fa-f]{16,}|(?=.*[0-9])(?=.*[A-Za-z])[A-Za-z0-9]{24,})$"
 )
 
+_PATTERN_NAMES = {
+    "quality": {
+        r"WEB[- .]?(?:DL|RIP)": "WEB-DL / WEBRip",
+        r"REMUX": "Remux", r"Blu[- .]?Ray|BluRay": "BluRay",
+        r"UHD|Ultra[- .]?HD": "UHD", r"HDTV": "HDTV", r"MiniBD": "MiniBD",
+        r"BD[- .]?RIP": "BDRip", r"HEVC|[Hx][ ._-]?265": "HEVC / H.265",
+        r"AVC|[Hx][ ._-]?264": "AVC / H.264",
+    },
+    "resolution": {
+        r"2160[pi]?|4K|x2160": "2160p / 4K", r"1080[pi]?|x1080": "1080p / 1080i",
+        r"720[pi]?|x720": "720p / 720i", r"480[pi]?|x480": "480p / 480i",
+    },
+    "effect": {
+        r"Dolby[ ._-]?Vision|DoVi|(?:^|[ ._\[-])DV(?:$|[ ._\]-])": "Dolby Vision",
+        r"HDR10\+|HDR10Plus": "HDR10+", r"HDR": "HDR",
+        r"Dolby[ ._-]?Atmos|Atmos": "Dolby Atmos",
+        r"(?:^|[ ._\[-])SDR(?:$|[ ._\]-])": "SDR",
+    },
+}
+
+
+def candidate_rule_names(candidate: dict[str, Any]) -> dict[str, str]:
+    """只为来源可确认的候选正则提供名称，兼容升级前的候选快照。"""
+    rules = candidate.get("rules") or {}
+    names = dict(candidate.get("rule_names") or {})
+    for field, patterns in _PATTERN_NAMES.items():
+        pattern = rules.get(field)
+        if pattern in patterns:
+            names[field] = patterns[pattern]
+        elif pattern and candidate.get(field) and pattern == re.escape(candidate[field]):
+            names[field] = candidate[field]
+    include = rules.get("include")
+    if include and "include" not in names:
+        team = candidate.get("team")
+        if team and include == re.escape(team):
+            names["include"] = team
+        elif include.startswith("(?=.*"):
+            names["include"] = "制作组与自定义标识"
+    return names
+
 
 def _short(value: Any, limit: int = 100) -> str:
     """
@@ -254,6 +294,11 @@ def resource_candidate(
         "resolution": resolution,
         "effect": effect,
         "team": team or customization,
+        "rule_names": {
+            "include": " + ".join(dict.fromkeys(
+                value for value, present in ((team, has_team), (customization, has_customization)) if present
+            )),
+        } if include else {},
         "rules": {
             "quality": _matching_pattern(
                 quality, title,

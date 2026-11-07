@@ -1446,6 +1446,19 @@ def test_custom_config_action_returns_result_and_refreshes_choices(plugin_host, 
     assert "99" in failed["message"]
     assert plugin.get_form()[1]["_last_confirmation"]["request_id"] == "ui-adopt-2"
 
+    host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
+    plugin.refresh_candidates()
+    choice = _form_items(plugin, "candidate")[0]["value"]
+    previewed = plugin.apply_config({
+        "enabled": True, "candidate": choice, "operation": "preview",
+        "operation_request_id": "ui-preview-1",
+    })
+    assert previewed["success"] is True
+    assert previewed["preview"] == plugin.get_form()[1]["_candidate_preview"]
+    assert previewed["preview"]["choice"] == choice
+    assert previewed["preview"]["table"]["component"] == "VTable"
+    assert "secret.example" not in json.dumps(previewed)
+
 
 def test_detail_shows_current_state_without_repeating_last_operation(plugin_host):
     """配置页仍可确认操作结果，详情页只展示当前管理状态。"""
@@ -1855,7 +1868,7 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     assert host.subscriptions[2].state == "S"
 
     host.search_results.clear()
-    success, _message, _draft = plugin.preview_candidate(choice)
+    success, _message, _draft = plugin.preview_candidate(choice, refresh_search=True)
     assert success is True
     success, message = plugin.confirm_candidate(choice)
     assert success is False
@@ -2065,3 +2078,350 @@ def test_expired_previews_and_changed_approved_rules_do_not_release_download(plu
     final_reload.init_plugin({"enabled": True})
     assert final_reload.submit_replacement(replace_choice, "1")[0] is False
     assert not host.downloads
+
+
+def test_named_candidate_draft_round_trips_without_changing_regex_or_custom_edits(plugin_host):
+    """名称引用保持原匹配语义；自定义正则原样保留，错误引用拒绝回填。"""
+    host = plugin_host
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    candidate = host.storage["gate_state"]["entries"]["2"]["candidates"][0]
+    displayed = _form_items(plugin, "candidate")[0]["rules"]
+    assert displayed["quality"] == {"candidate": "WEB-DL / WEBRip"}
+    assert displayed["include"] == {"candidate": "TEAM"}
+    success, _message, draft = plugin.preview_candidate(choice, json.dumps(displayed))
+    assert success
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["rules"] == candidate["rules"]
+    custom = {**displayed, "include": "TEAM|GROUP", "effect": None}
+    normalized = host.module._draft_rules(candidate, json.dumps(custom), "all_sites")
+    assert normalized["include"] == "TEAM|GROUP"
+    assert normalized["effect"] is None
+    assert normalized["sites"] == []
+    assert host.module.display_draft_rules(candidate, normalized)["include"] == "TEAM|GROUP"
+    with pytest.raises(ValueError, match="候选规则引用已失效"):
+        host.module._draft_rules(candidate, '{"quality":{"candidate":"1080p"}}', "candidate")
+    assert plugin.confirm_candidate(choice, draft)[0]
+    assert host.subscriptions[2].quality == candidate["rules"]["quality"]
+    assert host.subscriptions[2].include == "TEAM"
+
+
+def test_preview_reuses_search_without_age_limit_but_rechecks_rules_and_can_refresh(plugin_host, monkeypatch):
+    """规则变化即时重筛；缓存不按年龄失效，强制刷新才搜索，空结果也可复用。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    plugin._preview_search_cache.clear()
+    another_site = copy.deepcopy(chosen)
+    another_site.torrent_info.site = 7
+    another_site.torrent_info.site_name = "另一个站"
+    host.search_results.append(another_site)
+    host.search_calls.clear()
+    clock_value = [100.0]
+    monkeypatch.setattr(host.module.time, "monotonic", lambda: clock_value[0])
+    plugin.init_plugin({"enabled": True, "candidate": choice, "operation": "preview"})
+    assert len(host.search_calls) == 1
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
+    assert host.search_calls[0]["sites"] == [5]
+    clock_value[0] += 3
+    plugin.init_plugin({**host.storage["config"], "operation": "preview", "rule_mode": "all_sites"})
+    assert len(host.search_calls) == 2
+    assert host.search_calls[1]["sites"] is None
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_cached"] is False
+    clock_value[0] += 3
+    plugin.init_plugin({**host.storage["config"], "operation": "preview"})
+    cached = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert len(host.search_calls) == 2
+    assert cached["search_cached"] is True
+    assert cached["search_age_seconds"] == 3
+    assert cached["matched_count"] == 2
+    assert cached["timings"]["search_seconds"] == 0
+    host.search_results[:] = [chosen]
+    assert plugin.preview_candidate(choice, rule_mode="all_sites", refresh_search=True)[0]
+    assert len(host.search_calls) == 3
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
+    clock_value[0] += 90 * 24 * 3600
+    host.search_results.clear()
+    assert plugin.preview_candidate(choice)[0]
+    assert len(host.search_calls) == 3
+    cached = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert cached["search_cached"] is True
+    assert cached["search_age_seconds"] == 90 * 24 * 3600
+    assert cached["matched_count"] == 1
+    assert plugin.preview_candidate(choice, refresh_search=True)[0]
+    assert len(host.search_calls) == 4
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 0
+    assert plugin.preview_candidate(choice)[0]
+    assert len(host.search_calls) == 4
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_cached"] is True
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_result_count"] == 0
+    assert "cookie-secret" not in json.dumps(host.storage)
+    assert "secret.example" not in json.dumps(host.storage)
+
+
+def test_preview_explains_inherited_rules_and_counts_all_rejections_before_truncation(plugin_host, monkeypatch):
+    """摘要统计全部排除资源，区分候选、原订阅和宿主默认条件。"""
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    host.subscriptions[2].exclude = "blocked"
+    original_params = host.module.SubscribeChain.get_params
+    monkeypatch.setattr(host.module.SubscribeChain, "get_params", lambda subscribe: {
+        **original_params(subscribe), "min_seeders": 5,
+    })
+    host.search_results.extend(_context(f"Show.S01E02.1080p.WEB-DL.HDR-GROUP.{number}", episodes=(2,))
+                               for number in range(45))
+    excluded = _context("Show.S01E03.1080p.WEB-DL.HDR-TEAM.blocked", episodes=(3,))
+    host.search_results.append(excluded)
+    assert plugin.preview_candidate(choice, refresh_search=True)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["rejected_count"] == 46
+    assert len(preview["rejected"]) == 40
+    assert preview["rejection_summary"] == [
+        {"reason": "缺少包含标识：TEAM", "count": 45},
+        {"reason": "命中排除规则：自定义正则：blocked", "count": 1},
+    ]
+    summary = {item["field"]: item for item in preview["effective_rules"]}
+    assert summary["quality"]["source"] == "候选规格"
+    assert summary["exclude"]["source"] == "原订阅"
+    assert summary["min_seeders"]["source"] == "宿主默认"
+    panel = plugin.get_form()[1]["_candidate_preview"]
+    assert panel["rejection_summary"] == preview["rejection_summary"]
+    assert panel["matched_shown"] == 1
+    assert panel["rejected_shown"] == 40
+    assert panel["table"]["component"] == "VTable"
+    assert "secret.example" not in json.dumps(panel)
+
+
+def test_preview_timings_separate_recognition_search_filtering_and_directory(plugin_host, monkeypatch):
+    """用模拟耗时验证界面能定位等待阶段，不对站点进行实际请求。"""
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    host.search_results.append(_context("Show.S01E02.1080p.WEB-DL.HDR-GROUP", episodes=(2,)))
+    elapsed = [0.0]
+    monkeypatch.setattr(host.module.time, "perf_counter", lambda: elapsed[0])
+
+    def timed(function, seconds):
+        def wrapped(*args, **kwargs):
+            elapsed[0] += seconds
+            return function(*args, **kwargs)
+        return wrapped
+
+    monkeypatch.setattr(host.module.MediaChain, "recognize_media",
+                        timed(host.module.MediaChain.recognize_media, 2))
+    monkeypatch.setattr(host.module.SearchChain, "process", timed(host.module.SearchChain.process, 11))
+    monkeypatch.setattr(host.module.TorrentHelper, "filter_torrent_reason",
+                        staticmethod(timed(host.module.TorrentHelper.filter_torrent_reason, 0.25)))
+    monkeypatch.setattr(host.module, "preview_download_path", timed(host.module.preview_download_path, 3))
+    assert plugin.preview_candidate(choice, refresh_search=True)[0]
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["timings"] == {
+        "recognition_seconds": 2, "search_seconds": 11, "filter_seconds": 0.5,
+        "directory_seconds": 3, "total_seconds": 16.5,
+    }
+
+
+def test_scan_cache_replaces_previous_round_while_candidates_merge_and_approval_releases_it(plugin_host):
+    """历史候选可保留，预览只使用最新扫描；批准成功释放完整上下文。"""
+    host = plugin_host
+    plugin, old_choice, _old = _prepare_directory_confirmation(host)
+    old_id = old_choice.split(":", 1)[1]
+    newer = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM.New")
+    later_episode = _context("Show.S01E02.1080p.WEB-DL.HDR-TEAM.New", episodes=(2,))
+    host.search_results[:] = [newer, later_episode]
+    plugin.refresh_candidates()
+    entry = host.storage["gate_state"]["entries"]["2"]
+    assert len(entry["candidates"]) == 2
+    assert any(item["id"] == old_id for item in entry["candidates"])
+    host.search_calls.clear()
+    assert plugin.preview_candidate(old_choice)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert host.search_calls == []
+    assert preview["search_cached"] is True
+    assert preview["search_source"] == "候选扫描"
+    assert preview["search_result_at"] == entry["last_scan"]
+    assert preview["matched_count"] == 2
+    assert old_id not in {item["id"] for item in preview["matched"]}
+    assert plugin.confirm_candidate(old_choice)[0] is False
+    assert plugin._preview_search_cache
+    new_choice = next(item["value"] for item in _form_items(plugin, "candidate") if item["value"] != old_choice)
+    assert plugin.preview_candidate(new_choice)[0]
+    assert plugin.confirm_candidate(new_choice)[0]
+    assert plugin._preview_search_cache == {}
+    approved = host.storage["gate_state"]["entries"]["2"]
+    assert len(approved["candidates"]) == 2
+    assert approved["preview"]["matched_count"] == 2
+    assert "确认时的规则预览（历史记录）" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert next(service for service in plugin.get_service() if service["id"] == "candidate_refresh")["kwargs"] == {"hours": 4}
+
+
+def test_single_site_preview_filters_shared_scan_and_only_queries_selected_site_when_refreshed(plugin_host):
+    """全站扫描可为单站提供资源，单站预览不计入其他站点的排除资源。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    other_site = copy.deepcopy(chosen)
+    other_site.torrent_info.site = 7
+    other_site.torrent_info.site_name = "另一个站"
+    host.search_results.append(other_site)
+    plugin.refresh_candidates()
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert host.search_calls == []
+    assert preview["matched_count"] == 1
+    assert preview["rejected_count"] == 0
+    assert preview["search_sites"] == [5]
+    assert all(item["site_id"] == 5 for item in preview["matched"])
+    assert plugin.preview_candidate(choice, refresh_search=True)[0]
+    assert host.search_calls[-1]["sites"] == [5]
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
+    assert plugin.preview_candidate(choice, rule_mode="all_sites", refresh_search=True)[0]
+    assert host.search_calls[-1]["sites"] is None
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 2
+
+
+def test_original_subscription_option_survives_preview_and_is_not_overwritten_by_candidate(plugin_host):
+    """保留原订阅是独立选项，规范化后仍保留选择，不回填候选该项。"""
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    original = "WEB-?DL|WEB-?RIP"
+    host.subscriptions[2].quality = original
+    success, _message, draft = plugin.preview_candidate(choice, '{"quality":{"subscription":true}}')
+    assert success
+    assert json.loads(draft)["quality"] == {"subscription": True}
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert "quality" not in preview["rules"]
+    quality = next(item for item in preview["effective_rules"] if item["field"] == "quality")
+    assert quality["source"] == "原订阅"
+    assert quality["value"] == "WEB-DL"
+    assert plugin.confirm_candidate(choice, draft)[0]
+    assert host.subscriptions[2].quality == original
+    assert host.subscriptions[2].resolution == r"1080[pi]?|x1080"
+
+
+def test_search_cache_ignores_removed_duration_setting_and_is_bounded(plugin_host):
+    """旧时长设置被移除；缓存始终复用，容量有上限，停用释放内存。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    plugin.init_plugin({"enabled": True, "search_cache_hours": 0})
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice)[0]
+    assert plugin.preview_candidate(choice)[0]
+    assert host.search_calls == []
+    assert plugin._preview_search_cache
+    assert "search_cache_hours" not in host.storage["config"]
+    assert "search_cache_hours" not in json.dumps(plugin.get_form())
+    plugin.init_plugin({"enabled": True, "search_cache_hours": 24})
+    assert "search_cache_hours" not in host.storage["config"]
+    for number in range(70):
+        subscribe = _subscribe(number + 10)
+        subscribe.media_id = str(number)
+        plugin._remember_search(subscribe, [chosen], [], "候选扫描", "now")
+    assert len(plugin._preview_search_cache) == 64
+    plugin.init_plugin({"enabled": False, "search_cache_hours": 24})
+    assert plugin._preview_search_cache == {}
+
+
+def test_scan_removes_deleted_subscription_records_and_unused_search_cache(plugin_host):
+    """不按时间清缓存，但会清掉订阅删除或身份变化后无对应订阅的数据。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0]
+    assert host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert host.storage["gate_state"]["entries"]["2"]["candidates"]
+    plugin._remember_search(host.subscriptions[1], [chosen], [], "规则预览搜索", "now")
+    surviving_identity = host.module._identity(host.subscriptions[1])
+    del host.subscriptions[2]
+    plugin.refresh_candidates()
+    assert "2" not in host.storage["gate_state"]["entries"]
+    assert set(plugin._preview_search_cache) == {(surviving_identity, ())}
+    host.subscriptions[1].media_id = "456"
+    plugin.refresh_candidates()
+    assert plugin._preview_search_cache == {}
+
+
+def test_preview_status_checks_the_actual_cache_without_searching_or_saving(plugin_host):
+    """开始前的提示与预览使用相同缓存范围，区分空缓存、缺失及手动刷新。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    config = {"operation": "preview", "candidate": choice}
+    host.search_calls.clear()
+    saved = copy.deepcopy(host.storage)
+    assert plugin.preview_search_status(config) == {
+        "success": True, "status": "cached", "search_sites": [5], "search_result_count": 1,
+    }
+    assert host.search_calls == []
+    assert host.storage == saved
+    plugin._preview_search_cache.clear()
+    assert plugin.preview_search_status(config)["status"] == "cache_miss"
+    assert host.search_calls == []
+    assert plugin.preview_candidate(choice)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["search_trigger"] == "cache_miss"
+    assert preview["search_result_count"] == 1
+    assert plugin.preview_search_status({**config, "rule_mode": "all_sites"})["status"] == "cache_miss"
+    assert plugin.preview_search_status({**config, "refresh_search": True})["status"] == "manual"
+    # 有全站缓存，但其中没有所选站点的资源，也属于本次站点范围的空缓存。
+    other_site = copy.deepcopy(chosen)
+    other_site.torrent_info.site = 7
+    plugin._remember_search(host.subscriptions[2], [other_site], [], "候选扫描", "now")
+    assert plugin.preview_search_status(config)["status"] == "cached_empty"
+    assert plugin.preview_search_status(config)["search_result_count"] == 0
+    assert plugin.preview_search_status({**config, "rule_mode": "all_sites"})["status"] == "cached"
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice)[0]
+    assert host.search_calls == []
+    panel = plugin.get_form()[1]["_candidate_preview"]
+    assert panel["search_cached"] is True
+    assert panel["search_result_count"] == 0
+    assert panel["search_trigger"] == "cache"
+    assert plugin.preview_search_status({**config, "rule_json": "{broken"})["success"] is False
+
+
+def test_scan_expires_confirmed_candidates_and_previews_after_24_hours_without_revoking(plugin_host, monkeypatch):
+    """确认后的大记录满 24 小时由扫描清理，批准、规则与新的回刷预览仍可用。"""
+    from datetime import datetime as RealDatetime, timedelta, timezone as utc_timezone
+
+    host = plugin_host
+    base = RealDatetime(2026, 11, 7, 12, tzinfo=utc_timezone.utc)
+    clock_value = [base]
+
+    class FakeDatetime(RealDatetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock_value[0].astimezone(tz) if tz else clock_value[0].replace(tzinfo=None)
+
+    monkeypatch.setattr(host.module, "datetime", FakeDatetime)
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0]
+    assert plugin.confirm_candidate(choice)[0]
+    approved_rules = {name: copy.deepcopy(getattr(host.subscriptions[2], name))
+                      for name in ("quality", "resolution", "effect", "include", "sites")}
+    approved_at = host.storage["gate_state"]["entries"]["2"]["approved_at"]
+    host.subscriptions[3] = _subscribe(3)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 3}))
+    plugin.refresh_candidates()
+    pending_choice = next(item["value"] for item in _form_items(plugin, "candidate")
+                          if item["value"].startswith("3:"))
+    assert plugin.preview_candidate(pending_choice)[0]
+    clock_value[0] = base + timedelta(hours=23)
+    assert plugin.preview_replacements("2")[0]
+    assert plugin.preview_search_status({"operation": "preview_replace", "replace_subscription": "2"})["status"] == "cached"
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    clock_value[0] = base + timedelta(hours=24, seconds=-1)
+    plugin.refresh_candidates()
+    approved = host.storage["gate_state"]["entries"]["2"]
+    assert approved["candidates"] and approved["preview"] and approved["replacement_preview"]
+    clock_value[0] = base + timedelta(hours=24)
+    plugin.refresh_candidates()
+    approved = host.storage["gate_state"]["entries"]["2"]
+    assert "candidates" not in approved
+    assert "preview" not in approved
+    assert approved["replacement_preview"]
+    assert approved["status"] == "approved"
+    assert approved["approved_at"] == approved_at
+    assert plugin._is_approved(host.subscriptions[2]) is True
+    assert {name: getattr(host.subscriptions[2], name) for name in approved_rules} == approved_rules
+    assert "确认时的规则预览（历史记录）" not in json.dumps(plugin.get_page(), ensure_ascii=False)
+    clock_value[0] = base + timedelta(hours=47)
+    plugin.refresh_candidates()
+    assert "replacement_preview" not in host.storage["gate_state"]["entries"]["2"]
+    pending = host.storage["gate_state"]["entries"]["3"]
+    assert pending["status"] == "pending"
+    assert pending["candidates"] and pending["preview"]

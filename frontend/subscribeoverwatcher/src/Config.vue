@@ -69,17 +69,17 @@
           <v-row>
             <v-col cols="12" md="4">
               <v-select v-model="form.candidate_subscription" label="选择有版本的剧集"
-                :items="options.candidate_subscription" clearable density="comfortable" hide-details
+                :items="options.candidate_subscription" :disabled="!!busy" clearable density="comfortable" hide-details
                 no-data-text="暂无有版本的待确认剧集" @update:model-value="selectCandidateSubscription" />
             </v-col>
             <v-col cols="12" md="5">
               <v-select v-model="form.candidate" label="选择该剧集版本（全集优先）" :items="candidateChoices"
-                :disabled="!form.candidate_subscription" clearable density="comfortable" hide-details
+                :disabled="!!busy || !form.candidate_subscription" clearable density="comfortable" hide-details
                 @update:model-value="selectCandidate" />
             </v-col>
             <v-col cols="12" md="3">
               <v-select v-model="form.rule_mode" label="站点范围" :items="ruleModes"
-                density="comfortable" hide-details @update:model-value="clearRuleDraft" />
+                :disabled="!!busy" density="comfortable" hide-details @update:model-value="updateSiteScope" />
             </v-col>
           </v-row>
           <p class="text-caption text-medium-emphasis mt-2 mb-4">
@@ -90,26 +90,39 @@
               class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>
           </p>
           <v-select v-model="form.download_directory" label="下载目录（留空保留原目录）"
-            :items="options.download_directory" :disabled="!form.candidate_subscription" clearable
+            :items="options.download_directory" :disabled="!!busy || !form.candidate_subscription" clearable
             density="comfortable" hint="确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理。"
             persistent-hint class="mb-4" />
           <v-alert v-if="form.download_directory && !selectedDownloadDirectory" type="warning"
             variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
-          <v-textarea v-model="form.rule_json" label="草稿规则 JSON；留空使用候选规格"
-            rows="3" auto-grow density="comfortable" hide-details />
+          <rule-editor v-if="selectedCandidate" v-model="form.rule_json" :candidate="selectedCandidate"
+            :options="ruleOptions" :disabled="!!busy" />
           <p class="text-caption text-medium-emphasis mt-2 mb-0">
-            “不限站点”会清除订阅的站点限制，其他规格照常回填。包含规则可能同时使用制作组和自定义标识。预览核对基础规则，正式追更仍应用订阅规则组。
+            只用所选站点时，预览仅搜索和筛选该站；“不限站点”保留其他规则选项。
+            有对应范围的候选扫描或预览搜索缓存就复用，每次都会重新核对生效规则和下载目录；点击“重新搜索”获取新资源。
+            确认后的候选和确认预览保留 24 小时，期满后定期清理。
           </p>
           <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
             density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+          <v-alert v-if="busy === 'preview'" type="info" variant="tonal" density="compact"
+            class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
         </v-card-text>
         <v-card-actions class="px-4 pb-4 flex-wrap ga-2">
           <v-spacer />
+          <v-btn v-if="selectedPreview" variant="text" :disabled="!!busy || !selectedCandidate"
+            @click="submit('preview', true)">重新搜索并预览</v-btn>
           <v-btn color="info" variant="tonal" :loading="busy === 'preview'"
             :disabled="!!busy || !selectedCandidate" @click="submit('preview')">预览匹配</v-btn>
           <v-btn color="primary" variant="tonal" :loading="busy === 'confirm'"
             :disabled="!!busy || !selectedCandidate" @click="submit('confirm')">确认并恢复</v-btn>
         </v-card-actions>
+      </v-card>
+
+      <v-card v-if="selectedPreview" ref="previewCard" variant="outlined" class="mb-4">
+        <v-card-text>
+          <preview-results :preview="selectedPreview" :stale="previewStale" :disabled="!!busy"
+            @refresh-search="submit('preview', true)" />
+        </v-card-text>
       </v-card>
 
       <v-row>
@@ -167,6 +180,8 @@
                 :disabled="!!busy || !form.replace_subscription" @click="submit('preview_replace')">
                 预览可回刷资源
               </v-btn>
+              <v-btn v-if="selectedReplacementPreview" variant="text" :disabled="!!busy"
+                @click="submit('preview_replace', true)">重新搜索回刷资源</v-btn>
             </v-col>
             <v-col cols="12" md="8">
               <v-select v-model="form.replace_resource" label="选择预览通过的资源"
@@ -179,6 +194,10 @@
           </v-row>
           <v-alert v-if="feedback.section === 'replace'" :type="feedback.type" variant="tonal"
             density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+          <v-alert v-if="busy === 'preview_replace'" type="info" variant="tonal" density="compact"
+            class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
+          <preview-results v-if="selectedReplacementPreview" :preview="selectedReplacementPreview" class="mt-4"
+            :disabled="!!busy" refresh-label="重新搜索回刷资源" @refresh-search="submit('preview_replace', true)" />
         </v-card-text>
         <v-card-actions class="px-4 pb-4">
           <v-spacer />
@@ -194,6 +213,8 @@
 <script setup>
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CANDIDATE_SELECTION_EVENT, takeCandidateSelection } from './candidateSelection'
+import PreviewResults from './PreviewResults.vue'
+import RuleEditor from './RuleEditor.vue'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
@@ -236,7 +257,12 @@ const managedSummary = ref('正在读取已纳入管理的剧集…')
 const loading = ref(true)
 const formReady = ref(false)
 const busy = ref('')
+const previewProgress = ref('')
 const candidateCard = ref(null)
+const previewCard = ref(null)
+const candidatePreview = ref(null)
+const replacementPreview = ref(null)
+const ruleOptions = ref({})
 const handoffNotice = ref('')
 const feedback = reactive({ section: '', type: 'info', text: '' })
 function candidateSubscriptionId(item) {
@@ -253,6 +279,26 @@ const selectedCandidateUrl = computed(() => {
   return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : ''
 })
 const selectedCandidateSite = computed(() => selectedCandidate.value?.site_name || '所选站点')
+const selectedPreview = computed(() => candidatePreview.value?.choice === form.candidate
+  ? candidatePreview.value : null)
+const selectedReplacementPreview = computed(() => replacementPreview.value &&
+  String(replacementPreview.value.subscription_id) === String(form.replace_subscription)
+  ? replacementPreview.value : null)
+
+function draftKey(raw) {
+  try {
+    const changes = JSON.parse(raw || '{}')
+    if (!changes || Array.isArray(changes) || typeof changes !== 'object') return null
+    const rules = { ...selectedCandidate.value?.rules, ...changes }
+    if (form.rule_mode === 'all_sites') rules.sites = []
+    return JSON.stringify(Object.entries(rules).sort(([a], [b]) => a.localeCompare(b)))
+  } catch { return null }
+}
+const previewStale = computed(() => selectedPreview.value && (
+  selectedPreview.value.rule_mode !== form.rule_mode ||
+  (selectedPreview.value.download_directory || '') !== (form.download_directory || '') ||
+  draftKey(form.rule_json) === null || draftKey(form.rule_json) !== draftKey(selectedPreview.value.draft_json)
+))
 
 function selectCandidateSubscription(subscription) {
   form.candidate_subscription = subscription || ''
@@ -264,12 +310,24 @@ function selectCandidateSubscription(subscription) {
 
 function selectCandidate(candidate) {
   form.candidate = candidate || ''
-  form.rule_json = ''
+  const rules = selectedCandidate.value?.rules || {}
+  form.rule_json = Object.keys(rules).length ? JSON.stringify(rules, null, 2) : ''
+  if (form.rule_mode === 'all_sites') updateSiteScope(form.rule_mode)
   handoffNotice.value = ''
 }
 
-function clearRuleDraft() {
-  form.rule_json = ''
+function updateSiteScope(mode) {
+  if (!selectedCandidate.value && !form.rule_json) return
+  try {
+    const rules = form.rule_json.trim() ? JSON.parse(form.rule_json) : { ...selectedCandidate.value?.rules }
+    if (!rules || Array.isArray(rules) || typeof rules !== 'object') throw new Error('invalid draft')
+    rules.sites = mode === 'all_sites' ? [] : selectedCandidate.value?.rules?.sites ?? null
+    form.rule_json = JSON.stringify(rules, null, 2)
+  } catch {
+    feedback.section = 'candidate'
+    feedback.type = 'warning'
+    feedback.text = '已保存的规则无法读取，请重置为候选规则或重新选择版本。'
+  }
 }
 watch(() => form.replace_subscription, (subscription, previous) => {
   if (previous && subscription !== previous) {
@@ -289,6 +347,9 @@ function applySnapshot(snapshot) {
   const source = snapshot?.data?.conf ? snapshot.data : snapshot
   if (!source?.conf || !source?.model) throw new Error('配置数据未返回完整表单')
   const model = { ...props.initialConfig, ...source.model }
+  candidatePreview.value = source.model._candidate_preview || null
+  replacementPreview.value = source.model._replacement_preview || null
+  ruleOptions.value = source.model._rule_options || {}
   for (const name of fields) {
     if (Object.prototype.hasOwnProperty.call(model, name)) form[name] = model[name]
   }
@@ -350,30 +411,74 @@ async function refreshForm() {
   return applySnapshot(snapshot)
 }
 
-function payload(action, requestId) {
+function payload(action, requestId, refreshSearch) {
   const values = {}
   for (const name of fields) values[name] = form[name]
-  return { ...values, operation: action, operation_request_id: requestId }
+  return { ...values, operation: action, operation_request_id: requestId, refresh_search: refreshSearch }
 }
 
-async function submit(action) {
+function responseBody(raw) {
+  return raw?.data?.success === undefined ? raw : raw.data
+}
+
+async function showSearchProgress(submitted) {
+  if (submitted.refresh_search) {
+    previewProgress.value = '已手动触发重新搜索；正在等待站点响应和资源解析，可能需要较长时间。'
+    return
+  }
+  previewProgress.value = '正在检查当前站点范围是否有可复用的搜索缓存…'
+  try {
+    const status = responseBody(await props.api.post(`plugin/${PLUGIN_ID}/preview-status`, submitted))
+    const messages = {
+      cache_miss: '当前站点范围没有可复用缓存，已触发搜索；正在等待站点响应和资源解析，可能需要较长时间。',
+      cached: '正在复用搜索缓存并按当前规则筛选，无需重新搜索站点。',
+      cached_empty: '当前站点范围的搜索缓存为空，本次将复用空结果；建议手动重新搜索。',
+    }
+    previewProgress.value = status?.success && messages[status.status] ||
+      '正在执行预览；缓存状态暂无法确认，若需要搜索，需等待站点响应和资源解析。'
+  } catch {
+    previewProgress.value = '正在执行预览；缓存状态暂无法确认，若需要搜索，需等待站点响应和资源解析。'
+  }
+}
+
+async function submit(action, refreshSearch = false) {
   if (busy.value) return
   busy.value = action
   feedback.section = ''
   feedback.text = ''
   const requestId = action === 'save' ? '' : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const submitted = payload(action, requestId, refreshSearch)
+  const started = performance.now()
   try {
-    const rawResponse = await props.api.post(`plugin/${PLUGIN_ID}/apply`, payload(action, requestId))
-    const response = rawResponse?.data?.success === undefined ? rawResponse : rawResponse.data
-    const result = await refreshForm()
+    if (action === 'preview' || action === 'preview_replace') {
+      await showSearchProgress(submitted)
+      await nextTick()
+    }
+    const response = responseBody(await props.api.post(`plugin/${PLUGIN_ID}/apply`, submitted))
+    let result
+    let refreshFailed = false
+    try { result = await refreshForm() } catch { refreshFailed = true }
+    if (response?.preview) {
+      if (action === 'preview') {
+        candidatePreview.value = response.preview
+        if (response.preview.draft_json) form.rule_json = response.preview.draft_json
+      }
+      else if (action === 'preview_replace') replacementPreview.value = response.preview
+      response.preview.request_seconds = (performance.now() - started) / 1000
+    }
     if (!selectedCandidate.value) handoffNotice.value = ''
     feedback.section = sections[action] || 'settings'
-    if (action !== 'save' && result?.request_id !== requestId) {
+    if (action !== 'save' && !response?.preview && !refreshFailed && result?.request_id !== requestId) {
       feedback.type = 'error'
       feedback.text = '操作已提交，但未能确认结果，请查看插件详情页'
     } else {
       feedback.type = response?.success ? 'success' : 'error'
       feedback.text = response?.message || (response?.success ? '操作完成' : '操作失败')
+      if (refreshFailed) feedback.text += '；选择列表刷新失败，请稍后刷新。'
+    }
+    if (action === 'preview' && response?.success && selectedPreview.value) {
+      await nextTick()
+      previewCard.value?.$el?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
     }
   } catch (error) {
     feedback.section = sections[action] || 'settings'

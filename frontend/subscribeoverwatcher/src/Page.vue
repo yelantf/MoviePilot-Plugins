@@ -15,8 +15,9 @@
 </template>
 
 <script setup>
-import { defineComponent, h, onMounted, ref, resolveComponent } from 'vue'
+import { onMounted, ref } from 'vue'
 import { CANDIDATE_SELECTION_EVENT, queueCandidateSelection } from './candidateSelection'
+import SchemaNode from './schemaNode'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const props = defineProps({ api: { type: [Object, Function], required: true } })
@@ -24,30 +25,6 @@ const emit = defineEmits(['switch'])
 const page = ref([])
 const loading = ref(false)
 const error = ref('')
-
-function renderNode(node, onSelectCandidate) {
-  const component = node.component.startsWith('V') ? resolveComponent(node.component) : node.component
-  const children = (node.content || []).map(child => renderNode(child, onSelectCandidate))
-  const candidateId = node.component === 'VBtn' && node.props?.['data-candidate-id']
-  const nodeProps = candidateId
-    ? { ...node.props, onClick: () => onSelectCandidate(candidateId) }
-    : node.props || {}
-  if (typeof component === 'string') {
-    return h(component, nodeProps, children.length ? children : node.text || '')
-  }
-  return h(component, nodeProps, children.length ? { default: () => children } : undefined)
-}
-
-const SchemaNode = defineComponent({
-  name: 'SchemaNode',
-  props: {
-    node: { type: Object, required: true },
-    onSelectCandidate: { type: Function, required: true },
-  },
-  setup(nodeProps) {
-    return () => renderNode(nodeProps.node, nodeProps.onSelectCandidate)
-  },
-})
 
 function selectCandidate(candidateId) {
   if (!queueCandidateSelection(candidateId)) {

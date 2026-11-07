@@ -7,6 +7,8 @@
 import copy
 import json
 import threading
+import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -24,9 +26,14 @@ from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .directory import directory_choices, preview_download_path, selected_directory_root
-from .preview import normalize_draft_rules, parse_episode_selection, preview_resource
+from .preview import (
+    SUBSCRIPTION_RULE_OPTIONS, display_draft_rules, editor_draft_rules,
+    normalize_draft_rules, parse_episode_selection, preview_resource,
+    readable_rejection, rule_summary,
+)
 from .rules import (
-    candidate_is_eligible, is_complete_season_download, merge_candidates, public_page_url, resource_candidate,
+    candidate_is_eligible, candidate_rule_names, is_complete_season_download, merge_candidates,
+    public_page_url, resource_candidate,
     target_seasons,
 )
 
@@ -140,7 +147,7 @@ def _draft_rules(candidate: dict[str, Any], raw: str, mode: str) -> dict[str, An
     """选择所选站点或所有站点，其他候选规格照常回填。"""
     if mode not in {"candidate", "all_sites"}:
         raise ValueError("站点范围无效，请重新选择")
-    rules = normalize_draft_rules(candidate.get("rules") or {}, raw)
+    rules = normalize_draft_rules(candidate.get("rules") or {}, raw, candidate_rule_names(candidate))
     if mode == "all_sites":
         rules["sites"] = []
     return rules
@@ -306,6 +313,24 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     ]}
 
 
+def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dict[str, Any]]:
+    """向配置面板提供统计和展示表格，不重复传输完整资源列表。"""
+    preview = entry.get(field)
+    if not preview:
+        return None
+    return {
+        **{key: preview.get(key) for key in (
+            "choice", "rule_mode", "download_directory", "draft_json", "searched_at", "searched_ts",
+            "matched_count", "rejected_count", "search_cached", "search_age_seconds", "timings",
+            "search_result_count", "search_trigger",
+            "effective_rules", "rejection_summary", "search_source", "search_result_at", "search_sites",
+        )},
+        "subscription_id": sid, "table": _preview_table(preview),
+        "matched_shown": len(preview.get("matched") or []),
+        "rejected_shown": len(preview.get("rejected") or []),
+    }
+
+
 class SubscribeOverwatcher(_PluginBase):
     """
     管理新剧集订阅的下载确认和目标季版本候选。
@@ -317,7 +342,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.6.0"
+    plugin_version = "1.8.0"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -331,6 +356,9 @@ class SubscribeOverwatcher(_PluginBase):
         super().__init__()
         self._lock = threading.RLock()
         self._scan_lock = threading.Lock()
+        # 完整搜索上下文只在进程内复用，按容量保留，不写入插件持久数据。
+        self._preview_search_cache: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
+        self._search_cache_sequence = 0
         self._enabled = False
         self._confirm_full_pack = True
         self._daily_notice = True
@@ -346,6 +374,8 @@ class SubscribeOverwatcher(_PluginBase):
         :param config: 用户保存的插件配置
         """
         config = dict(config or {})
+        cache_setting_removed = "search_cache_hours" in config
+        config.pop("search_cache_hours", None)
         historical_migrated = "historical_subscription" in config \
             and not isinstance(config["historical_subscription"], list)
         if historical_migrated:
@@ -372,6 +402,8 @@ class SubscribeOverwatcher(_PluginBase):
                 self._save_state()
             previously_disabled = self._state.get("was_enabled") is False
             self._enabled = bool(config.get("enabled"))
+            if not self._enabled:
+                self._preview_search_cache.clear()
             self._confirm_full_pack = bool(config.get("confirm_full_pack", True))
             self._daily_notice = bool(config.get("daily_notice", True))
             self._notice_hour = self._time_part(config.get("notice_hour", 9), 9, 23)
@@ -410,7 +442,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "revoke_subscription": "", "rule_json": "", "replace_subscription": "",
                     "replace_resource": "", "replace_episodes": "", "operation_request_id": "",
                 })
-            elif historical_migrated:
+            elif historical_migrated or cache_setting_removed:
                 self.update_config(config)
             return
         normalized_rules = ""
@@ -424,6 +456,7 @@ class SubscribeOverwatcher(_PluginBase):
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
                     str(config.get("rule_mode") or "candidate"),
                     str(config.get("download_directory") or ""),
+                    refresh_search=bool(config.get("refresh_search")),
                 )
             elif actions[0] == "confirm":
                 success, message = self.confirm_candidate(
@@ -436,7 +469,9 @@ class SubscribeOverwatcher(_PluginBase):
             elif actions[0] == "revoke":
                 success, message = self.revoke_approval(config.get("revoke_subscription"))
             elif actions[0] == "preview_replace":
-                success, message = self.preview_replacements(config.get("replace_subscription"))
+                success, message = self.preview_replacements(
+                    config.get("replace_subscription"), refresh_search=bool(config.get("refresh_search")),
+                )
             elif actions[0] == "submit_replace":
                 success, message = self.submit_replacement(
                     str(config.get("replace_resource") or ""), str(config.get("replace_episodes") or ""),
@@ -455,6 +490,7 @@ class SubscribeOverwatcher(_PluginBase):
                 logger.warning(f"剧集守门员：{message}")
             updated_config = {
                 **config, "operation": "save", "operation_request_id": "",
+                "refresh_search": False,
                 "adopt": False, "preview": False, "confirm": False,
                 "direct_approve": False, "revoke": False, "preview_replace": False, "submit_replace": False,
             }
@@ -480,7 +516,7 @@ class SubscribeOverwatcher(_PluginBase):
                     updated_config["replace_resource"] = ""
                     updated_config["replace_episodes"] = ""
             self.update_config(updated_config)
-        elif historical_migrated:
+        elif historical_migrated or cache_setting_removed:
             self.update_config(config)
         self._reconcile_pending_states()
         self._schedule_scan()
@@ -699,7 +735,13 @@ class SubscribeOverwatcher(_PluginBase):
         try:
             subscribes = self._subscribes.list()
             active_ids = {str(subscribe.id) for subscribe in subscribes}
+            active_identities = {_identity(subscribe) for subscribe in subscribes
+                                 if subscribe.type == MediaType.TV.value}
             with self._lock:
+                self._preview_search_cache = {
+                    key: cached for key, cached in self._preview_search_cache.items()
+                    if key[0] in active_identities
+                }
                 stale_ids = set(self._state["entries"]) - active_ids
                 stale_ids.update(
                     str(subscribe.id) for subscribe in subscribes
@@ -709,7 +751,8 @@ class SubscribeOverwatcher(_PluginBase):
                 )
                 for sid in stale_ids:
                     self._state["entries"].pop(sid, None)
-                if stale_ids:
+                records_cleaned = self._prune_confirmed_records()
+                if stale_ids or records_cleaned:
                     self._save_state()
             for subscribe in subscribes:
                 if self._is_managed(subscribe) and subscribe.type == MediaType.TV.value:
@@ -735,6 +778,32 @@ class SubscribeOverwatcher(_PluginBase):
                 self._search_approved(sid)
         finally:
             self._scan_lock.release()
+
+    def _prune_confirmed_records(self) -> bool:
+        """扫描时清理批准满 24 小时的候选与确认预览；调用方持有状态锁。"""
+        cutoff = datetime.now(timezone.utc).timestamp() - 24 * 3600
+        changed = False
+        for entry in self._state["entries"].values():
+            if entry.get("status") != "approved":
+                continue
+            try:
+                approved_at = datetime.fromisoformat(str(entry.get("approved_at") or "").replace("Z", "+00:00"))
+                if approved_at.tzinfo is None:
+                    approved_at = approved_at.replace(tzinfo=timezone.utc)
+                approved_ts = approved_at.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                approved_ts = None
+            if approved_ts is not None and approved_ts <= cutoff:
+                for field in ("candidates", "preview"):
+                    if field in entry:
+                        entry.pop(field)
+                        changed = True
+            # 后续回刷预览从自己的生成时间计时，不能因订阅早已批准而立即清掉。
+            preview_ts = (entry.get("replacement_preview") or {}).get("searched_ts")
+            if isinstance(preview_ts, (int, float)) and preview_ts <= cutoff:
+                entry.pop("replacement_preview", None)
+                changed = True
+        return changed
 
     def _scan_one(self, sid: int) -> None:
         """
@@ -768,6 +837,7 @@ class SubscribeOverwatcher(_PluginBase):
                     entry["candidates"] = merge_candidates(entry.get("candidates") or [], fresh)
                     entry["last_scan"] = now
                     entry.pop("last_error", None)
+                    self._remember_search(subscribe, contexts, [], "候选扫描", now)
                     self._save_state()
         except Exception:
             logger.exception(f"扫描订阅 {sid} 的目标季候选失败")
@@ -778,12 +848,17 @@ class SubscribeOverwatcher(_PluginBase):
                     self._save_state()
 
     @staticmethod
-    def _search_unfiltered(subscribe: Any) -> list[Any]:
+    def _search_unfiltered(
+        subscribe: Any, timings: Optional[dict[str, float]] = None, *, sites: Optional[list[int]] = None,
+    ) -> list[Any]:
         """按媒体身份搜索各季，再保留包含目标季的资源。"""
+        started = time.perf_counter()
         media = MediaChain().recognize_media(
             media_source=MediaSource(subscribe.media_source),
             media_id=str(subscribe.media_id), mtype=MediaType.TV,
         )
+        if timings is not None:
+            timings["recognition_seconds"] = time.perf_counter() - started
         if media is None:
             return []
         target = copy.copy(media)
@@ -795,18 +870,75 @@ class SubscribeOverwatcher(_PluginBase):
         media_key = build_media_key(media_source, media_id)
         if not media_key:
             return []
-        return SearchChain().process(
+        started = time.perf_counter()
+        contexts = SearchChain().process(
             mediainfo=target,
             rule_groups=[],
+            sites=sites or None,
             candidate_filter=lambda contexts: [
                 context for context in contexts
                 if getattr(context, "match_status", None) in (None, "exact")
                 and target_seasons(getattr(context, "meta_info", None), season)
+                and (not sites or getattr(getattr(context, "torrent_info", None), "site", None) in sites)
             ],
         )
+        if timings is not None:
+            timings["search_seconds"] = time.perf_counter() - started
+        return contexts
+
+    def _remember_search(
+        self, subscribe: Any, contexts: list[Any], sites: list[int], source: str, searched_at: str,
+    ) -> None:
+        """每个媒体和站点范围只保留最新一轮结果，不合并历次搜索。"""
+        with self._lock:
+            key = (_identity(subscribe), tuple(sorted(set(sites))))
+            if key not in self._preview_search_cache and len(self._preview_search_cache) >= 64:
+                oldest = min(self._preview_search_cache, key=lambda item: self._preview_search_cache[item]["at"])
+                self._preview_search_cache.pop(oldest, None)
+            self._search_cache_sequence += 1
+            self._preview_search_cache[key] = {
+                "at": time.monotonic(), "contexts": contexts, "source": source, "searched_at": searched_at,
+                "sequence": self._search_cache_sequence,
+            }
+
+    def _cached_search(self, subscribe: Any, sites: list[int]) -> Optional[dict[str, Any]]:
+        """预览及开始前的状态检查共用同一缓存选择和站点筛选。"""
+        identity = _identity(subscribe)
+        selected_sites = set(sites)
+        with self._lock:
+            compatible = [
+                entry for (media_identity, cached_sites), entry in self._preview_search_cache.items()
+                if media_identity == identity and (not cached_sites or
+                    (selected_sites and selected_sites.issubset(cached_sites)))
+            ]
+            if not compatible:
+                return None
+            cached = max(compatible, key=lambda item: (item["at"], item["sequence"]))
+            return {**cached, "contexts": [
+                context for context in cached["contexts"]
+                if not sites or getattr(getattr(context, "torrent_info", None), "site", None) in sites
+            ]}
+
+    def _preview_contexts(
+        self, subscribe: Any, refresh_search: bool, timings: dict[str, float], sites: list[int],
+    ) -> tuple[list[Any], bool, float, str, str]:
+        """单站可复用覆盖该站的扫描；全站预览不能复用不完整的单站搜索。"""
+        cached = self._cached_search(subscribe, sites) if not refresh_search else None
+        if cached is not None:
+            return cached["contexts"], True, time.monotonic() - cached["at"], cached["source"], cached["searched_at"]
+        key = (_identity(subscribe), tuple(sorted(set(sites))))
+        with self._lock:
+            # 强制刷新失败时不能继续使用被要求淘汰的旧搜索。
+            self._preview_search_cache.pop(key, None)
+        contexts = self._search_unfiltered(subscribe, timings, sites=sites)
+        searched_at = _utc_now()
+        self._remember_search(subscribe, contexts, sites, "规则预览搜索", searched_at)
+        return contexts, False, 0.0, "规则预览搜索", searched_at
 
     @staticmethod
-    def _rule_rejection(subscribe: Any, context: Any) -> Optional[str]:
+    def _rule_rejection(
+        subscribe: Any, context: Any, filter_params: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         用宿主的同一基础筛选器核对站点与订阅文本规则。
         """
@@ -816,11 +948,14 @@ class SubscribeOverwatcher(_PluginBase):
         sites = getattr(subscribe, "sites", None) or []
         if sites and getattr(torrent, "site", None) not in sites:
             return "不在订阅站点范围内"
-        return TorrentHelper.filter_torrent_reason(torrent, SubscribeChain.get_params(subscribe))
+        return TorrentHelper.filter_torrent_reason(
+            torrent, SubscribeChain.get_params(subscribe) if filter_params is None else filter_params,
+        )
 
     def _search_rule_preview(
         self, subscribe: Any, rules: dict[str, Any], *, require_episodes: bool = False,
         download_directory: str = "",
+        refresh_search: bool = False, candidate: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         只搜索并筛选当前资源，不更新订阅或提交下载。
@@ -831,13 +966,23 @@ class SubscribeOverwatcher(_PluginBase):
         :param download_directory: 可选的资源根目录；留空预览订阅原目录或宿主默认目录
         :return: 通过、拒绝及统计信息
         """
+        started = time.perf_counter()
+        timings = {"recognition_seconds": 0.0, "search_seconds": 0.0}
         working = copy.copy(subscribe)
         for field, value in rules.items():
             if value is not None:
                 setattr(working, field, value)
             elif field != "sites":
                 setattr(working, field, None)
-        contexts = self._search_unfiltered(subscribe)
+        search_sites = getattr(working, "sites", None) or []
+        contexts, cached, cache_age, source, result_at = self._preview_contexts(
+            subscribe, refresh_search, timings, search_sites,
+        )
+        filtering_started = time.perf_counter()
+        filter_params = SubscribeChain.get_params(working)
+        summary = rule_summary(filter_params, getattr(working, "sites", None) or [], candidate,
+                               working=working, rules=rules)
+        directory_seconds = 0.0
         now = _utc_now()
         matched: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
@@ -855,10 +1000,11 @@ class SubscribeOverwatcher(_PluginBase):
                 reason = "未明确识别集数，不能手动选集"
             else:
                 try:
-                    reason = self._rule_rejection(working, context)
+                    reason = self._rule_rejection(working, context, filter_params)
                 except (TypeError, ValueError, AttributeError):
                     reason = "资源字段不完整，无法核对规则"
                 if reason is None:
+                    directory_started = time.perf_counter()
                     try:
                         item["download_path"] = preview_download_path(
                             getattr(context, "media_info", None),
@@ -866,8 +1012,10 @@ class SubscribeOverwatcher(_PluginBase):
                         )
                     except ValueError as error:
                         item["download_path_error"] = str(error)
+                    finally:
+                        directory_seconds += time.perf_counter() - directory_started
             if reason:
-                item["reason"] = reason
+                item["reason"] = readable_rejection(reason, summary)
                 rejected.append(item)
             else:
                 matched.append(item)
@@ -875,15 +1023,36 @@ class SubscribeOverwatcher(_PluginBase):
                     "first_episode": 1, "episode": 0}
         matched.sort(key=lambda item: priority.get(item["kind"], 0), reverse=True)
         rejected.sort(key=lambda item: priority.get(item["kind"], 0), reverse=True)
+        timings.update({
+            "filter_seconds": max(0.0, time.perf_counter() - filtering_started - directory_seconds),
+            "directory_seconds": directory_seconds,
+            "total_seconds": time.perf_counter() - started,
+        })
+        reason_counts = Counter(item["reason"] for item in rejected)
+        logger.info(
+            f"订阅 {subscribe.id} 规则预览：{'复用搜索' if cached else '重新搜索'}，"
+            f"媒体识别 {timings['recognition_seconds']:.2f}s，搜索与解析 {timings['search_seconds']:.2f}s，"
+            f"规则筛选 {timings['filter_seconds']:.2f}s，目录计算 {directory_seconds:.2f}s，"
+            f"通过 {len(matched)} 条，排除 {len(rejected)} 条"
+        )
         return {
             "matched": matched[:80], "rejected": rejected[:40],
             "matched_count": len(matched), "rejected_count": len(rejected),
             "searched_at": now, "searched_ts": datetime.now(timezone.utc).timestamp(),
+            "search_cached": cached, "search_age_seconds": round(cache_age, 1),
+            "search_result_count": len(contexts),
+            "search_trigger": "cache" if cached else "manual" if refresh_search else "cache_miss",
+            "search_source": source, "search_result_at": result_at, "search_sites": search_sites,
+            "timings": {key: round(value, 3) for key, value in timings.items()},
+            "effective_rules": summary,
+            "rejection_summary": [{"reason": reason, "count": count}
+                                  for reason, count in reason_counts.most_common()],
         }
 
     def preview_candidate(
         self, choice: str, rule_json: str = "", rule_mode: str = "candidate",
         download_directory: str = "",
+        *, refresh_search: bool = False,
     ) -> tuple[bool, str, str]:
         """
         生成候选规格的只读匹配预览，保持订阅暂停和原规则不变。
@@ -918,7 +1087,10 @@ class SubscribeOverwatcher(_PluginBase):
                 return False, str(error), rule_json
             scope = _rule_scope(subscribe)
         try:
-            preview = self._search_rule_preview(subscribe, rules, download_directory=download_directory)
+            preview = self._search_rule_preview(
+                subscribe, rules, download_directory=download_directory,
+                refresh_search=refresh_search, candidate=candidate,
+            )
         except Exception:
             logger.exception(f"预览订阅 {sid} 的规则匹配失败")
             return False, "搜索失败，请查看插件日志后重试", rule_json
@@ -927,11 +1099,12 @@ class SubscribeOverwatcher(_PluginBase):
             entry = self._state["entries"].get(str(sid)) or {}
             if not current or entry.get("status") != "pending" or _rule_scope(current) != scope:
                 return False, "预览期间订阅发生变化，请重新预览", rule_json
-            preview.update({"choice": choice, "rules": rules, "scope": scope, "rule_mode": rule_mode})
+            normalized_json = json.dumps(editor_draft_rules(candidate, rules, rule_json), ensure_ascii=False, indent=2)
+            preview.update({"choice": choice, "rules": rules, "scope": scope, "rule_mode": rule_mode,
+                            "draft_json": normalized_json})
             preview["download_directory"] = download_directory
             entry["preview"] = preview
             self._save_state()
-        normalized_json = json.dumps(rules, ensure_ascii=False, indent=2)
         selected = next((item for item in preview["matched"] if item["id"] == candidate_id), {})
         path = selected.get("download_path") or selected.get("download_path_error")
         destination = f"；预计下载目录：{path}" if path else ""
@@ -1056,6 +1229,11 @@ class SubscribeOverwatcher(_PluginBase):
             self._save_state()
             logger.exception(f"批准订阅 {sid} 时写入规则或状态失败")
             return False, "规则或状态保存失败，订阅仍保持拦截"
+        with self._lock:
+            self._preview_search_cache = {
+                key: cached for key, cached in self._preview_search_cache.items()
+                if key[0] != entry.get("identity")
+            }
         if resume_state != "S":
             self._schedule_approved_search(sid)
         else:
@@ -1122,7 +1300,7 @@ class SubscribeOverwatcher(_PluginBase):
             return False, "批准已撤销并恢复下载拦截，但暂停订阅失败，请检查插件日志"
         return True, f"订阅 {sid} 已撤销批准，原有筛选规则保留"
 
-    def preview_replacements(self, sid_value: Any) -> tuple[bool, str]:
+    def preview_replacements(self, sid_value: Any, *, refresh_search: bool = False) -> tuple[bool, str]:
         """
         按已批准订阅的当前规则搜索可供手动回刷的资源。
 
@@ -1142,7 +1320,7 @@ class SubscribeOverwatcher(_PluginBase):
             self._save_state()
             scope = _rule_scope(subscribe)
         try:
-            preview = self._search_rule_preview(subscribe, {}, require_episodes=True)
+            preview = self._search_rule_preview(subscribe, {}, require_episodes=True, refresh_search=refresh_search)
         except Exception:
             logger.exception(f"预览订阅 {sid} 的回刷资源失败")
             return False, "搜索失败，请查看插件日志后重试"
@@ -1299,11 +1477,55 @@ class SubscribeOverwatcher(_PluginBase):
         from fastapi import Depends
         from app.api.dependencies.auth import get_current_active_superuser
 
+        dependencies = [Depends(get_current_active_superuser)]
         return [{
             "path": "/apply", "endpoint": self.apply_config, "methods": ["POST"],
-            "auth": "bear", "dependencies": [Depends(get_current_active_superuser)],
+            "auth": "bear", "dependencies": dependencies,
             "summary": "保存剧集守门员设置并执行所选操作",
+        }, {
+            "path": "/preview-status", "endpoint": self.preview_search_status, "methods": ["POST"],
+            "auth": "bear", "dependencies": dependencies,
+            "summary": "检查预览搜索缓存，不保存设置或触发搜索",
         }]
+
+    def preview_search_status(self, config: dict[str, Any]) -> dict[str, Any]:
+        """搜索前告知组件本次会复用缓存还是重新搜索；不修改任何记录。"""
+        try:
+            is_candidate = config.get("operation") == "preview"
+            if not is_candidate and config.get("operation") != "preview_replace":
+                return {"success": False, "message": "请选择预览操作"}
+            if is_candidate:
+                sid_text, candidate_id = str(config.get("candidate") or "").split(":", 1)
+                sid = int(sid_text)
+            else:
+                sid = int(config.get("replace_subscription") or "")
+            with self._lock:
+                subscribe = self._subscribes.get(sid)
+                entry = self._state["entries"].get(str(sid)) or {}
+                if not subscribe or entry.get("identity") != _identity(subscribe):
+                    return {"success": False, "message": "订阅身份已变化，请重新扫描"}
+                if is_candidate:
+                    candidate = next((item for item in entry.get("candidates") or []
+                                      if item.get("id") == candidate_id), None)
+                    if entry.get("status") != "pending" or not candidate:
+                        return {"success": False, "message": "候选或订阅已变化，请重新扫描"}
+                    rules = _draft_rules(candidate, str(config.get("rule_json") or ""),
+                                         str(config.get("rule_mode") or "candidate"))
+                else:
+                    if not self._is_approved(subscribe):
+                        return {"success": False, "message": "订阅未批准或身份已变化"}
+                    rules = {}
+                sites = rules.get("sites")
+                if sites is None:
+                    sites = getattr(subscribe, "sites", None) or []
+                cached = self._cached_search(subscribe, sites)
+                status = "manual" if config.get("refresh_search") else (
+                    "cache_miss" if cached is None else "cached" if cached["contexts"] else "cached_empty"
+                )
+                return {"success": True, "status": status, "search_sites": sites,
+                        "search_result_count": len(cached["contexts"]) if cached is not None else None}
+        except (ValueError, TypeError) as error:
+            return {"success": False, "message": str(error) or "预览选项无效"}
 
     def apply_config(self, config: dict[str, Any]) -> dict[str, Any]:
         """沿用宿主配置更新流程，并把一次性操作的实际结果返回给组件。"""
@@ -1318,10 +1540,20 @@ class SubscribeOverwatcher(_PluginBase):
             outcome = copy.deepcopy(self._state.get("last_confirmation") or {})
         if outcome.get("request_id") != str(config.get("operation_request_id") or ""):
             return {"success": False, "message": "操作已提交，但未能确认结果，请查看插件详情页"}
-        return {
+        response = {
             "success": bool(outcome.get("success")),
             "message": outcome.get("message") or "操作未返回结果",
         }
+        if response["success"] and config.get("operation") in {"preview", "preview_replace"}:
+            is_candidate = config["operation"] == "preview"
+            sid = str(config.get("candidate") or "").split(":", 1)[0] if is_candidate \
+                else str(config.get("replace_subscription") or "")
+            with self._lock:
+                response["preview"] = _config_preview(
+                    sid, self._state["entries"].get(sid) or {},
+                    "preview" if is_candidate else "replacement_preview",
+                )
+        return response
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
@@ -1331,6 +1563,13 @@ class SubscribeOverwatcher(_PluginBase):
             subscriptions = self._subscribes.list()
             current = {str(item.id): item for item in subscriptions}
             last_confirmation = copy.deepcopy(self._state.get("last_confirmation"))
+            previews = {}
+            for field in ("preview", "replacement_preview"):
+                latest = max(
+                    ((sid, entry) for sid, entry in self._state["entries"].items() if entry.get(field)),
+                    key=lambda row: row[1][field].get("searched_ts") or 0, default=None,
+                )
+                previews[field] = _config_preview(*latest, field) if latest else None
             # 首次启用前还没有水位；先展示现有订阅，保存启用配置时再冻结水位。
             historical = [
                 (item, _subscription_progress(item)[0])
@@ -1390,11 +1629,12 @@ class SubscribeOverwatcher(_PluginBase):
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
                     "subscription_id": sid,
-                    "rules": {
+                    "rule_names": candidate_rule_names(item),
+                    "rules": display_draft_rules(item, {
                         key: value for key, value in (item.get("rules") or {}).items()
                         if key in {"quality", "resolution", "effect", "include", "exclude", "sites"}
                         and value is not None
-                    },
+                    }),
                     "page_url": public_page_url(item.get("page_url")),
                     "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
                 }
@@ -1499,12 +1739,6 @@ class SubscribeOverwatcher(_PluginBase):
                            "hint": "确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理",
                            "persistent-hint": True})),
             ),
-            row(
-                col(field("VTextarea", {
-                    "model": "rule_json", "label": "草稿规则 JSON；留空使用候选规格，可编辑后重新预览",
-                    "rows": 3, "auto-grow": True,
-                })),
-            ),
             divider,
             row(
                 col(select("direct_subscription", "直接批准的待确认订阅", pending_choices,
@@ -1549,6 +1783,9 @@ class SubscribeOverwatcher(_PluginBase):
             "replace_subscription": "", "replace_resource": "", "replace_episodes": "",
             "operation": "save", "operation_request_id": "",
             "_last_confirmation": last_confirmation,
+            "_candidate_preview": previews["preview"],
+            "_replacement_preview": previews["replacement_preview"],
+            "_rule_options": SUBSCRIPTION_RULE_OPTIONS,
         }
 
     def get_page(self) -> list[dict[str, Any]]:
@@ -1646,7 +1883,9 @@ class SubscribeOverwatcher(_PluginBase):
                     }})
         if approved:
             page.append({"component": "VAlert", "props": {
-                "type": "success", "variant": "tonal", "text": "已批准订阅可在配置页撤销批准；规则会保留，订阅会暂停。",
+                "type": "success", "variant": "tonal",
+                "text": "已批准订阅可在配置页撤销批准；规则会保留，订阅会暂停。"
+                        "候选和确认预览保留 24 小时，期满后由下一次扫描清理，批准状态继续有效。",
             }})
         for sid, entry in approved:
             mode = "候选规则回填" if entry.get("mode") == "candidate" else "直接批准"
@@ -1655,6 +1894,16 @@ class SubscribeOverwatcher(_PluginBase):
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
                         f"{mode} · 批准于 {entry.get('approved_at') or '?'}",
             }})
+            confirmed_preview = entry.get("preview") or {}
+            if confirmed_preview:
+                page.append({"component": "VAlert", "props": {
+                    "type": "info", "variant": "tonal",
+                    "text": f"确认时的规则预览（历史记录）：{confirmed_preview.get('searched_at') or '?'} · "
+                            f"通过 {confirmed_preview.get('matched_count', 0)} 条，"
+                            f"排除 {confirmed_preview.get('rejected_count', 0)} 条；"
+                            "完整搜索缓存已释放，以下记录不代表当前资源仍然存在。",
+                }})
+                page.append(_preview_table(confirmed_preview))
             preview = entry.get("replacement_preview") or {}
             if preview:
                 page.append({"component": "VAlert", "props": {
@@ -1726,6 +1975,8 @@ class SubscribeOverwatcher(_PluginBase):
         """
         停止插件的一次性候选扫描和确认后补搜任务。
         """
+        with self._lock:
+            self._preview_search_cache.clear()
         try:
             remove_plugin_once_job(self.__class__.__name__, "collect")
         except RuntimeError:

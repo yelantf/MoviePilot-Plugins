@@ -9,13 +9,42 @@ import re
 from hashlib import sha256
 from typing import Any, Optional
 
-from .rules import public_page_url, resource_candidate, target_seasons
+from .rules import candidate_rule_names, public_page_url, resource_candidate, target_seasons
 
 
 RULE_FIELDS = ("quality", "resolution", "effect", "include", "exclude", "sites")
+RULE_LABELS = {"quality": "质量", "resolution": "分辨率", "effect": "特效",
+               "include": "包含", "exclude": "排除", "sites": "站点",
+               "tv_size": "剧集大小", "movie_size": "电影大小", "size": "大小",
+               "min_seeders": "最少做种人数", "min_seeders_time": "做种检查时间"}
+
+# 与 MoviePilot-Frontend v3/src/api/constants.ts 的订阅筛选选项一致。
+SUBSCRIPTION_RULE_OPTIONS = {
+    "quality": [
+        {"title": "全部", "value": None},
+        {"title": "蓝光原盘", "value": "Blu-?Ray.+VC-?1|Blu-?Ray.+AVC|UHD.+blu-?ray.+HEVC|MiniBD"},
+        {"title": "Remux", "value": "Remux"}, {"title": "BluRay", "value": "Blu-?Ray"},
+        {"title": "UHD", "value": "UHD|UltraHD"}, {"title": "WEB-DL", "value": "WEB-?DL|WEB-?RIP"},
+        {"title": "HDTV", "value": "HDTV"}, {"title": "H265", "value": "[Hx].?265|HEVC"},
+        {"title": "H264", "value": "[Hx].?264|AVC"},
+    ],
+    "resolution": [
+        {"title": "全部", "value": None}, {"title": "4K", "value": "4K|2160p|x2160"},
+        {"title": "1080p", "value": "1080[pi]|x1080"}, {"title": "720p", "value": "720[pi]|x720"},
+    ],
+    "effect": [
+        {"title": "全部", "value": None},
+        {"title": "杜比视界", "value": r"Dolby[\s.]+Vision|DOVI|[\s.]+DV[\s.]+"},
+        {"title": "杜比全景声", "value": r"Dolby[\s.]*\+?Atmos|Atmos"},
+        {"title": "HDR", "value": r"[\s.]+HDR[\s.]+|HDR10|HDR10\+"},
+        {"title": "SDR", "value": r"[\s.]+SDR[\s.]+"},
+    ],
+}
 
 
-def normalize_draft_rules(defaults: dict[str, Any], raw: str) -> dict[str, Any]:
+def normalize_draft_rules(
+    defaults: dict[str, Any], raw: str, names: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """
     将候选规格与用户编辑的 JSON 合并为可安全回填的规则。
 
@@ -37,6 +66,14 @@ def normalize_draft_rules(defaults: dict[str, Any], raw: str) -> dict[str, Any]:
         if key not in result:
             continue
         value = result[key]
+        if isinstance(value, dict):
+            if set(value) == {"subscription"} and value["subscription"] is True and key != "sites":
+                result.pop(key)
+                continue
+            if set(value) != {"candidate"} or not names or not names.get(key) \
+                    or value["candidate"] != names[key] or not defaults.get(key):
+                raise ValueError(f"{key} 的候选规则引用已失效，请重新选择版本并重新预览")
+            value = result[key] = defaults[key]
         if key == "sites":
             if value is not None and (
                 not isinstance(value, list)
@@ -52,6 +89,67 @@ def normalize_draft_rules(defaults: dict[str, Any], raw: str) -> dict[str, Any]:
             except re.error as error:
                 raise ValueError(f"{key} 的正则表达式无效：{error}") from error
     return result
+
+
+def editor_draft_rules(candidate: dict[str, Any], rules: dict[str, Any], raw: str) -> dict[str, Any]:
+    """保留选项面板中的“保留原订阅”选择，兼容原始 JSON 草稿。"""
+    displayed = display_draft_rules(candidate, rules)
+    changes = json.loads(raw) if raw.strip() else {}
+    displayed.update({field: value for field, value in changes.items()
+                      if value == {"subscription": True} and field not in rules})
+    return displayed
+
+
+def display_draft_rules(candidate: dict[str, Any], rules: dict[str, Any]) -> dict[str, Any]:
+    """把与所选候选完全一致的规则显示成名称引用，自定义规则保留原文。"""
+    defaults = candidate.get("rules") or {}
+    names = candidate_rule_names(candidate)
+    return {
+        field: {"candidate": names[field]}
+        if field in names and value and value == defaults.get(field) else value
+        for field, value in rules.items()
+    }
+
+
+def rule_summary(
+    params: dict[str, Any], sites: list[int], candidate: Optional[dict[str, Any]] = None,
+    *, working: Any = None, rules: Optional[dict[str, Any]] = None,
+) -> list[dict[str, str]]:
+    """展示本次筛选的实际条件，包括宿主默认条件。"""
+    displayed = display_draft_rules(candidate or {}, params)
+    rules = rules or {}
+    summary = [{"field": "sites", "label": "站点", "value": ", ".join(map(str, sites)) or "不限站点",
+                "source": "候选 / 草稿" if rules.get("sites") is not None else "原订阅"}]
+    for field, value in displayed.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, dict) and "candidate" in value:
+            text = value["candidate"]
+        elif field in SUBSCRIPTION_RULE_OPTIONS and (option := next(
+            (item for item in SUBSCRIPTION_RULE_OPTIONS[field] if item["value"] == value), None,
+        )):
+            text = option["title"]
+        elif field in RULE_FIELDS:
+            text = f"自定义正则：{value}"
+        else:
+            text = str(value)
+        source = "宿主默认"
+        if working is not None and getattr(working, field, None):
+            source = "原订阅"
+            if field in rules and rules[field] == params[field]:
+                source = "候选规格" if isinstance(value, dict) else "草稿"
+        summary.append({"field": field, "label": RULE_LABELS.get(field, field), "value": text, "source": source})
+    return summary
+
+
+def readable_rejection(reason: str, summary: list[dict[str, str]]) -> str:
+    """沿用宿主首个失败条件，用生效条件名称解释包含和排除的含义。"""
+    for item in summary:
+        field, label = item["field"], item["label"]
+        if reason.startswith((f"不符合{label}条件", f"不符合{field}条件")):
+            prefix = {"include": "缺少包含标识", "exclude": "命中排除规则"}.get(field, f"不符合{label}")
+            return f"{prefix}：{item['value']}"
+    return reason
 
 
 def parse_episode_selection(value: str, total_episode: Optional[int]) -> set[int]:
