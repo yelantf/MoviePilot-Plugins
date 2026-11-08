@@ -293,6 +293,23 @@ def _candidate_action_cell(sid: str, items: list[dict[str, Any]]) -> dict[str, A
     return {"component": "td", "content": buttons}
 
 
+def _seeders_label(item: dict[str, Any]) -> str:
+    seeders = item.get("seeders")
+    return f"{seeders:,} 人" if isinstance(seeders, int) and not isinstance(seeders, bool) and seeders >= 0 else "未知"
+
+
+def _availability_cell(items: list[dict[str, Any]], field: str) -> dict[str, Any]:
+    """合并版本仍按站点分别展示人数和促销，避免误用其他站点的免费状态。"""
+    content = []
+    for item in items:
+        label = _seeders_label(item) if field == "seeders" else item.get("promotion") or "未知"
+        if len(items) > 1:
+            site = item.get("site_name") or str(item.get("site_id") or "未知站点")
+            label = f"{site}：{label}"
+        content.append({"component": "div", "text": label, "props": {"style": "white-space: nowrap"}})
+    return {"component": "td", "content": content}
+
+
 def _full_season_version_count(items: list[dict[str, Any]]) -> int:
     """跨站同版本整季资源在确认和提示中只计一次。"""
     return sum(group[0].get("kind") == "full_season" for group in _display_groups(items))
@@ -313,6 +330,8 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
             _site_cell(group),
             {"component": "td", "text": item.get("title") or ""},
             _size_cell(item),
+            _availability_cell(group, "seeders"),
+            _availability_cell(group, "promotion"),
             {"component": "td", "text": item.get("download_path") or item.get("download_path_error") or "—"},
             {"component": "td", "text": item.get("reason") or "符合当前规则"},
         ]}
@@ -323,7 +342,7 @@ def _preview_table(preview: dict[str, Any]) -> dict[str, Any]:
     return {"component": "VTable", "props": {"hover": True}, "content": [
         {"component": "thead", "content": [{"component": "tr", "content": [
             {"component": "th", "text": title}
-            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "预计下载目录", "原因")
+            for title in ("结果", "类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "预计下载目录", "原因")
         ]}]},
         {"component": "tbody", "content": rows},
     ]}
@@ -362,7 +381,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.4"
+    plugin_version = "1.9.5"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -2038,6 +2057,7 @@ class SubscribeOverwatcher(_PluginBase):
                              f"{_candidate_label(item)} {_candidate_coverage(item)} · "
                              f"{item.get('site_name') or item.get('site_id') or '未知站点'} · "
                              f"{_size_label(item.get('size_bytes'), exact=True)} · "
+                             f"做种 {_seeders_label(item)} · 免费/促销：{item.get('promotion') or '未知'} · "
                              f"{item.get('quality') or '?'} {item.get('resolution') or '?'} "
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
@@ -2052,6 +2072,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "page_url": public_page_url(item.get("page_url")),
                     "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
                     "site_id": item.get("site_id"),
+                    "seeders_label": _seeders_label(item), "promotion": item.get("promotion") or "未知",
                     "original_sites": getattr(current.get(sid), "sites", None) or [],
                     "original_filter_groups": getattr(current.get(sid), "filter_groups", None) or [],
                     "team": item.get("release_team", item.get("team")), "team_pattern": candidate_team_pattern(item),
@@ -2077,7 +2098,8 @@ class SubscribeOverwatcher(_PluginBase):
                 {
                     "title": f"#{sid} · {_candidate_label(item)} {_candidate_coverage(item)} · "
                              f"{item.get('site_name') or item.get('site_id') or '未知站点'} · "
-                             f"{_size_label(item.get('size_bytes'), exact=True)} · {item.get('title')}",
+                             f"{_size_label(item.get('size_bytes'), exact=True)} · "
+                             f"做种 {_seeders_label(item)} · 免费/促销：{item.get('promotion') or '未知'} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
                 }
                 for sid, entry in self._state["entries"].items()
@@ -2288,6 +2310,8 @@ class SubscribeOverwatcher(_PluginBase):
                     _site_cell(group),
                     {"component": "td", "text": item.get("title") or ""},
                     _size_cell(item),
+                    _availability_cell(group, "seeders"),
+                    _availability_cell(group, "promotion"),
                     {"component": "td", "text": item.get("quality") or "?"},
                     {"component": "td", "text": item.get("resolution") or "?"},
                     {"component": "td", "text": item.get("effect") or "?"},
@@ -2301,7 +2325,7 @@ class SubscribeOverwatcher(_PluginBase):
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "质量", "分辨率", "特效", "制作组", "最后发现", "配置")
+                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现", "配置")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})

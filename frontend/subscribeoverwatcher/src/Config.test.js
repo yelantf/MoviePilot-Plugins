@@ -14,7 +14,7 @@ const Button = defineComponent({
 })
 const components = Object.fromEntries([
   'VCard', 'VCardTitle', 'VCardText', 'VCardActions', 'VRow', 'VCol', 'VSpacer',
-  'VAlert', 'VTable', 'VProgressLinear', 'VSwitch', 'VSelect', 'VAutocomplete', 'VCombobox', 'VTextField',
+  'VAlert', 'VTable', 'VProgressLinear', 'VSwitch', 'VSelect', 'VAutocomplete', 'VCombobox', 'VTextField', 'VChip',
 ].map(name => [name, Container]))
 components.VBtn = Button
 components.VAlert = defineComponent({
@@ -716,17 +716,22 @@ describe('custom configuration actions', () => {
       .toBeUndefined()
   })
 
-  it('links the selected candidate to its site detail page', async () => {
+  it('updates the selected candidate detail link, seeders and promotion when switching versions', async () => {
     const data = snapshot({ managed: '尚无已纳入管理的剧集订阅。', historical: [] })
     data.conf[0].content.push({ component: 'VSelect', props: {
       model: 'candidate', items: [{
         title: '样例资源', value: '1:resource', site_name: '样例站',
         page_url: 'https://tracker.example/details.php?id=42',
-      }],
+        seeders_label: '0 人', promotion: '免费 · 上传 2×',
+      }, {
+        title: '另一个版本', value: '1:other', site_name: '另一个站',
+        page_url: 'https://other.example/details.php?id=43',
+        seeders_label: '19 人', promotion: '下载计费 50%',
+      }, { title: '旧版本', value: '1:old' }],
     } })
     data.model.candidate = '1:resource'
     const wrapper = mount(Config, {
-      props: { api: { get: vi.fn().mockResolvedValue(data) } }, global: { components },
+      props: { api: { get: vi.fn().mockResolvedValue(data) } }, global: { components: { ...components, VSelect: Select } },
     })
     await flushPromises()
 
@@ -736,6 +741,18 @@ describe('custom configuration actions', () => {
       href: 'https://tracker.example/details.php?id=42',
       target: '_blank', rel: 'noopener noreferrer',
     })
+    const availability = () => wrapper.find('[aria-live="polite"]')
+    expect(availability().text()).toContain('做种：0 人')
+    expect(availability().text()).toContain('免费/促销：免费 · 上传 2×')
+    await wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').setValue('1:other')
+    expect(wrapper.find('a').attributes('href')).toBe('https://other.example/details.php?id=43')
+    expect(availability().text()).toContain('做种：19 人')
+    expect(availability().text()).toContain('免费/促销：下载计费 50%')
+    expect(availability().text()).not.toContain('免费 · 上传 2×')
+    await wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').setValue('1:old')
+    expect(availability().text()).toContain('做种：未知')
+    expect(availability().text()).toContain('免费/促销：未知')
+    wrapper.unmount()
   })
 
   it('keeps the existing detail tables visible in the custom page', async () => {

@@ -1723,6 +1723,12 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     third.torrent_info.site_name = "第三个站"
     first.torrent_info.size = second.torrent_info.size = 1024 ** 3
     third.torrent_info.size = 1024 ** 3 + 1
+    first.torrent_info.seeders = 0
+    first.torrent_info.downloadvolumefactor = 0
+    first.torrent_info.uploadvolumefactor = 2
+    second.torrent_info.seeders = 19
+    second.torrent_info.downloadvolumefactor = 0.5
+    second.torrent_info.uploadvolumefactor = 1
     host.search_results.extend([first, second, third])
     plugin.refresh_candidates()
 
@@ -1732,6 +1738,9 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     first_candidate = by_site["样例站"]
     second_candidate = by_site["另一个站"]
     third_candidate = by_site["第三个站"]
+    assert first_candidate["seeders"] == 0 and first_candidate["promotion"] == "免费 · 上传 2×"
+    assert second_candidate["seeders"] == 19 and second_candidate["promotion"] == "下载计费 50%"
+    assert third_candidate["seeders"] is None and third_candidate["promotion"] == "未知"
     same_site = {**first_candidate, "id": "another-id"}
     unknown_size = {**second_candidate, "size_bytes": None}
     different_episode = {**second_candidate, "episodes": [2]}
@@ -1751,6 +1760,9 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
         item["title"] for item in choices if "第三个站" in item["title"]
     )
     assert {tuple(item["rules"]["sites"]) for item in choices} == {(5,), (7,), (9,)}
+    first_choice = next(item for item in choices if item["site_id"] == 5)
+    assert "做种 0 人" in first_choice["title"] and "免费 · 上传 2×" in first_choice["title"]
+    assert first_choice["seeders_label"] == "0 人" and first_choice["promotion"] == "免费 · 上传 2×"
     assert host.module._size_label(1024 ** 3, exact=True) != \
         host.module._size_label(1024 ** 3 + 1, exact=True)
     candidate_table = next(item for item in plugin.get_page()
@@ -1766,6 +1778,12 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert other_row["content"][4]["content"][0]["text"] == "1.00 GiB"
     assert grouped_row["content"][4]["props"]["title"] == "精确大小：1,073,741,824 B"
     assert other_row["content"][4]["props"]["title"] == "精确大小：1,073,741,825 B"
+    assert {node["text"] for node in grouped_row["content"][5]["content"]} == {"样例站：0 人", "另一个站：19 人"}
+    assert {node["text"] for node in grouped_row["content"][6]["content"]} == {
+        "样例站：免费 · 上传 2×", "另一个站：下载计费 50%",
+    }
+    assert other_row["content"][5]["content"][0]["text"] == "未知"
+    assert other_row["content"][6]["content"][0]["text"] == "未知"
     site_links = [item for item in grouped_row["content"][2]["content"] if item["component"] == "a"]
     assert {item["props"]["href"] for item in site_links} == {
         "https://one.example/details.php?id=11", "https://two.example/details.php?id=22",
@@ -1796,6 +1814,10 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
                for row in preview_rows)
     assert all(row["content"][5]["content"][0]["text"] == "1.00 GiB" for row in preview_rows)
     assert grouped_preview["content"][5]["props"]["title"] == "精确大小：1,073,741,824 B"
+    assert {node["text"] for node in grouped_preview["content"][6]["content"]} == {"样例站：0 人", "另一个站：19 人"}
+    assert {node["text"] for node in grouped_preview["content"][7]["content"]} == {
+        "样例站：免费 · 上传 2×", "另一个站：下载计费 50%",
+    }
     assert len([node for node in grouped_preview["content"][3]["content"]
                 if node["component"] == "a"]) == 2
     assert grouped_preview["content"][4] == \
@@ -1863,6 +1885,8 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     chosen = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM",
                       page_url="https://tracker.example/details.php?id=1")
     rejected = _context("Show.S01E02.2160p.BluRay.DV-GROUP", episodes=(2,))
+    rejected.torrent_info.seeders = 4
+    rejected.torrent_info.volume_factor = "50%"
     cross_season = _context("Show.S01-S02.1080p.WEB-DL.HDR-TEAM")
     cross_season.meta_info.end_season = 2
     unconfirmed_identity = _context("Show.S01E03.1080p.WEB-DL.HDR-TEAM", episodes=(3,))
@@ -1877,6 +1901,8 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     assert preview["matched_count"] == 1
     assert preview["rejected_count"] == 1
     assert preview["rejected"][0]["reason"]
+    assert preview["rejected"][0]["seeders"] == 4
+    assert preview["rejected"][0]["promotion"] == "50%"
     assert "secret.example" not in json.dumps(preview)
     assert host.subscriptions[2].state == "S"
     assert host.subscriptions[2].quality is None
@@ -3456,6 +3482,9 @@ def test_persistent_cache_survives_stop_and_restart_with_keyword_provenance_and_
     plugin, choice, chosen = _prepare_directory_confirmation(host)
     host.directories.append(_directory("原目录", "/old/downloads"))
     chosen.meta_info.episode_list = [1, 3]
+    chosen.torrent_info.seeders = 12
+    chosen.torrent_info.downloadvolumefactor = 0
+    chosen.torrent_info.uploadvolumefactor = 2
     cached = next(iter(plugin._preview_search_cache.values()))
     cached["diagnostics"]["original_search"]["resource_ids"] = []
     clock = [1000.0, 2000.0]
@@ -3484,6 +3513,8 @@ def test_persistent_cache_survives_stop_and_restart_with_keyword_provenance_and_
     assert preview["matched"][0]["id"] == choice.split(":", 1)[1]
     assert preview["search_keyword_changed"] is True
     assert preview["matched"][0]["download_path"].endswith("电视剧/国产剧")
+    assert preview["matched"][0]["seeders"] == 12
+    assert preview["matched"][0]["promotion"] == "免费 · 上传 2×"
 
 
 def test_reloaded_persistent_cache_rechecks_current_rules(plugin_host):

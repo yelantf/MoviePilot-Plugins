@@ -112,6 +112,13 @@
               <a v-if="selectedCandidateUrl" :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
                 class="text-primary text-decoration-underline">{{ selectedCandidateSite }}</a>
             </p>
+            <div v-if="selectedCandidate" class="d-flex flex-wrap ga-2 mb-2" aria-live="polite">
+              <v-chip size="small" variant="tonal">做种：{{ selectedCandidate.seeders_label || '未知' }}</v-chip>
+              <v-chip size="small" variant="tonal">免费/促销：{{ selectedCandidate.promotion || '未知' }}</v-chip>
+            </div>
+            <p class="text-caption text-medium-emphasis mb-4">
+              做种人数及免费/促销为最近搜索时的状态，重新搜索可更新；未提供数据的资源显示“未知”。
+            </p>
             <v-select v-model="form.download_directory" label="下载目录（留空保留原目录）"
               :items="options.download_directory" :disabled="!!busy || !form.candidate_subscription" clearable
               density="comfortable" hint="确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理。"

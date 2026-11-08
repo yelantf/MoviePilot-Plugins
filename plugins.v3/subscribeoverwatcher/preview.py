@@ -9,7 +9,7 @@ import re
 from hashlib import sha256
 from typing import Any, Optional
 
-from .rules import candidate_rule_names, public_page_url, resource_candidate, target_seasons
+from .rules import candidate_rule_names, public_page_url, resource_availability, resource_candidate, target_seasons
 from .rulegroups import UNFILTERED_GROUP_NAME
 
 
@@ -246,7 +246,7 @@ def preview_resource(context: Any, season: int, total_episode: Optional[int], se
     if candidate:
         return {key: candidate[key] for key in (
             "id", "kind", "seasons", "target_season", "episodes", "total_episode",
-            "title", "site_id", "site_name", "size_bytes",
+            "title", "site_id", "site_name", "size_bytes", "seeders", "promotion",
             "page_url", "quality", "resolution", "effect", "team",
         )}
     title = str(getattr(torrent, "title", None) or "").strip()[:240]
@@ -266,6 +266,7 @@ def preview_resource(context: Any, season: int, total_episode: Optional[int], se
         "site_name": str(getattr(torrent, "site_name", None) or "")[:80],
         "page_url": public_page_url(getattr(torrent, "page_url", None), getattr(torrent, "enclosure", None)),
         "size_bytes": size_bytes,
+        **resource_availability(torrent),
         "quality": str(getattr(meta, "resource_type", None) or "")[:80],
         "resolution": str(getattr(meta, "resource_pix", None) or "")[:80],
         "effect": str(getattr(meta, "resource_effect", None) or "")[:80],

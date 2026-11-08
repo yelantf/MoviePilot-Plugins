@@ -5,6 +5,7 @@
 """
 
 import hashlib
+import math
 import re
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -69,6 +70,30 @@ def _short(value: Any, limit: int = 100) -> str:
     将搜索结果中的展示字段限制到固定长度。
     """
     return str(value or "").strip()[:limit]
+
+
+def resource_availability(torrent: Any) -> dict[str, Any]:
+    """保留搜索时的做种人数和计费状态；缺失数据不当成零做种或免费。"""
+    seeders = getattr(torrent, "seeders", None)
+    seeders = seeders if isinstance(seeders, int) and not isinstance(seeders, bool) and seeders >= 0 else None
+
+    def factor(field: str) -> Optional[float]:
+        value = getattr(torrent, field, None)
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and math.isfinite(value) and value >= 0 else None
+
+    download = factor("downloadvolumefactor")
+    upload = factor("uploadvolumefactor")
+    if download is None:
+        promotion = _short(getattr(torrent, "volume_factor", None), 80) or "未知"
+    else:
+        promotion = "免费" if download == 0 else "普通" if download == 1 \
+            else f"下载计费 {download * 100:g}%"
+        if upload is not None and upload != 1:
+            if download == 1:
+                promotion = "下载计费 100%"
+            promotion += f" · 上传 {upload:g}×"
+    return {"seeders": seeders, "promotion": promotion}
 
 
 def public_page_url(page_url: Any, enclosure: Any = None) -> Optional[str]:
@@ -297,6 +322,7 @@ def resource_candidate(
         "site_name": _short(getattr(torrent, "site_name", None), 80),
         "page_url": public_page_url(getattr(torrent, "page_url", None), getattr(torrent, "enclosure", None)),
         "size_bytes": size_bytes,
+        **resource_availability(torrent),
         "pubdate": _short(getattr(torrent, "pubdate", None), 40),
         "quality": quality,
         "resolution": resolution,
