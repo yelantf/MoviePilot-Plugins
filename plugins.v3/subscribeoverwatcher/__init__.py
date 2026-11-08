@@ -26,6 +26,7 @@ from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .directory import directory_choices, preview_download_path, selected_directory_root
+from .cache import MAX_CACHE_ENTRIES, SearchCacheStore
 from .preview import (
     SUBSCRIPTION_RULE_OPTIONS, candidate_default_rules, display_draft_rules, editor_draft_rules,
     normalize_draft_rules, parse_episode_selection, preview_resource,
@@ -48,7 +49,7 @@ def _utc_now() -> str:
 
 
 def _search_diagnostics_snapshot(diagnostics: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    """每条资源的查询词仅随完整搜索缓存保存在内存，不扩大持久记录。"""
+    """每条资源的查询词只随搜索缓存保存，不扩大候选和预览展示记录。"""
     if diagnostics is None:
         return None
     snapshot = {key: value for key, value in diagnostics.items() if key != "resource_keywords"}
@@ -361,7 +362,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.3"
+    plugin_version = "1.9.4"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -377,9 +378,11 @@ class SubscribeOverwatcher(_PluginBase):
         self._scan_lock = threading.Lock()
         self._search_stop = threading.Event()
         self._queued_scan_ids: set[int] = set()
-        # 完整搜索上下文只在进程内复用，按容量保留，不写入插件持久数据。
+        # 搜索事实单独落盘，不把凭据或完整搜索结果放入候选和预览展示记录。
         self._preview_search_cache: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
         self._search_cache_sequence = 0
+        self._search_cache_store: Optional[SearchCacheStore] = None
+        self._search_cache_loaded = False
         self._enabled = False
         self._confirm_full_pack = True
         self._daily_notice = True
@@ -427,8 +430,17 @@ class SubscribeOverwatcher(_PluginBase):
             if not self._enabled:
                 self._search_stop.set()
                 self._preview_search_cache.clear()
+                self._search_cache_loaded = False
+                store = self._disk_search_cache()
+                if store is not None:
+                    try:
+                        store.clear()
+                    except OSError:
+                        logger.warning("无法清除已停用插件的持久搜索缓存，请检查插件数据目录")
             elif self._search_stop.is_set():
                 self._search_stop = threading.Event()
+            if self._enabled and not self._search_cache_loaded:
+                self._load_search_cache()
             self._confirm_full_pack = bool(config.get("confirm_full_pack", True))
             self._daily_notice = bool(config.get("daily_notice", True))
             self._notice_hour = self._time_part(config.get("notice_hour", 9), 9, 23)
@@ -846,10 +858,7 @@ class SubscribeOverwatcher(_PluginBase):
             active_identities = {_identity(subscribe) for subscribe in subscribes
                                  if subscribe.type == MediaType.TV.value}
             with self._lock:
-                self._preview_search_cache = {
-                    key: cached for key, cached in self._preview_search_cache.items()
-                    if key[0] in active_identities
-                }
+                self._forget_search_cache(lambda key: key[0] not in active_identities)
                 stale_ids = set(self._state["entries"]) - active_ids
                 stale_ids.update(
                     str(subscribe.id) for subscribe in subscribes
@@ -1134,15 +1143,64 @@ class SubscribeOverwatcher(_PluginBase):
         """每个媒体和站点范围只保留最新一轮结果，不合并历次搜索。"""
         with self._lock:
             key = (_identity(subscribe), tuple(sorted(set(sites))))
-            if key not in self._preview_search_cache and len(self._preview_search_cache) >= 64:
+            if key not in self._preview_search_cache and len(self._preview_search_cache) >= MAX_CACHE_ENTRIES:
                 oldest = min(self._preview_search_cache, key=lambda item: self._preview_search_cache[item]["at"])
-                self._preview_search_cache.pop(oldest, None)
+                self._forget_search_cache(lambda item: item == oldest)
             self._search_cache_sequence += 1
             self._preview_search_cache[key] = {
                 "at": time.monotonic(), "contexts": contexts, "source": source, "searched_at": searched_at,
                 "sequence": self._search_cache_sequence,
+                "searched_ts": time.time(),
                 "diagnostics": diagnostics,
             }
+            store = self._disk_search_cache()
+            if store is not None:
+                try:
+                    removed = store.save(key, self._preview_search_cache[key])
+                    for cached_key in list(self._preview_search_cache):
+                        if store.filename(cached_key) in removed:
+                            self._preview_search_cache.pop(cached_key, None)
+                except OSError:
+                    logger.warning("无法保存持久搜索缓存，本轮继续使用内存结果")
+
+    def _disk_search_cache(self) -> Optional[SearchCacheStore]:
+        if self._search_cache_store is None:
+            try:
+                self._search_cache_store = SearchCacheStore(self.get_data_path() / "search-cache")
+            except (OSError, AttributeError):
+                logger.warning("插件数据目录不可用，搜索缓存暂时仅在内存中复用")
+        return self._search_cache_store
+
+    def _load_search_cache(self) -> None:
+        store = self._disk_search_cache()
+        self._search_cache_loaded = True
+        if store is None:
+            return
+        identities = {_identity(subscribe) for subscribe in self._subscribes.list()
+                      if subscribe.type == MediaType.TV.value}
+        try:
+            restored = store.load(identities)
+        except OSError:
+            logger.warning("无法读取持久搜索缓存，将在需要时重新搜索")
+            return
+        self._preview_search_cache.update(restored)
+        self._search_cache_sequence = max([self._search_cache_sequence] + [
+            entry["sequence"] for entry in restored.values()
+        ])
+        if restored:
+            logger.info(f"已恢复 {len(restored)} 组持久搜索缓存，预览无需重新搜索对应站点范围")
+
+    def _forget_search_cache(self, predicate: Any, *, extra_keys: tuple = ()) -> None:
+        """容量淘汰、批准、删除订阅和主动刷新同时移除内存与磁盘结果。"""
+        store = self._disk_search_cache()
+        for key in set(self._preview_search_cache).union(extra_keys):
+            if predicate(key):
+                self._preview_search_cache.pop(key, None)
+                if store is not None:
+                    try:
+                        store.delete(key)
+                    except OSError:
+                        logger.warning("无法移除持久搜索缓存，请检查插件数据目录")
 
     def _cached_search(self, subscribe: Any, sites: list[int]) -> Optional[dict[str, Any]]:
         """预览及开始前的状态检查共用同一缓存选择和站点筛选。"""
@@ -1177,7 +1235,8 @@ class SubscribeOverwatcher(_PluginBase):
         key = (_identity(subscribe), tuple(sorted(set(sites))))
         with self._lock:
             # 强制刷新失败时不能继续使用被要求淘汰的旧搜索。
-            self._preview_search_cache.pop(key, None)
+            self._forget_search_cache(lambda item: item[0] == key[0] and (not item[1] or
+                                      (sites and set(sites).issubset(item[1]))), extra_keys=(key,))
         diagnostics: dict[str, Any] = {}
         contexts = self._search_unfiltered(subscribe, timings, sites=sites, diagnostics=diagnostics)
         searched_at = _utc_now()
@@ -1571,10 +1630,7 @@ class SubscribeOverwatcher(_PluginBase):
             logger.exception(f"批准订阅 {sid} 时写入规则或状态失败")
             return False, "规则或状态保存失败，订阅仍保持拦截"
         with self._lock:
-            self._preview_search_cache = {
-                key: cached for key, cached in self._preview_search_cache.items()
-                if key[0] != entry.get("identity")
-            }
+            self._forget_search_cache(lambda key: key[0] == entry.get("identity"))
         if resume_state != "S":
             self._schedule_approved_search(sid)
         else:
@@ -2369,6 +2425,7 @@ class SubscribeOverwatcher(_PluginBase):
         with self._lock:
             self._search_stop.set()
             self._preview_search_cache.clear()
+            self._search_cache_loaded = False
             self._queued_scan_ids.clear()
         try:
             remove_plugin_once_job(self.__class__.__name__, "collect")

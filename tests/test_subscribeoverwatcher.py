@@ -20,7 +20,7 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1] / "plugins.v3" / "subscribeover
 
 
 @pytest.fixture
-def plugin_host(monkeypatch):
+def plugin_host(monkeypatch, tmp_path):
     """
     装配只有插件所需接口的内存宿主。
 
@@ -72,6 +72,9 @@ def plugin_host(monkeypatch):
             记录一次性确认控件被复位。
             """
             storage["config"] = copy.deepcopy(config)
+
+        def get_data_path(self):
+            return tmp_path
 
         def post_message(self, **kwargs):
             """记录通过宿主通知渠道发送的消息。"""
@@ -320,6 +323,10 @@ def plugin_host(monkeypatch):
         """
         jobs.pop(job_id, None)
 
+    class RestoredFacts(SimpleNamespace):
+        def from_dict(self, values):
+            self.__dict__.update(copy.deepcopy(values))
+
     exports = {
         "app.application.directory": {
             "DirectoryHelper": DirectoryHelper, "build_media_download_path": build_media_download_path,
@@ -331,6 +338,9 @@ def plugin_host(monkeypatch):
         "app.chain.media": {"MediaChain": MediaChain},
         "app.chain.search": {"SearchChain": SearchChain},
         "app.chain.subscribe": {"SubscribeChain": SubscribeChain},
+        "app.domain.context": {"Context": SimpleNamespace, "MediaInfo": RestoredFacts,
+                               "TorrentInfo": RestoredFacts},
+        "app.schemas.context": {"MetaInfo": SimpleNamespace},
         "app.db.oper.subscribe": {"SubscribeOper": SubscribeOper},
         "app.db.oper.systemconfig": {"SystemConfigOper": SystemConfigOper},
         "app.plugins": {"_PluginBase": PluginBase},
@@ -3437,3 +3447,180 @@ def test_stop_event_stays_cancelled_after_plugin_is_enabled_again(plugin_host):
     plugin.init_plugin({"enabled": True})
     assert previous.is_set() and not plugin._search_stop.is_set()
     assert plugin._search_stop is not previous
+
+
+def test_persistent_cache_survives_stop_and_restart_with_keyword_provenance_and_discrete_episodes(
+    plugin_host, monkeypatch,
+):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    host.directories.append(_directory("原目录", "/old/downloads"))
+    chosen.meta_info.episode_list = [1, 3]
+    cached = next(iter(plugin._preview_search_cache.values()))
+    cached["diagnostics"]["original_search"]["resource_ids"] = []
+    clock = [1000.0, 2000.0]
+    monkeypatch.setattr(host.module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(host.module.time, "time", lambda: clock[1])
+    plugin._remember_search(host.subscriptions[2], [chosen], [], "候选扫描", "扫描时间",
+                            cached["diagnostics"])
+    plugin.stop_service()
+    assert plugin._preview_search_cache == {}
+    files = list(plugin.get_data_path().joinpath("search-cache").glob("*.json"))
+    assert len(files) == 1
+    text = files[0].read_text()
+    assert "cookie-secret" not in text and "secret.example/torrent" not in text
+    clock[:] = [5.0, 2000.0 + 90 * 24 * 3600]
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    host.search_calls.clear()
+    assert restarted.preview_search_status({"operation": "preview", "candidate": choice,
+                                             "rule_mode": "all_sites"})["status"] == "cached"
+    assert restarted.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert host.search_calls == []
+    preview = restarted._state["entries"]["2"]["preview"]
+    assert preview["search_source"] == "候选扫描"
+    assert preview["search_age_seconds"] == 90 * 24 * 3600
+    assert preview["matched"][0]["episodes"] == [1, 3]
+    assert preview["matched"][0]["id"] == choice.split(":", 1)[1]
+    assert preview["search_keyword_changed"] is True
+    assert preview["matched"][0]["download_path"].endswith("电视剧/国产剧")
+
+
+def test_reloaded_persistent_cache_rechecks_current_rules(plugin_host):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    plugin.stop_service()
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    host.search_calls.clear()
+    assert restarted.preview_candidate(choice, '{"include":"OTHER_TEAM"}')[0]
+    preview = restarted._state["entries"]["2"]["preview"]
+    assert preview["search_cached"] and preview["matched_count"] == 0 and preview["rejected_count"] == 1
+    assert host.search_calls == []
+
+
+def test_empty_and_single_site_caches_restore_without_becoming_all_site_cache(plugin_host):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    plugin._forget_search_cache(lambda _key: True)
+    plugin._remember_search(host.subscriptions[2], [], [5], "规则预览搜索", "空搜索")
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    host.search_calls.clear()
+    config = {"operation": "preview", "candidate": choice}
+    assert restarted.preview_search_status(config)["status"] == "cached_empty"
+    assert restarted.preview_search_status({**config, "rule_mode": "all_sites"})["status"] == "cache_miss"
+    assert restarted.preview_candidate(choice)[0]
+    assert host.search_calls == []
+    assert restarted._state["entries"]["2"]["preview"]["search_result_count"] == 0
+
+
+@pytest.mark.parametrize("damage", ["invalid_json", "unsupported_schema", "bad_context", "deep_json"])
+def test_corrupt_persistent_cache_is_removed_and_does_not_look_like_successful_empty_search(plugin_host, damage):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    file = next(plugin.get_data_path().joinpath("search-cache").glob("*.json"))
+    data = json.loads(file.read_text())
+    if damage == "unsupported_schema":
+        data["schema"] = 999
+    elif damage == "bad_context":
+        data["contexts"] = [{}]
+    file.write_text("broken" if damage == "invalid_json" else
+                    "[" * 2000 + "0" + "]" * 2000 if damage == "deep_json" else json.dumps(data))
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert not file.exists()
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
+    assert restarted.preview_search_status(config)["status"] == "cache_miss"
+    host.search_calls.clear()
+    assert restarted.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert len(host.search_calls) == 2
+
+
+def test_approval_and_disabling_remove_persistent_cache_and_reload_cannot_restore_it(plugin_host):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0]
+    assert plugin.confirm_candidate(choice)[0]
+    folder = plugin.get_data_path() / "search-cache"
+    assert list(folder.glob("*.json")) == []
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert restarted._preview_search_cache == {}
+    restarted._remember_search(host.subscriptions[2], [chosen], [], "回刷预览", "回刷时间")
+    assert list(folder.glob("*.json"))
+    restarted.init_plugin({"enabled": False})
+    assert not list(folder.glob("*.json"))
+
+
+def test_deleted_or_changed_subscription_cache_is_removed_from_disk_at_scan_or_startup(plugin_host):
+    host = plugin_host
+    plugin, _choice, chosen = _prepare_directory_confirmation(host)
+    folder = plugin.get_data_path() / "search-cache"
+    del host.subscriptions[2]
+    plugin.refresh_candidates()
+    assert list(folder.glob("*.json")) == []
+    plugin._remember_search(host.subscriptions[1], [chosen], [], "旧身份搜索", "旧时间")
+    host.subscriptions[1].media_id = "changed"
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert restarted._preview_search_cache == {} and list(folder.glob("*.json")) == []
+
+
+def test_cache_entry_and_disk_byte_limits_remove_oldest_results_from_memory_and_disk(plugin_host):
+    import os
+    host = plugin_host
+    plugin, _choice, chosen = _prepare_directory_confirmation(host)
+    store = plugin._disk_search_cache()
+    store.max_entries = 2
+    for number in (3, 4, 5):
+        host.subscriptions[number] = _subscribe(number)
+        plugin._remember_search(host.subscriptions[number], [chosen], [], "搜索", "时间")
+    expected = {host.module._identity(host.subscriptions[number]) for number in (4, 5)}
+    assert {key[0] for key in plugin._preview_search_cache} == expected
+    assert len(list(store.path.glob("*.json"))) == 2
+    store.max_entries = 64
+    store.max_bytes = sum(file.stat().st_size for file in store.path.glob("*.json")) + 100
+    # 宿主时钟回调后，较早文件可能仍带未来的 mtime；当前新搜索必须保留。
+    for rank, key in enumerate(sorted(plugin._preview_search_cache,
+                                     key=lambda item: plugin._preview_search_cache[item]["at"])):
+        stamp = host.module.time.time() + 86400 + rank
+        os.utime(store.path / store.filename(key), (stamp, stamp))
+    host.subscriptions[6] = _subscribe(6)
+    plugin._remember_search(host.subscriptions[6], [chosen], [], "搜索", "时间")
+    assert len(plugin._preview_search_cache) == 2
+    assert sum(file.stat().st_size for file in store.path.glob("*.json")) <= store.max_bytes
+    assert {key[0] for key in plugin._preview_search_cache} == {
+        host.module._identity(host.subscriptions[number]) for number in (5, 6)
+    }
+
+
+def test_failed_manual_refresh_does_not_restore_old_covering_cache_after_restart(plugin_host, monkeypatch):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("search failed")
+
+    monkeypatch.setattr(plugin, "_search_unfiltered", fail)
+    assert plugin.preview_candidate(choice, refresh_search=True)[0] is False
+    assert plugin._preview_search_cache == {}
+    assert list(plugin.get_data_path().joinpath("search-cache").glob("*.json")) == []
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert restarted.preview_search_status({"operation": "preview", "candidate": choice})["status"] == "cache_miss"
+
+
+def test_disk_write_failure_keeps_new_memory_result_without_restoring_old_disk_result(plugin_host, monkeypatch):
+    host = plugin_host
+    plugin, _choice, _chosen = _prepare_directory_confirmation(host)
+    cache_module = sys.modules[host.module.SearchCacheStore.__module__]
+
+    def fail(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cache_module.os, "replace", fail)
+    newest = _context("Newest S01E01 TEAM")
+    plugin._remember_search(host.subscriptions[2], [newest], [], "新搜索", "新时间")
+    assert next(iter(plugin._preview_search_cache.values()))["contexts"] == [newest]
+    assert list(plugin.get_data_path().joinpath("search-cache").iterdir()) == []
