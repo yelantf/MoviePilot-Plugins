@@ -22,9 +22,9 @@
     </p>
     <v-alert v-if="preview.search_diagnostics?.site_failures?.length" type="warning"
       variant="tonal" density="compact" class="mb-3">
-      该次搜索有失败或暂停的站点，结果可能不完整。插件在冷却期间跳过这些站点的请求。
+      该次搜索有等待、失败或暂停的站点，结果可能不完整。过长等待或冷却中的站点会暂缓请求。
       <div v-for="site in preview.search_diagnostics.site_failures" :key="site.site_id">
-        {{ site.site_name }}：{{ site.reason }}；{{ preview.search_cached ? '当时暂停至' : '暂停至' }} {{ localTime(site.until) }}。
+        {{ site.site_name }}：{{ site.reason }}；{{ preview.search_cached ? '当时最早可重试' : '最早可重试' }} {{ localTime(site.until) }}。
       </div>
     </v-alert>
     <v-alert v-else-if="preview.search_cached && preview.search_result_count === 0" type="warning"
@@ -62,6 +62,10 @@
           {{ round.kind === 'target_season' ? '带季搜索' : round.kind === 'original_search' ? '原订阅搜索' : '合集补搜' }}：{{ round.keyword }} ·
           媒体匹配 {{ round.identified_count }} 条，目标季保留 {{ round.result_count }} 条 · {{ seconds(round.seconds) }} 秒
           <span v-if="round.site_keywords?.length"> · 实际关键词：{{ round.site_keywords.join('、') }}</span>
+          <span v-if="round.budget_shared"> · 请求共用系统站点间隔</span>
+          <span v-for="wait in round.site_waits || []" :key="wait.site_id">
+            · {{ wait.site_name || `站点 ${wait.site_id}` }} 等待 {{ seconds(wait.seconds) }} 秒
+          </span>
         </li>
       </ul>
     </details>

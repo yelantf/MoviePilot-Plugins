@@ -82,6 +82,112 @@ function previewSnapshot(draft) {
 }
 
 describe('custom configuration actions', () => {
+  it('scans an empty managed show, shows progress, and refreshes its versions', async () => {
+    const initial = snapshot({ managed: '已纳入管理 1 条剧集订阅', historical: [] })
+    initial.conf[0].content.push({ component: 'VSelect', props: { model: 'scan_subscription', items: [
+      { title: '#3 新剧集', value: '3' },
+    ] } })
+    const fresh = structuredClone(initial)
+    fresh.conf[0].content.push(
+      { component: 'VSelect', props: { model: 'candidate_subscription', items: [{ title: '#3 新剧集', value: '3' }] } },
+      { component: 'VSelect', props: { model: 'candidate', items: [
+        { title: '新扫描的版本', value: '3:a', subscription_id: '3', rules: { sites: [5] } },
+      ] } },
+    )
+    let resolveScan
+    let reads = 0
+    const api = {
+      get: vi.fn().mockImplementation(async () => ++reads === 1 ? initial : fresh),
+      post: vi.fn().mockImplementation((_url, submitted) => {
+        fresh.model._last_confirmation = { request_id: submitted.operation_request_id, success: true }
+        return new Promise(resolve => { resolveScan = resolve })
+      }),
+    }
+    const wrapper = mount(Config, { props: { api }, global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    const button = wrapper.findAll('button').find(item => item.text() === '扫描所选剧集')
+    expect(button.element.disabled).toBe(true)
+    await wrapper.find('select[aria-label="选择已纳入的待确认剧集"]').setValue('3')
+    await button.trigger('click')
+    expect(wrapper.text()).toContain('已触发所选剧集扫描')
+    expect(button.element.disabled).toBe(true)
+    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'scan', scan_subscription: '3', candidate: '' })
+    resolveScan({ success: true, message: '扫描完成，本轮发现候选 1 条' })
+    await flushPromises()
+    expect(wrapper.text()).toContain('扫描完成，本轮发现候选 1 条')
+    expect(wrapper.text()).not.toContain('已触发所选剧集扫描')
+    expect(wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').text()).toContain('新扫描的版本')
+    expect(button.element.disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('keeps another show and its unsaved rule selections after a manual scan', async () => {
+    const initial = candidateSnapshot()
+    initial.conf[0].content.push({ component: 'VSelect', props: { model: 'scan_subscription', items: [
+      { title: '#3 新剧集', value: '3' },
+    ] } })
+    const fresh = structuredClone(initial)
+    fresh.model.rule_json = ''
+    fresh.model.candidate = ''
+    fresh.model.candidate_subscription = ''
+    let reads = 0
+    const api = {
+      get: vi.fn().mockImplementation(async () => ++reads === 1 ? initial : fresh),
+      post: vi.fn().mockImplementation(async (_url, submitted) => {
+        fresh.model._last_confirmation = { request_id: submitted.operation_request_id, success: true }
+        return { success: true, message: '扫描完成' }
+      }),
+    }
+    const wrapper = mount(Config, { props: { api }, global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    const draft = '{"include":"MY.*TEAM","sites":[5]}'
+    await setRuleDraft(wrapper, draft)
+    await wrapper.find('select[aria-label="选择已纳入的待确认剧集"]').setValue('3')
+    await wrapper.findAll('button').find(item => item.text() === '扫描所选剧集').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe('2:a')
+    expect(wrapper.findComponent(RuleEditor).props('modelValue')).toBe(draft)
+    expect(wrapper.text()).toContain('扫描完成')
+    wrapper.unmount()
+  })
+
+  it('shows a manual scan failure and releases its busy state for retry', async () => {
+    const data = snapshot({ managed: '已纳入管理 1 条剧集订阅', historical: [] })
+    data.model.scan_subscription = '3'
+    data.conf[0].content.push({ component: 'VSelect', props: { model: 'scan_subscription', items: [
+      { title: '#3 新剧集', value: '3' },
+    ] } })
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(async (_url, submitted) => {
+        data.model._last_confirmation = { request_id: submitted.operation_request_id, success: false }
+        return { success: false, message: '已有候选扫描正在进行，请稍后重试' }
+      }),
+    }
+    const wrapper = mount(Config, { props: { api }, global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    const button = wrapper.findAll('button').find(item => item.text() === '扫描所选剧集')
+    await button.trigger('click')
+    await flushPromises()
+    expect(wrapper.text()).toContain('已有候选扫描正在进行，请稍后重试')
+    expect(button.element.disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('shows shared budget waiting separately from a failed site', () => {
+    const preview = { ...previewSnapshot(''), search_diagnostics: {
+      rounds: [{ keyword: 'Show S07', kind: 'target_season', identified_count: 1, result_count: 1,
+        seconds: 17, budget_shared: true, site_waits: [{ site_id: 5, site_name: '天空', seconds: 15 }] }],
+      site_failures: [{ site_id: 7, site_name: '另一站', reason: '站点搜索间隔尚未结束，本轮暂缓', until: 1800000000 }],
+    } }
+    const wrapper = mount(PreviewResults, { props: { preview }, global: { components } })
+    expect(wrapper.text()).toContain('请求共用系统站点间隔')
+    expect(wrapper.text()).toContain('天空 等待 15.00 秒')
+    expect(wrapper.text()).toContain('最早可重试')
+    expect(wrapper.text()).toContain('另一站：站点搜索间隔尚未结束，本轮暂缓')
+    wrapper.unmount()
+  })
+
   it.each([
     [false, null, '保持原设置', '原订阅搜索已召回所选版本'],
     [true, 'Show S07', '调整', '原订阅搜索未召回，带季查询已召回'],

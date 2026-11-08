@@ -1,13 +1,81 @@
 """目标季搜索词及站点失败后的请求抑制，网络和媒体匹配仍交给宿主。"""
 
+import random
 import re
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from inspect import signature
 from typing import Any, Callable
+from uuid import uuid4
 
 from app.chain.search import SearchChain
+from app.sdk.logging import logger
+
+
+def configure_candidate_budget(chain: Any, cancelled: Callable[[], bool]) -> bool:
+    """复用宿主的站点租约；真实请求计入同一记录，不创建下载或订阅搜索任务。"""
+    try:
+        from app.application.subscription.sitebudget import SubscriptionSiteBudget, SubscriptionSiteBudgetUnavailable
+        from app.runtime.stop import runtime_stop_state
+    except ImportError:
+        return False
+    repository = getattr(chain, "subscription_search_repository", None)
+    configure = getattr(chain, "configure_subscription_site_budget", None)
+    if repository is None or not callable(configure):
+        return False
+    if "minimum_interval" not in signature(SubscriptionSiteBudget.acquire).parameters:
+        return False
+    try:
+        from app.chain.search.scan import AUTOMATIC_REQUEST_INTERVAL
+    except ImportError:
+        AUTOMATIC_REQUEST_INTERVAL = 10
+
+    class CandidateBudget(SubscriptionSiteBudget):
+        """短间隔等待不算错误；过长等待保留诊断，由用户或下一轮扫描重试。"""
+
+        def acquire(self, site_id: int, *, minimum_interval: float = 0):
+            site = chain._budget_sites.get(site_id) or {}
+            try:
+                site_interval = max(0, float(site.get("limit_seconds") or 0))
+            except (TypeError, ValueError, OverflowError):
+                site_interval = 0
+            interval = max(minimum_interval, site_interval,
+                           random.uniform(AUTOMATIC_REQUEST_INTERVAL, AUTOMATIC_REQUEST_INTERVAL * 2))
+            started = time.monotonic()
+            notified = False
+            try:
+                while True:
+                    try:
+                        return super().acquire(site_id, minimum_interval=interval)
+                    except SubscriptionSiteBudgetUnavailable as error:
+                        retry = datetime.fromisoformat(error.retry_at)
+                        if retry.tzinfo is None:
+                            retry = retry.astimezone()
+                        seconds = max(0.05, retry.timestamp() - time.time())
+                        remaining = 60 - (time.monotonic() - started)
+                        if error.wait_reason == "failing" or remaining <= 0 \
+                                or (error.wait_reason != "busy" and seconds > remaining):
+                            reason = {
+                                "busy": "站点正在被系统或其他搜索占用，本轮暂缓",
+                                "cooldown": "站点搜索间隔尚未结束，本轮暂缓",
+                                "rate_limit": "站点访问额度尚未恢复，本轮暂缓",
+                                "failing": "宿主报告该站点处于失败冷却，本轮暂缓",
+                            }.get(error.wait_reason, "站点暂不可用，本轮暂缓")
+                            chain._budget_deferred(site_id, reason, retry.timestamp())
+                            raise
+                        if not notified:
+                            logger.info(f"插件搜索等待站点 {site_id} 的共享访问间隔或在途请求，约 {seconds:.1f} 秒后重试")
+                            notified = True
+                        time.sleep(min(1.0, seconds, remaining))
+            finally:
+                if notified:
+                    chain._record_site_wait(site_id, time.monotonic() - started)
+
+    configure(CandidateBudget(repository=repository, owner=f"SubscribeOverwatcher:{uuid4().hex}",
+                              cancelled=cancelled, stop_state=runtime_stop_state))
+    return True
 
 
 @contextmanager
@@ -81,13 +149,17 @@ def failure_hold(outcome: str, detail: str, now: float) -> tuple[float, str]:
 class CandidateSearchChain(SearchChain):
     """在宿主站点请求边界记录失败；后续搜索词和其他订阅遵守同一冷却。"""
 
-    def __init__(self, held: Callable, hold: Callable, *, focused_season: int | None = None) -> None:
+    def __init__(self, held: Callable, hold: Callable, *, focused_season: int | None = None,
+                 budget_deferrals: dict | None = None) -> None:
         super().__init__()
         self._held = held
         self._hold = hold
         self._focused_season = focused_season
         self._reports_lock = threading.Lock()
         self.site_reports: list[dict[str, Any]] = []
+        self.site_waits: dict[int, float] = {}
+        self._budget_sites: dict[int, dict[str, Any]] = {}
+        self._budget_deferrals = budget_deferrals if budget_deferrals is not None else {}
 
     def _site_keyword(self, keyword: str) -> str:
         # 宿主可能把“中文剧名 S07”替换为纯英文名；在请求边界补回本轮目标季。
@@ -104,6 +176,12 @@ class CandidateSearchChain(SearchChain):
         if pause:
             self._report(site, "paused", 0, pause)
             return []
+        deferred = self._budget_deferrals.get(site.get("id"))
+        if deferred and deferred["until"] > time.time():
+            self._report(site, "deferred", 0, deferred)
+            return []
+        with self._reports_lock:
+            self._budget_sites[site.get("id")] = site
         with _observation() as observation:
             result = super()._search_site_torrents_with_budget(
                 site=site, keyword=self._site_keyword(keyword), mtype=mtype, page=page,
@@ -114,6 +192,17 @@ class CandidateSearchChain(SearchChain):
                 pause = self._hold(site, outcome, getattr(observation, "error", None) or "")
                 self._report(site, outcome, len(result or []), pause)
             return result
+
+    def _budget_deferred(self, site_id: int, reason: str, until: float) -> None:
+        site = self._budget_sites.get(site_id) or {"id": site_id}
+        pause = {"reason": reason, "until": until}
+        with self._reports_lock:
+            self._budget_deferrals[site_id] = pause
+        self._report(site, "deferred", 0, pause)
+
+    def _record_site_wait(self, site_id: int, seconds: float) -> None:
+        with self._reports_lock:
+            self.site_waits[site_id] = self.site_waits.get(site_id, 0) + seconds
 
     def search_site_torrents(self, *, site: dict[str, Any], keyword: str, mtype: Any = None,
                             page: int = 0) -> list[Any]:

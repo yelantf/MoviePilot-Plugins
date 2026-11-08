@@ -3001,13 +3001,15 @@ def test_confirmation_keeps_original_search_unless_only_season_search_recalls_se
     assert submitted_search == [("Show S01" if change_keyword else "Custom Original Search", not change_keyword)]
 
 
-@pytest.mark.parametrize("reason", ["timeout", "missing_observation", "changed_original_keyword"])
+@pytest.mark.parametrize("reason", ["timeout", "budget_wait", "missing_observation", "changed_original_keyword"])
 def test_failed_or_unverified_original_search_does_not_replace_subscription_keyword(plugin_host, reason):
     host = plugin_host
     plugin, choice, _chosen = _prepare_directory_confirmation(host)
     diagnostics = next(iter(plugin._preview_search_cache.values()))["diagnostics"]
-    if reason == "timeout":
-        diagnostics["original_search"].update(resource_ids=[], site_failures=[{"site_id": 5, "reason": "站点请求超时"}])
+    if reason in {"timeout", "budget_wait"}:
+        diagnostics["original_search"].update(resource_ids=[], site_failures=[{
+            "site_id": 5, "reason": "站点请求超时" if reason == "timeout" else "站点搜索间隔尚未结束，本轮暂缓",
+        }])
     elif reason == "missing_observation":
         diagnostics.pop("original_search")
     else:
@@ -3170,3 +3172,268 @@ def test_candidate_observation_preserves_host_failure_and_pagination_facts(plugi
     assert outer.attempted is True
     assert outer.outcome == "timeout" and outer.error == "请求超时"
     assert outer.raw_count == 7 and outer.has_more is False
+
+
+def test_manual_scan_selects_empty_pending_show_and_only_refreshes_that_show(plugin_host):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0]
+    previous = copy.deepcopy(plugin._state["entries"]["2"])
+    host.subscriptions[3] = _subscribe(3)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 3}))
+    assert plugin._state["entries"]["3"].get("candidates") == []
+    form, _model = plugin.get_form()
+    choices = []
+
+    def collect(nodes):
+        for node in nodes:
+            if node.get("props", {}).get("model") == "scan_subscription":
+                choices.extend(node["props"]["items"])
+            collect(node.get("content") or [])
+
+    collect(form)
+    assert "3" in {item["value"] for item in choices}
+    host.search_calls.clear()
+    success, message = plugin.scan_subscription("3")
+    assert success and "本轮发现候选" in message
+    assert plugin._state["entries"]["3"]["candidates"]
+    assert plugin._state["entries"]["2"] == previous
+    assert plugin._queued_scan_ids == set()
+    assert host.search_calls and all("mediainfo" in call for call in host.search_calls)
+    assert host.downloads == []
+    search_count = len(host.search_calls)
+    plugin._run_scheduled_scan()
+    assert plugin._state["entries"]["2"] == previous
+    assert len(host.search_calls) == search_count
+
+
+def test_manual_scan_refreshes_cache_and_invalidates_old_preview_without_downloading(plugin_host):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0]
+    host.search_results[:] = [_context("New TEAM S01E01")]
+    plugin._schedule_scan([2])
+    plugin.init_plugin({"enabled": True, "operation": "scan", "scan_subscription": "2",
+                        "operation_request_id": "manual-scan"})
+    result = plugin._state["last_confirmation"]
+    assert result["success"] and result["request_id"] == "manual-scan"
+    assert "preview" not in plugin._state["entries"]["2"]
+    assert plugin._queued_scan_ids == set()
+    assert host.downloads == []
+    assert len(plugin._state["entries"]["2"]["candidates"]) == 2
+    cached = next(iter(plugin._preview_search_cache.values()))
+    assert cached["contexts"] == host.search_results and chosen not in cached["contexts"]
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice)[0]
+    assert host.search_calls == []
+
+
+def test_manual_scan_busy_failure_and_invalid_identity_do_not_report_success(plugin_host, monkeypatch):
+    host = plugin_host
+    plugin, _choice, _chosen = _prepare_directory_confirmation(host)
+    plugin._scan_lock.acquire()
+    try:
+        assert plugin.scan_subscription("2") == (False, "已有候选扫描正在进行，请稍后重试")
+    finally:
+        plugin._scan_lock.release()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("network unavailable")
+
+    monkeypatch.setattr(plugin, "_search_unfiltered", fail)
+    assert plugin.scan_subscription("2")[0] is False
+    assert not plugin._scan_lock.locked()
+    assert "搜索失败" in plugin._state["entries"]["2"]["last_error"]
+    host.subscriptions[2].activity_key = "reused-id"
+    assert plugin.scan_subscription("2")[0] is False
+    assert plugin.scan_subscription(True)[0] is False
+    assert plugin.scan_subscription("not-an-id")[0] is False
+    assert host.downloads == []
+
+
+def test_manual_empty_scan_suggests_native_search_and_prunes_old_confirmed_records(plugin_host):
+    host = plugin_host
+    plugin, _choice, _chosen = _prepare_directory_confirmation(host)
+    host.search_results.clear()
+    plugin._state["entries"]["old"] = {
+        "status": "approved", "approved_at": "2020-01-01T00:00:00+00:00",
+        "candidates": ["old candidate"], "preview": {"old": True},
+    }
+    success, message = plugin.scan_subscription("2")
+    assert success and "本轮发现候选 0 条" in message and "手动搜索" in message
+    assert "candidates" not in plugin._state["entries"]["old"]
+    assert "preview" not in plugin._state["entries"]["old"]
+    assert plugin._state["entries"]["old"]["status"] == "approved"
+    assert next(iter(plugin._preview_search_cache.values()))["contexts"] == []
+
+
+def test_cancelled_scan_does_not_search_more_keywords_or_replace_cache(plugin_host, monkeypatch):
+    host = plugin_host
+    plugin, _choice, chosen = _prepare_directory_confirmation(host)
+    previous_cache = plugin._preview_search_cache.copy()
+    calls = []
+
+    def process(_chain, **kwargs):
+        calls.append(kwargs)
+        plugin._search_stop.set()
+        return [chosen]
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    assert plugin.scan_subscription("2")[0] is False
+    assert len(calls) == 1
+    assert plugin._preview_search_cache == previous_cache
+    assert not plugin._scan_lock.locked()
+
+
+def _install_budget_contract(host, monkeypatch):
+    """装配预算接口替身；用虚拟时钟验证适配器，不访问数据库和网络。"""
+    from datetime import datetime, timezone
+    now = [1000.0]
+    calls = []
+    sleeps = []
+
+    class Unavailable(RuntimeError):
+        def __init__(self, seconds, reason="cooldown"):
+            self.retry_at = datetime.fromtimestamp(now[0] + seconds, timezone.utc).isoformat()
+            self.wait_reason = reason
+
+    class Cancelled(RuntimeError):
+        pass
+
+    stop = SimpleNamespace(is_system_stopped=False)
+    repository = SimpleNamespace(claim=lambda _site, _interval: SimpleNamespace(acquired=True))
+
+    class Budget:
+        def __init__(self, *, repository, owner, cancelled, stop_state):
+            self.repository, self.owner = repository, owner
+            self.cancelled, self.stop_state = cancelled, stop_state
+
+        def acquire(self, site_id, *, minimum_interval=0):
+            if self.cancelled() or self.stop_state.is_system_stopped:
+                raise Cancelled()
+            calls.append((site_id, minimum_interval))
+            return self.repository.claim(site_id, minimum_interval)
+
+    module = ModuleType("app.application.subscription.sitebudget")
+    module.SubscriptionSiteBudget = Budget
+    module.SubscriptionSiteBudgetUnavailable = Unavailable
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    runtime = ModuleType("app.runtime.stop")
+    runtime.runtime_stop_state = stop
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    monkeypatch.setattr(host.module.SearchChain, "subscription_search_repository", repository, raising=False)
+    monkeypatch.setattr(host.module.SearchChain, "configure_subscription_site_budget",
+                        lambda chain, budget: setattr(chain, "budget", budget), raising=False)
+    adapter = sys.modules[host.module.CandidateSearchChain.__module__]
+    monkeypatch.setattr(adapter.time, "time", lambda: now[0])
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: now[0])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(adapter.time, "sleep", sleep)
+    monkeypatch.setattr(adapter.random, "uniform", lambda lower, upper: (lower + upper) / 2)
+    return SimpleNamespace(now=now, calls=calls, sleeps=sleeps, repository=repository, adapter=adapter,
+                           Unavailable=Unavailable, Cancelled=Cancelled, stop=stop)
+
+
+@pytest.mark.parametrize("site_interval,expected", [(0, 15), (45, 45)])
+def test_budget_wait_retries_and_respects_random_and_configured_site_intervals(
+    plugin_host, monkeypatch, site_interval, expected,
+):
+    host = plugin_host
+    contract = _install_budget_contract(host, monkeypatch)
+    holds = []
+    chain = host.module.CandidateSearchChain(lambda _site: None, lambda *args: holds.append(args))
+    chain._budget_sites[5] = {"id": 5, "name": "天空", "limit_seconds": site_interval}
+
+    def claim(_site, _interval):
+        if contract.now[0] < 1003:
+            raise contract.Unavailable(1003 - contract.now[0])
+        return "lease"
+
+    contract.repository.claim = claim
+    assert host.module.configure_candidate_budget(chain, lambda: False)
+    assert chain.budget.acquire(5) == "lease"
+    assert contract.calls == [(5, expected)] * 4
+    assert chain.site_waits[5] == 3
+    assert contract.sleeps == [1, 1, 1]
+    assert holds == [] and chain.site_reports == []
+
+
+def test_budget_busy_waits_for_completion_and_cancel_stops_within_one_second(plugin_host, monkeypatch):
+    host = plugin_host
+    contract = _install_budget_contract(host, monkeypatch)
+    chain = host.module.CandidateSearchChain(lambda _site: None, lambda *_args: None)
+
+    def claim(_site, _interval):
+        if contract.now[0] < 1002:
+            raise contract.Unavailable(900, "busy")
+        return "lease"
+
+    contract.repository.claim = claim
+    assert host.module.configure_candidate_budget(chain, lambda: contract.now[0] >= 1003)
+    assert chain.budget.acquire(5) == "lease"
+    contract.repository.claim = lambda *_args: (_ for _ in ()).throw(contract.Unavailable(10))
+    with pytest.raises(contract.Cancelled):
+        chain.budget.acquire(5)
+    assert contract.now[0] == 1003 and chain.site_waits[5] == 3
+
+
+@pytest.mark.parametrize("reason,seconds", [("cooldown", 120), ("failing", 10), ("busy", 900)])
+def test_long_budget_wait_defers_same_site_for_remaining_queries_without_error_hold(
+    plugin_host, monkeypatch, reason, seconds,
+):
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    contract = _install_budget_contract(host, monkeypatch)
+    shared_deferrals = {}
+    calls = []
+
+    def budget_search(chain, **kwargs):
+        calls.append(kwargs["site"]["id"])
+        try:
+            chain.budget.acquire(kwargs["site"]["id"])
+        except contract.Unavailable:
+            return []
+        return ["resource"]
+
+    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget", budget_search, raising=False)
+    contract.repository.claim = lambda site, _interval: (_ for _ in ()).throw(
+        contract.Unavailable(seconds, reason)) if site == 5 else "lease"
+    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site,
+                                           budget_deferrals=shared_deferrals)
+    assert host.module.configure_candidate_budget(chain, lambda: False)
+    site = {"id": 5, "name": "天空"}
+    assert chain._search_site_torrents_with_budget(site=site, keyword="Show S01") == []
+    assert sum(contract.sleeps) == (60 if reason == "busy" else 0)
+    another = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site,
+                                             budget_deferrals=shared_deferrals)
+    assert host.module.configure_candidate_budget(another, lambda: False)
+    assert another._search_site_torrents_with_budget(site=site, keyword="Show") == []
+    assert another._search_site_torrents_with_budget(site={"id": 7}, keyword="Show") == ["resource"]
+    assert calls == [5, 7]
+    assert plugin._site_hold(site) is None
+    assert another.site_reports[-1]["status"] == "deferred"
+
+
+def test_budget_missing_interface_safely_keeps_legacy_search(plugin_host, monkeypatch):
+    host = plugin_host
+    chain = host.module.CandidateSearchChain(lambda _site: None, lambda *_args: None)
+    assert host.module.configure_candidate_budget(chain, lambda: False) is False
+    contract = _install_budget_contract(host, monkeypatch)
+    monkeypatch.setattr(sys.modules["app.application.subscription.sitebudget"].SubscriptionSiteBudget,
+                        "acquire", lambda self, site_id: "legacy")
+    assert host.module.configure_candidate_budget(chain, lambda: False) is False
+
+
+def test_stop_event_stays_cancelled_after_plugin_is_enabled_again(plugin_host):
+    plugin = plugin_host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    previous = plugin._search_stop
+    plugin.stop_service()
+    plugin.init_plugin({"enabled": True})
+    assert previous.is_set() and not plugin._search_stop.is_set()
+    assert plugin._search_stop is not previous

@@ -44,6 +44,28 @@
         <v-alert type="info" variant="tonal" density="compact" class="mb-4">{{ managedSummary }}</v-alert>
 
         <v-card variant="outlined" class="mb-4">
+          <v-card-title class="text-subtitle-1">手动扫描已纳入剧集</v-card-title>
+          <v-card-text>
+            <v-select v-model="form.scan_subscription" label="选择已纳入的待确认剧集"
+              :items="options.scan_subscription" :disabled="!!busy" clearable density="comfortable"
+              hide-details no-data-text="暂无已纳入管理的待确认剧集" />
+            <p class="text-caption text-medium-emphasis mt-3 mb-0">
+              没有候选的剧集也可选择。只重新搜索这一条剧集并更新版本列表，预览可复用扫描结果。
+              请求仍遵守系统共享的站点占用、访问间隔及冷却；已批准剧集可使用回刷资源预览。
+            </p>
+            <v-alert v-if="busy === 'scan'" type="info" variant="tonal" density="compact" class="mt-3"
+              role="status" aria-live="polite">已触发所选剧集扫描；正在等待站点间隔、响应和资源解析，可能需要较长时间。</v-alert>
+            <v-alert v-if="feedback.section === 'scan'" :type="feedback.type" variant="tonal"
+              density="compact" class="mt-3">{{ feedback.text }}</v-alert>
+          </v-card-text>
+          <v-card-actions class="px-4 pb-4">
+            <v-spacer />
+            <v-btn color="info" variant="tonal" :loading="busy === 'scan'"
+              :disabled="!!busy || !form.scan_subscription" @click="submit('scan')">扫描所选剧集</v-btn>
+          </v-card-actions>
+        </v-card>
+
+        <v-card variant="outlined" class="mb-4">
           <v-card-title class="text-subtitle-1">纳入历史剧集</v-card-title>
           <v-card-text>
             <v-autocomplete v-model="form.historical_subscription" label="选择历史剧集（可多选，按进度排序）"
@@ -227,12 +249,12 @@ import DataPage from './Page.vue'
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
   'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
-  'historical_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json', 'download_directory',
+  'historical_subscription', 'scan_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json', 'download_directory',
   'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
 ]
 const sections = {
-  adopt: 'history', preview: 'candidate', confirm: 'candidate',
+  adopt: 'history', scan: 'scan', preview: 'candidate', confirm: 'candidate',
   direct_approve: 'approve', revoke: 'revoke',
   preview_replace: 'replace', submit_replace: 'replace',
 }
@@ -250,6 +272,7 @@ const emit = defineEmits(['switch'])
 const form = reactive({
   enabled: false, confirm_full_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
+  scan_subscription: '',
   candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_json: '',
   download_directory: '',
   direct_subscription: '', revoke_subscription: '',
@@ -257,6 +280,7 @@ const form = reactive({
 })
 const options = reactive({
   notice_hour: [], notice_minute: [], historical_subscription: [],
+  scan_subscription: [],
   candidate_subscription: [], candidate: [],
   download_directory: [],
   direct_subscription: [], revoke_subscription: [], replace_subscription: [], replace_resource: [],
@@ -489,7 +513,7 @@ async function submit(action, refreshSearch = false) {
     const response = responseBody(await props.api.post(`plugin/${PLUGIN_ID}/apply`, submitted))
     let result
     let refreshFailed = false
-    try { result = await refreshForm() } catch { refreshFailed = true }
+    try { result = await refreshForm({ preserveForm: action === 'scan' }) } catch { refreshFailed = true }
     if (response?.preview) {
       if (action === 'preview') {
         candidatePreview.value = response.preview
@@ -499,6 +523,10 @@ async function submit(action, refreshSearch = false) {
       response.preview.request_seconds = (performance.now() - started) / 1000
     }
     if (!selectedCandidate.value) handoffNotice.value = ''
+    if (action === 'scan' && response?.success && !form.candidate_subscription
+      && options.candidate_subscription.some(item => String(item.value) === String(submitted.scan_subscription))) {
+      form.candidate_subscription = String(submitted.scan_subscription)
+    }
     feedback.section = sections[action] || 'settings'
     if (action !== 'save' && !response?.preview && !refreshFailed && result?.request_id !== requestId) {
       feedback.type = 'error'
