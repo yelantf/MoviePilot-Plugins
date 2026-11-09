@@ -15,6 +15,17 @@ _PAGE_ID_KEYS = {"id", "tid", "torrentid", "torrent_id"}
 _SECRET_PATH_SEGMENT = re.compile(
     r"^(?:(?=[0-9]*[A-Fa-f])[0-9A-Fa-f]{16,}|(?=.*[0-9])(?=.*[A-Za-z])[A-Za-z0-9]{24,})$"
 )
+_SEASON_PACK_HINT = re.compile(
+    r"全集|全季|完结|\bCOMPLETE\b|\bSEASON[ ._-]?PACK\b|\bS\d{1,2}[ ._-]?(?:PACK|COMPLETE)\b"
+    r"|全\s*[0-9０-９零〇一二两三四五六七八九十百]+\s*集"
+    r"|(?<![0-9０-９])[0-9０-９零〇一二两三四五六七八九十百]+\s*集\s*全",
+    re.I,
+)
+_NEGATED_PACK_HINT = re.compile(
+    r"(?:尚未|未|不|非|没有)\s*(?:完结|全集|全季)"
+    r"|\b(?:INCOMPLETE|NOT[ ._-]+COMPLETE|ONGOING)\b",
+    re.I,
+)
 
 _PATTERN_NAMES = {
     "quality": {
@@ -222,7 +233,22 @@ def _title_starts_after_first_episode(title: str) -> bool:
     return bool(numbers) and 1 not in numbers and all(number > 1 for number in numbers)
 
 
-def _candidate_kind(meta: Any, title: str, season: int, total_episode: Optional[int]) -> Optional[str]:
+def _has_season_pack_hint(title: str, description: Any, labels: Any) -> bool:
+    """主标题、副标题和站点标签仅提供合集线索，不推断具体集号。"""
+    texts = [title]
+    if isinstance(description, str):
+        texts.append(description[:4096])
+    if isinstance(labels, str):
+        texts.append(labels[:240])
+    elif isinstance(labels, (list, tuple, set)):
+        texts.extend(label[:240] for label in list(labels)[:64] if isinstance(label, str))
+    return any(_SEASON_PACK_HINT.search(text) and not _NEGATED_PACK_HINT.search(text) for text in texts)
+
+
+def _candidate_kind(
+    meta: Any, title: str, season: int, total_episode: Optional[int],
+    *, description: Any = None, labels: Any = None,
+) -> Optional[str]:
     """
     区分跨季资源、识别集数覆盖全集、疑似全集和单集 E01。
     """
@@ -240,7 +266,7 @@ def _candidate_kind(meta: Any, title: str, season: int, total_episode: Optional[
             return "full_season"
     if _is_single_first_episode(meta, season):
         return "first_episode"
-    if re.search(r"全集|全季|完结|\bCOMPLETE\b|\bSEASON[ ._-]?PACK\b|\bS\d{1,2}[ ._-]?(?:PACK|COMPLETE)\b", title, re.I):
+    if _has_season_pack_hint(title, description, labels):
         # 标题明确标出后续集数时，整季字样不能把单集误判为整季候选。
         begin_episode = getattr(meta, "begin_episode", None)
         if (episodes and 1 not in episodes) or (not episodes and isinstance(begin_episode, int)
@@ -287,7 +313,10 @@ def resource_candidate(
     title = _short(getattr(torrent, "title", None), 240)
     if not title:
         return None
-    kind = _candidate_kind(meta, title, season, total_episode)
+    kind = _candidate_kind(
+        meta, title, season, total_episode,
+        description=getattr(torrent, "description", None), labels=getattr(torrent, "labels", None),
+    )
     if kind is None:
         return None
     site = getattr(torrent, "site", None)

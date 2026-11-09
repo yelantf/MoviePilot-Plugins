@@ -427,6 +427,20 @@ def _context(title, episodes=(1,), enclosure="https://secret.example/torrent", p
     )
 
 
+def _season_only_context(title, season=2, description="", labels=None):
+    """模拟只识别季号、副标题总集数而没有具体集号的合集资源。"""
+    context = _context(title)
+    context.meta_info.begin_season = season
+    context.meta_info.season_list = [season]
+    context.meta_info.episode_list = []
+    context.meta_info.begin_episode = None
+    context.meta_info.end_episode = None
+    context.meta_info.total_episode = 5
+    context.torrent_info.description = description
+    context.torrent_info.labels = labels if labels is not None else []
+    return context
+
+
 def _download_event(sid, context=None, episodes=None):
     """
     建立带宿主订阅来源的下载前事件。
@@ -879,6 +893,139 @@ def test_late_episode_with_pack_word_is_not_a_candidate(plugin_host):
     assert rules.resource_candidate(wrongly_full, 1, "now", total_episode=12) is None
     assert rules.resource_candidate(_context("Show.S01E01.Complete", episodes=(1,)),
                                     1, "now", total_episode=12)["kind"] == "first_episode"
+
+
+@pytest.mark.parametrize("suffix,description,labels,expected_kind", [
+    ("", "幸福伽菜子的快乐杀手生活 第二季 全5集", [], "suspected_full"),
+    ("", "第二季 5集全", [], "suspected_full"),
+    ("", "第二季 全五集", [], "suspected_full"),
+    ("", "第二季 全５集", [], "suspected_full"),
+    ("", "", ["中字", "完结"], "suspected_full"),
+    ("", "", "完结", "suspected_full"),
+    ("", "", ("Complete",), "suspected_full"),
+    (" Complete", "", [], "suspected_full"),
+    ("", "", [], None),
+    ("", "更新至5集", [], None),
+    ("", "未完结", [], None),
+    ("", "非全集", [], None),
+    ("", "", ["尚未完结"], None),
+    (" NOT COMPLETE", "", [], None),
+    ("", "Incomplete", [], None),
+    ("", "", ["ONGOING"], None),
+])
+def test_season_pack_hints_include_subtitle_and_labels_without_inventing_episodes(
+    plugin_host, suffix, description, labels, expected_kind,
+):
+    """合集线索可来自主标题、副标题或标签，缺少集号时始终保留不确定性。"""
+    rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
+    context = _season_only_context(
+        "Happy Kanakos Killer Life 2025 S02 1080p DMM WEB-DL AAC2.0 H.264-DepWeb" + suffix,
+        description=description, labels=labels,
+    )
+    candidate = rules.resource_candidate(context, 2, "now", total_episode=5)
+    if expected_kind is None:
+        assert candidate is None
+    else:
+        assert candidate["kind"] == expected_kind
+        assert candidate["episodes"] == []
+        assert candidate["total_episode"] == 5
+        assert plugin_host.module._candidate_label(candidate) == "疑似整季（集数待核实）"
+        assert rules.resource_candidate(context, 1, "now", total_episode=5) is None
+
+
+@pytest.mark.parametrize("episode_token,episodes,expected_kind", [
+    ("S02E01", (1,), "first_episode"),
+    ("S02", (2,), None),
+    ("S02E02", (1, 2, 3, 4, 5), None),
+    ("S02", (1, 2, 3, 4, 5), "full_season"),
+])
+def test_pack_hints_do_not_override_explicit_episode_evidence(
+    plugin_host, episode_token, episodes, expected_kind,
+):
+    """完结标签不能把 E01 或后续单集改判为整季，明确全集仍按集号判定。"""
+    rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
+    context = _context(f"Show.{episode_token}.1080p.WEB-DL", episodes=episodes)
+    context.meta_info.begin_season = 2
+    context.meta_info.season_list = [2]
+    context.meta_info.begin_episode = min(episodes)
+    context.torrent_info.description = "第二季 全5集"
+    context.torrent_info.labels = ["完结"]
+    candidate = rules.resource_candidate(context, 2, "now", total_episode=5)
+    assert (candidate["kind"] if candidate else None) == expected_kind
+
+
+def test_subtitle_and_label_packs_survive_scan_and_cached_preview_after_reload(plugin_host):
+    """两类漏判合集可扫描选择，重启后复用缓存预览仍不宣称已核实全集。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.season = 2
+    subscribe.total_episode = subscribe.lack_episode = 5
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    labeled = _season_only_context(
+        "Happy Kanakos Killer Life 2025 S02 1080p DMM WEB-DL AAC2.0 H.264-DepWeb",
+        labels=["完结"],
+    )
+    described = _season_only_context(
+        "Happy Kanakos Killer Life S02 2026 1080p DMM WEB-DL AAC2.0 H.264-DepWeb",
+        description="幸福伽菜子的快乐杀手生活 第二季 全5集",
+    )
+    described.torrent_info.site = 7
+    described.torrent_info.site_name = "另一个站"
+    host.search_results.extend([labeled, described])
+
+    assert plugin.scan_subscription("2")[0]
+    entry = host.storage["gate_state"]["entries"]["2"]
+    assert entry["last_scan_count"] == 2
+    assert {item["site_id"] for item in entry["candidates"]} == {5, 7}
+    assert all(item["kind"] == "suspected_full" and item["episodes"] == []
+               for item in entry["candidates"])
+    choices = _form_items(plugin, "candidate")
+    assert len(choices) == 2
+    assert all("疑似整季（集数待核实）" in item["title"] for item in choices)
+    plugin.stop_service()
+    reloaded = host.module.SubscribeOverwatcher()
+    reloaded.init_plugin({"enabled": True})
+    host.search_calls.clear()
+
+    assert reloaded.preview_candidate(choices[0]["value"], rule_mode="all_sites")[0]
+    assert host.search_calls == []
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["search_cached"] is True
+    assert preview["matched_count"] == 2
+    assert all(item["kind"] == "suspected_full" and item["episodes"] == []
+               for item in preview["matched"])
+    assert subscribe.state == "S"
+    assert host.downloads == []
+
+
+@pytest.mark.parametrize("description,labels", [
+    ("", ["完结"]),
+    ("第二季 全5集", []),
+])
+def test_season_pack_hint_does_not_allow_unverified_full_season_download(
+    plugin_host, description, labels,
+):
+    """关闭全集确认也不能只凭副标题或站点标签自动放行合集。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True, "confirm_full_pack": False})
+    subscribe = _subscribe(2)
+    subscribe.season = 2
+    subscribe.total_episode = 5
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    context = _season_only_context("Show.S02.1080p.WEB-DL", description=description, labels=labels)
+    rules = importlib.import_module(f"{host.module.__name__}.rules")
+    assert rules.resource_candidate(context, 2, "now", total_episode=5)["kind"] == "suspected_full"
+    event = _download_event(2, context=context, episodes={1, 2, 3, 4, 5})
+    assert not rules.is_complete_season_download(event.event_data, subscribe)
+    plugin.intercept_download(event)
+    assert event.event_data.cancel is True
 
 
 def test_reload_discards_saved_late_episode_pack_candidate(plugin_host):
@@ -1870,7 +2017,7 @@ def test_candidate_labels_do_not_claim_unrecognized_or_sparse_episodes_are_compl
     """标题整季词和已识别集号分别展示，跳号不能渲染成连续覆盖。"""
     module = plugin_host.module
     candidate = {"kind": "suspected_full", "episodes": [], "total_episode": 8}
-    assert module._candidate_label(candidate) == "标题疑似整季"
+    assert module._candidate_label(candidate) == "疑似整季（集数待核实）"
     assert module._candidate_coverage(candidate) == "未识别具体集号（目标总集数 8）"
     candidate["episodes"] = [1, 3, 4, 8]
     assert module._candidate_coverage(candidate) == "E01, E03–E04, E08/8"

@@ -131,7 +131,7 @@ def _candidate_label(candidate: dict[str, Any]) -> str:
     if kind == "cross_season":
         return "跨季资源（含目标季）"
     if kind == "suspected_full":
-        return "标题疑似整季"
+        return "疑似整季（集数待核实）"
     if kind == "episode":
         return "分集"
     return "单集 E01"
@@ -417,7 +417,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.9"
+    plugin_version = "1.9.10"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
