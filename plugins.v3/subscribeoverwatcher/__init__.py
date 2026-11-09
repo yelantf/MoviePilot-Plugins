@@ -87,15 +87,42 @@ def _resource_key(context: Any) -> tuple[Any, ...]:
     return ("unknown", id(context))
 
 
+def _merge_resource_info(primary: Any, supplemental: Any) -> Any:
+    """同一种子补充副标题与标签，保留主记录的标题和季集解析，不修改搜索原对象。"""
+    torrent = getattr(primary, "torrent_info", None)
+    other = getattr(supplemental, "torrent_info", None)
+    if torrent is None or other is None:
+        return primary
+    descriptions = list(dict.fromkeys(
+        line for value in (getattr(torrent, "description", None), getattr(other, "description", None))
+        if isinstance(value, str) for line in value.splitlines() if line.strip()
+    ))
+    description = "\n".join(descriptions) if descriptions else getattr(torrent, "description", None)
+    labels = []
+    for value in (getattr(torrent, "labels", None), getattr(other, "labels", None)):
+        items = [value] if isinstance(value, str) else value if isinstance(value, (list, tuple, set)) else []
+        labels.extend(label for label in items if isinstance(label, str) and label and label not in labels)
+    if description == getattr(torrent, "description", None) and labels == (getattr(torrent, "labels", None) or []):
+        return primary
+    merged = copy.copy(primary)
+    merged.torrent_info = copy.copy(torrent)
+    merged.torrent_info.description = description
+    merged.torrent_info.labels = labels
+    return merged
+
+
 def _distinct_contexts(contexts: list[Any]) -> list[Any]:
-    """合并不同查询词及同一查询内重复返回的种子，保留首个结果。"""
-    seen = set()
+    """合并重复返回种子的副标题和标签，每个站点资源只保留一条记录。"""
+    positions = {}
     unique = []
     for context in contexts:
         key = _resource_key(context)
-        if key not in seen:
-            seen.add(key)
+        if key not in positions:
+            positions[key] = len(unique)
             unique.append(context)
+        else:
+            position = positions[key]
+            unique[position] = _merge_resource_info(unique[position], context)
     return unique
 
 
@@ -417,7 +444,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.10"
+    plugin_version = "1.9.11"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1388,10 +1415,16 @@ class SubscribeOverwatcher(_PluginBase):
                              if ids_by_context.get(id(context)) == selected_id), None) if selected_id else None
             if selected is not None:
                 selected_key = _resource_key(selected)
-                distinct = [selected if _resource_key(context) == selected_key else context
+                distinct = [_merge_resource_info(selected, context) if _resource_key(context) == selected_key else context
                             for context in distinct]
-            ids_by_key = {_resource_key(context): ids_by_context[id(context)] for context in distinct
-                          if id(context) in ids_by_context}
+            ids_by_key = {}
+            for context in distinct:
+                try:
+                    item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if item:
+                    ids_by_key[_resource_key(context)] = item["id"]
             for context in contexts:
                 resource_id = ids_by_context.get(id(context))
                 canonical_id = ids_by_key.get(_resource_key(context))

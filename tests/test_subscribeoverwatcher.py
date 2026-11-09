@@ -2482,6 +2482,128 @@ def test_manual_scan_then_preview_shows_one_row_per_site_torrent_link(plugin_hos
     assert preview["search_keyword_changed"] is False
 
 
+@pytest.mark.parametrize("description,labels", [
+    ("", ["完结"]),
+    ("第二季 全5集", []),
+    ("第二季 全5集", ["完结", "中字"]),
+])
+def test_scan_merges_pack_evidence_from_duplicate_search_results(plugin_host, monkeypatch, description, labels):
+    """同链接后返回的合集线索进入一个候选和缓存预览，原搜索结果保持原样。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.season = 2
+    subscribe.total_episode = subscribe.lack_episode = 5
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    focused = _season_only_context("Show S02 1080p WEB-DL", labels=["中字"])
+    focused.torrent_info.page_url = "https://tracker.example/details.php?id=123"
+    original = copy.deepcopy(focused)
+    original.torrent_info.description = description
+    original.torrent_info.labels = labels
+    original.torrent_info.enclosure = "https://secret.example/another-download-token"
+    initial = copy.deepcopy([focused, original])
+
+    def process(_chain, **kwargs):
+        return kwargs["candidate_filter"]([focused] if kwargs["keyword"] else [original])
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    assert plugin.scan_subscription("2")[0]
+    candidates = plugin._state["entries"]["2"]["candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["kind"] == "suspected_full"
+    assert candidates[0]["episodes"] == []
+    cached = next(iter(plugin._preview_search_cache.values()))["contexts"]
+    assert len(cached) == 1
+    assert "中字" in cached[0].torrent_info.labels
+    assert description in (cached[0].torrent_info.description or "")
+    assert set(labels).issubset(cached[0].torrent_info.labels)
+    choice = _form_items(plugin, "candidate")[0]["value"]
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice)[0]
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert host.search_calls == []
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["kind"] == "suspected_full"
+    assert preview["search_keyword_changed"] is False
+    # 提交下载前的资源唯一性检查仍能看到同链接的不同原始记录。
+    assert len(plugin._search_unfiltered(subscribe, preserve_duplicates=True)) == 2
+    assert [focused, original] == initial
+
+
+def test_duplicate_metadata_merge_preserves_episode_evidence_and_distinct_torrents(plugin_host):
+    """补充文本与标签不能拼接集号伪造全集，不同站点或详情链接不混合。"""
+    module = plugin_host.module
+    primary = _context("Show.S01.1080p.WEB-DL", episodes=(1, 3),
+                       page_url="https://tracker.example/details.php?id=123")
+    primary.torrent_info.description = "原副标题"
+    primary.torrent_info.labels = ["中字"]
+    supplemental = copy.deepcopy(primary)
+    supplemental.torrent_info.description = "原副标题\n全5集"
+    supplemental.torrent_info.labels = ["中字", "完结", "完结"]
+    supplemental.meta_info.episode_list = [2, 4, 5]
+    other_site = copy.deepcopy(primary)
+    other_site.torrent_info.site = 7
+    other_torrent = copy.deepcopy(primary)
+    other_torrent.torrent_info.page_url = "https://tracker.example/details.php?id=456"
+    initial = copy.deepcopy([primary, supplemental, other_site, other_torrent])
+
+    merged = module._distinct_contexts([primary, supplemental, supplemental, other_site, other_torrent])
+    assert len(merged) == 3
+    assert merged[0].torrent_info.description == "原副标题\n全5集"
+    assert merged[0].torrent_info.labels == ["中字", "完结"]
+    assert merged[0].meta_info.episode_list == [1, 3]
+    assert module.resource_candidate(merged[0], 1, "now", 5)["kind"] == "suspected_full"
+    assert merged[1].torrent_info.labels == merged[2].torrent_info.labels == ["中字"]
+    assert [primary, supplemental, other_site, other_torrent] == initial
+    again = module._distinct_contexts([merged[0], supplemental])
+    assert again[0].torrent_info.description == merged[0].torrent_info.description
+    assert again[0].torrent_info.labels == merged[0].torrent_info.labels
+
+
+def test_legacy_cache_merge_preserves_selected_pack_and_keyword_provenance_after_restart(plugin_host):
+    """旧缓存合并副标题后保留所选标题及原搜索命中映射，不误切换搜索方式。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.season = 2
+    subscribe.total_episode = subscribe.lack_episode = 5
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    selected = _season_only_context("Show S02 1080p WEB-DL", labels=["完结"])
+    selected.torrent_info.page_url = "https://tracker.example/details.php?id=123"
+    host.search_results.append(selected)
+    assert plugin.scan_subscription("2")[0]
+    choice = _form_items(plugin, "candidate")[0]["value"]
+    selected.torrent_info.labels = []
+    other = copy.deepcopy(selected)
+    other.torrent_info.title += " Alternate"
+    other.torrent_info.description = "第二季 全5集"
+    other_id = host.module.preview_resource(other, 2, 5, "now")["id"]
+    diagnostics = next(iter(plugin._preview_search_cache.values()))["diagnostics"]
+    diagnostics["original_search"]["resource_ids"] = [other_id]
+    plugin._remember_search(subscribe, [other, selected], [], "旧扫描缓存", "扫描时间", diagnostics)
+    plugin.stop_service()
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    host.search_calls.clear()
+
+    assert restarted.preview_candidate(choice)[0]
+    preview = restarted._state["entries"]["2"]["preview"]
+    assert host.search_calls == []
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["id"] == choice.split(":", 1)[1]
+    assert preview["matched"][0]["title"] == selected.torrent_info.title
+    assert preview["matched"][0]["kind"] == "suspected_full"
+    assert preview["matched"][0]["episodes"] == []
+    assert preview["search_keyword_changed"] is False
+    assert preview["search_keyword_verified"] is True
+
+
 def test_manual_scan_replaces_old_candidate_when_same_link_title_changes(plugin_host):
     """站点更新标题后，重新扫描不会把同一详情页保留成两个候选。"""
     host = plugin_host
