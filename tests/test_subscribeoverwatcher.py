@@ -2310,6 +2310,69 @@ def test_scan_cache_replaces_previous_round_while_candidates_merge_and_approval_
     assert next(service for service in plugin.get_service() if service["id"] == "candidate_refresh")["kwargs"] == {"hours": 4}
 
 
+def test_manual_scan_then_preview_shows_one_row_per_site_torrent_link(plugin_host, monkeypatch):
+    """带季和原订阅搜索召回同一链接时，只展示一个候选和一条预览结果。"""
+    host = plugin_host
+    plugin, choice, focused = _prepare_directory_confirmation(host)
+    focused.torrent_info.page_url = "https://tracker.example/details.php?id=123"
+    original = copy.deepcopy(focused)
+    original.torrent_info.description = "原搜索返回的不同描述"
+    original.torrent_info.enclosure = "https://secret.example/another-download-token"
+
+    def process(_chain, **kwargs):
+        result = [focused] if kwargs["keyword"] else [original]
+        return kwargs["candidate_filter"](result)
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    assert plugin.scan_subscription("2")[0]
+    entry = plugin._state["entries"]["2"]
+    assert len(entry["candidates"]) == 1
+    assert plugin.preview_candidate(choice)[0]
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["search_cached"] is True
+    assert preview["matched_count"] == 1
+    assert preview["rejected_count"] == 0
+    assert preview["search_keyword_changed"] is False
+
+
+def test_manual_scan_replaces_old_candidate_when_same_link_title_changes(plugin_host):
+    """站点更新标题后，重新扫描不会把同一详情页保留成两个候选。"""
+    host = plugin_host
+    plugin, _choice, original = _prepare_directory_confirmation(host)
+    link = "https://tracker.example/details.php?id=123"
+    original.torrent_info.page_url = link
+    assert plugin.scan_subscription("2")[0]
+    first_seen = plugin._state["entries"]["2"]["candidates"][0]["first_seen"]
+
+    renamed = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM.Renamed", page_url=link)
+    host.search_results[:] = [renamed]
+    assert plugin.scan_subscription("2")[0]
+    candidates = plugin._state["entries"]["2"]["candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["title"] == renamed.torrent_info.title
+    assert candidates[0]["first_seen"] == first_seen
+
+
+def test_preview_deduplicates_existing_cache_and_keeps_selected_candidate(plugin_host):
+    """升级前缓存若保存同链接的不同解析，预览沿用所选候选并合并搜索证据。"""
+    host = plugin_host
+    plugin, choice, selected = _prepare_directory_confirmation(host)
+    selected.torrent_info.page_url = "https://tracker.example/details.php?id=123"
+    other = copy.deepcopy(selected)
+    other.torrent_info.title += ".Alternate"
+    other_id = host.module.preview_resource(other, 1, 8, host.module._utc_now())["id"]
+    cached = next(iter(plugin._preview_search_cache.values()))
+    cached["contexts"] = [other, selected]
+    cached["diagnostics"]["original_search"]["resource_ids"] = [other_id]
+
+    assert plugin.preview_candidate(choice)[0]
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["id"] == choice.split(":", 1)[1]
+    assert preview["search_keyword_changed"] is False
+    assert plugin.confirm_candidate(choice)[0]
+
+
 def test_single_site_preview_filters_shared_scan_and_only_queries_selected_site_when_refreshed(plugin_host):
     """全站扫描可为单站提供资源，单站预览不计入其他站点的排除资源。"""
     host = plugin_host
@@ -3039,6 +3102,72 @@ def test_confirmation_keeps_original_search_unless_only_season_search_recalls_se
     assert plugin.confirm_candidate(choice)[0]
     plugin._search_approved(2)
     assert submitted_search == [("Show S01" if change_keyword else "Custom Original Search", not change_keyword)]
+
+
+def test_manual_verified_keyword_can_override_recalled_original_search(plugin_host):
+    """用户可选已召回当前版本的词，预览核对后才覆盖原订阅搜索方式。"""
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    subscribe = host.subscriptions[2]
+    subscribe.search_imdbid = True
+    option = next(item for item in _form_items(plugin, "candidate") if item["value"] == choice)
+    keyword = option["verified_keywords"][0]
+    selection = f"keyword:{keyword}"
+    assert {item["value"] for item in _form_items(plugin, "keyword_choice")} >= {"auto", "original", selection}
+
+    success, _message, draft = plugin.preview_candidate(choice, keyword_choice=selection)
+    assert success
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["keyword_choice"] == selection
+    assert preview["search_keyword"] == keyword
+    assert preview["search_keyword_changed"] is True
+    assert preview["matched_count"] == 1
+    assert getattr(subscribe, "keyword", None) is None and subscribe.search_imdbid is True
+    assert plugin.confirm_candidate(choice, draft)[0] is False
+    assert plugin.confirm_candidate(choice, draft, keyword_choice=selection)[0]
+    assert subscribe.keyword == keyword and subscribe.search_imdbid is False
+
+
+def test_manual_keyword_must_have_recalled_selected_version(plugin_host):
+    """任意拼写不能伪装成已验证搜索词写回订阅。"""
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    success, message, _draft = plugin.preview_candidate(choice, keyword_choice="keyword:unverified search")
+    assert success is False and "未在最新搜索中召回" in message
+    assert getattr(host.subscriptions[2], "keyword", None) is None
+
+
+def test_manual_keyword_preview_excludes_resources_only_found_by_other_queries(plugin_host, monkeypatch):
+    """手动选词预览只计入该词召回的资源。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    other = _context("Show.S01E01.1080p.WEB-DL.HDR-TEAM.Other")
+
+    def process(_chain, **kwargs):
+        result = [chosen] if kwargs["keyword"] else [chosen, other]
+        return kwargs["candidate_filter"](result)
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    plugin.refresh_candidates()
+    candidate = next(item for item in _form_items(plugin, "candidate") if item["value"] == choice)
+    keyword = candidate["verified_keywords"][0]
+    assert plugin.preview_candidate(choice, keyword_choice=f"keyword:{keyword}")[0]
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 1
+    assert preview["rejected_count"] == 1
+    assert preview["rejected"][0]["reason"] == "未由手动选择的搜索词召回"
+
+
+def test_keep_original_keyword_choice_requires_original_search_to_recall_candidate(plugin_host):
+    """显式保留原搜索方式时，须先证实它能找回所选版本。"""
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice, keyword_choice="original")[0]
+    assert plugin._state["entries"]["2"]["preview"]["search_keyword_changed"] is False
+    host.search_results.clear()
+    assert plugin.scan_subscription("2")[0]
+    success, message, _draft = plugin.preview_candidate(choice, keyword_choice="original")
+    assert success is False and "原订阅搜索未召回" in message
 
 
 @pytest.mark.parametrize("reason", ["timeout", "budget_wait", "missing_observation", "changed_original_keyword"])

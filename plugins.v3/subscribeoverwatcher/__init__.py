@@ -72,6 +72,47 @@ def _identity(subscribe: Any) -> str:
     )
 
 
+def _resource_key(context: Any) -> tuple[Any, ...]:
+    """同一站点的详情页标识一个种子；缺少详情页时退回标题和大小。"""
+    torrent = getattr(context, "torrent_info", None)
+    if torrent is None:
+        return ("unknown", id(context))
+    site = getattr(torrent, "site", None)
+    page = public_page_url(getattr(torrent, "page_url", None), getattr(torrent, "enclosure", None))
+    if page:
+        return ("page", site, page)
+    title = " ".join(str(getattr(torrent, "title", None) or "").split()).casefold()
+    if title:
+        return ("title", site, title, getattr(torrent, "size", None))
+    return ("unknown", id(context))
+
+
+def _distinct_contexts(contexts: list[Any]) -> list[Any]:
+    """合并不同查询词及同一查询内重复返回的种子，保留首个结果。"""
+    seen = set()
+    unique = []
+    for context in contexts:
+        key = _resource_key(context)
+        if key not in seen:
+            seen.add(key)
+            unique.append(context)
+    return unique
+
+
+def _keyword_selection(choice: str) -> tuple[str, Optional[str]]:
+    """解析预览时的搜索词选择；具体关键词还须由搜索缓存验证。"""
+    if choice in ("", "auto"):
+        return "auto", None
+    if choice == "original":
+        return "original", None
+    if isinstance(choice, str) and choice.startswith("keyword:"):
+        keyword = choice[len("keyword:"):]
+        if keyword and keyword == keyword.strip() and len(keyword) <= 300 \
+                and not any(ord(char) < 32 for char in keyword):
+            return "keyword", keyword
+    raise ValueError("请选择有效的搜索词")
+
+
 def _subscription_id(origin: Any) -> Optional[int]:
     """
     从宿主的订阅下载来源中读取订阅 ID。
@@ -361,7 +402,7 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
             "rule_groups_checked", "rule_groups_auto_disabled", "rule_group_notice", "rule_group_comparison",
             "effective_rules", "rejection_summary", "search_source", "search_result_at", "search_sites",
             "search_diagnostics",
-            "search_keyword", "original_search_keyword", "search_keyword_notice",
+            "search_keyword", "original_search_keyword", "search_keyword_notice", "keyword_choice",
             "search_keyword_changed", "search_keyword_verified",
         )},
         "subscription_id": sid, "table": _preview_table(preview),
@@ -381,7 +422,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.6"
+    plugin_version = "1.9.8"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -496,6 +537,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "direct_approve": False, "revoke": False,
                     "preview_replace": False, "submit_replace": False,
                     "historical_subscription": [], "scan_subscription": "", "candidate_subscription": "", "candidate": "",
+                    "keyword_choice": "auto",
                     "direct_subscription": "",
                     "download_directory": "",
                     "revoke_subscription": "", "rule_json": "", "replace_subscription": "",
@@ -518,12 +560,14 @@ class SubscribeOverwatcher(_PluginBase):
                     str(config.get("rule_mode") or "candidate"),
                     str(config.get("download_directory") or ""),
                     refresh_search=bool(config.get("refresh_search")),
+                    keyword_choice=str(config.get("keyword_choice") or "auto"),
                 )
             elif actions[0] == "confirm":
                 success, message = self.confirm_candidate(
                     str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
                     str(config.get("rule_mode") or "candidate"),
                     str(config.get("download_directory") or ""),
+                    keyword_choice=str(config.get("keyword_choice") or "auto"),
                 )
             elif actions[0] == "direct_approve":
                 success, message = self.approve_subscription(config.get("direct_subscription"))
@@ -568,6 +612,7 @@ class SubscribeOverwatcher(_PluginBase):
                     updated_config["candidate_subscription"] = ""
                     updated_config["candidate"] = ""
                     updated_config["rule_mode"] = "candidate"
+                    updated_config["keyword_choice"] = "auto"
                     updated_config["rule_json"] = ""
                     updated_config["download_directory"] = ""
                 elif actions == ["preview_replace"]:
@@ -1001,8 +1046,9 @@ class SubscribeOverwatcher(_PluginBase):
     def _search_unfiltered(
         self, subscribe: Any, timings: Optional[dict[str, float]] = None, *, sites: Optional[list[int]] = None,
         diagnostics: Optional[dict[str, Any]] = None,
+        preserve_duplicates: bool = False,
     ) -> list[Any]:
-        """优先带季查询，再用原订阅搜索验证是否需要调整关键词并补收跨季包。"""
+        """搜索目标季与原订阅；下载提交前保留重复结果以检查资源唯一性。"""
         search_stop = self._search_stop
         started = time.perf_counter()
         media = MediaChain().recognize_media(
@@ -1026,7 +1072,8 @@ class SubscribeOverwatcher(_PluginBase):
         if not names:
             return []
         site_reports = []
-        resource_keywords: dict[str, list[str]] = {}
+        focused_keywords: dict[tuple[Any, ...], list[str]] = {}
+        original_keys: set[tuple[Any, ...]] = set()
         rounds = []
         supplemental_failed = False
         original_search: dict[str, Any] = {"checked": False, "resource_ids": []}
@@ -1075,13 +1122,14 @@ class SubscribeOverwatcher(_PluginBase):
                     continue
                 if not item:
                     continue
+                key = _resource_key(context)
                 if not focused:
-                    original_search["resource_ids"].append(item["id"])
+                    original_keys.add(key)
                     continue
                 actual_keyword = next((report["keyword"] for report in chain.site_reports
                                        if report.get("site_id") == item.get("site_id")
                                        and report.get("count") and report.get("keyword")), keyword)
-                words = resource_keywords.setdefault(item["id"], [])
+                words = focused_keywords.setdefault(key, [])
                 if actual_keyword not in words:
                     words.append(actual_keyword)
             rounds.append({"keyword": label, "kind": "target_season" if focused else "original_search",
@@ -1123,17 +1171,34 @@ class SubscribeOverwatcher(_PluginBase):
             supplemental = []
             supplemental_failed = True
             logger.exception(f"订阅 {subscribe.id} 原订阅搜索验证失败，保留已取得的目标季资源")
-        def resource_key(context: Any) -> tuple[Any, ...]:
-            torrent = getattr(context, "torrent_info", None)
-            meta = getattr(context, "meta_info", None)
-            return (getattr(torrent, "site", None), getattr(torrent, "title", None), getattr(torrent, "size", None),
-                    getattr(torrent, "description", None), getattr(torrent, "enclosure", None),
-                    tuple(getattr(meta, "season_list", None) or []),
-                    tuple(getattr(meta, "episode_list", None) or []))
+        # 预览按详情页合并；下载提交则保留同轮重复记录以检查唯一性。
+        if preserve_duplicates:
+            def exact_record_key(context: Any) -> tuple[Any, ...]:
+                torrent = getattr(context, "torrent_info", None)
+                meta = getattr(context, "meta_info", None)
+                return (getattr(torrent, "site", None), getattr(torrent, "title", None),
+                        getattr(torrent, "size", None), getattr(torrent, "description", None),
+                        getattr(torrent, "enclosure", None),
+                        tuple(getattr(meta, "season_list", None) or []),
+                        tuple(getattr(meta, "episode_list", None) or []))
 
-        # 只合并不同搜索词召回的相同资源；同一轮的不唯一记录保留给提交前校验。
-        focused_keys = {resource_key(context) for context in contexts}
-        contexts += [context for context in supplemental if resource_key(context) not in focused_keys]
+            focused_keys = {exact_record_key(context) for context in contexts}
+            contexts += [context for context in supplemental if exact_record_key(context) not in focused_keys]
+        else:
+            contexts = _distinct_contexts(contexts + supplemental)
+        resource_keywords: dict[str, list[str]] = {}
+        for context in contexts:
+            try:
+                item = preview_resource(context, season, subscribe.total_episode, _utc_now())
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not item:
+                continue
+            key = _resource_key(context)
+            words = resource_keywords.setdefault(item["id"], [])
+            words.extend(word for word in focused_keywords.get(key, []) if word not in words)
+            if key in original_keys and item["id"] not in original_search["resource_ids"]:
+                original_search["resource_ids"].append(item["id"])
         if search_stop.is_set():
             raise RuntimeError("插件搜索已停止")
         if diagnostics is not None:
@@ -1274,6 +1339,7 @@ class SubscribeOverwatcher(_PluginBase):
         download_directory: str = "",
         refresh_search: bool = False, candidate: Optional[dict[str, Any]] = None,
         auto_disable_rule_groups: bool = False,
+        keyword_choice: str = "auto",
     ) -> dict[str, Any]:
         """
         只搜索并筛选当前资源，不更新订阅或提交下载。
@@ -1292,38 +1358,89 @@ class SubscribeOverwatcher(_PluginBase):
                 setattr(working, field, value)
             elif field != "sites":
                 setattr(working, field, None)
+        keyword_mode, selected_keyword = _keyword_selection(keyword_choice)
         search_sites = getattr(working, "sites", None) or []
         contexts, cached, cache_age, source, result_at, diagnostics = self._preview_contexts(
             subscribe, refresh_search, timings, search_sites,
         )
-        resource_keywords = (diagnostics or {}).get("resource_keywords") or {}
+        # 旧版持久缓存可能含同一详情页的多份结果，预览时也要收敛它们。
+        distinct = _distinct_contexts(contexts)
+        id_aliases = {}
+        if len(distinct) != len(contexts):
+            ids_by_context = {}
+            for context in contexts:
+                try:
+                    item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if item:
+                    ids_by_context[id(context)] = item["id"]
+            # 保留用户正在预览的版本，避免旧缓存内另一份解析覆盖其选择值。
+            selected_id = (candidate or {}).get("id")
+            selected = next((context for context in contexts
+                             if ids_by_context.get(id(context)) == selected_id), None) if selected_id else None
+            if selected is not None:
+                selected_key = _resource_key(selected)
+                distinct = [selected if _resource_key(context) == selected_key else context
+                            for context in distinct]
+            ids_by_key = {_resource_key(context): ids_by_context[id(context)] for context in distinct
+                          if id(context) in ids_by_context}
+            for context in contexts:
+                resource_id = ids_by_context.get(id(context))
+                canonical_id = ids_by_key.get(_resource_key(context))
+                if resource_id and canonical_id:
+                    id_aliases[resource_id] = canonical_id
+        contexts = distinct
+        resource_keywords = {}
+        for resource_id, words in ((diagnostics or {}).get("resource_keywords") or {}).items():
+            target_id = id_aliases.get(resource_id, resource_id)
+            selected_words = resource_keywords.setdefault(target_id, [])
+            selected_words.extend(word for word in words if word not in selected_words)
         candidate_keywords = resource_keywords.get((candidate or {}).get("id")) or []
+        if keyword_mode == "keyword" and (candidate is None or selected_keyword not in candidate_keywords):
+            raise ValueError("所选搜索词未在最新搜索中召回这个版本，请重新扫描或选择其他搜索词")
         original_search = (diagnostics or {}).get("original_search") or {}
         original_keyword = getattr(subscribe, "keyword", None) or None
         original_checked = bool(original_search.get("checked")
                                 and original_search.get("keyword") == original_keyword
                                 and original_search.get("search_imdbid") == bool(getattr(subscribe, "search_imdbid", False))
                                 and original_search.get("custom_words") == (getattr(subscribe, "custom_words", None) or None))
-        original_ids = set(original_search.get("resource_ids") or []) if original_checked else set()
+        original_ids = {id_aliases.get(resource_id, resource_id)
+                        for resource_id in original_search.get("resource_ids") or []} if original_checked else set()
         original_matched = bool(candidate and candidate.get("id") in original_ids)
+        if keyword_mode == "original" and candidate and not original_matched:
+            raise ValueError("原订阅搜索未召回所选版本，请重新搜索或选择已验证搜索词")
         site_failed = any((candidate or {}).get("site_id") is None
                           or item.get("site_id") == candidate.get("site_id")
                           for item in original_search.get("site_failures") or [])
         original_completed = original_checked and not site_failed
-        search_keyword_changed = bool(candidate and not original_matched and candidate_keywords and original_completed)
-        search_keyword = candidate_keywords[0] if search_keyword_changed else original_keyword
-        search_keyword_verified = original_matched or search_keyword_changed
         search_keyword_notice = ""
-        if candidate and original_matched:
-            search_keyword_notice = "原订阅搜索已召回所选版本，确认后保留原搜索词和搜索方式；当前按原订阅搜索结果预览。"
-        elif search_keyword_changed:
-            search_keyword_notice = "原订阅搜索正常完成但未召回所选版本，带季查询已召回；确认后才改用该带季搜索词。"
+        if keyword_mode == "keyword":
+            search_keyword = selected_keyword
+            search_keyword_changed = selected_keyword != original_keyword or bool(getattr(subscribe, "search_imdbid", False))
+            search_keyword_verified = True
+            search_keyword_notice = "已手动选择本轮召回所选版本的搜索词；预览只计入该词召回的资源，确认后才写入订阅。"
             if getattr(subscribe, "search_imdbid", False):
-                search_keyword_notice += "同时从 IMDb ID 搜索改为已验证的标题搜索。"
-        elif candidate and original_completed:
-            search_keyword_notice = "本轮未召回所选版本，不会修改原订阅搜索词。"
-        elif candidate:
-            search_keyword_notice = "未能验证当前原订阅搜索（缓存缺少记录或站点失败），不能判断必须加季号；本次保留原搜索词，请重新搜索完成验证。"
+                search_keyword_notice += "确认时会改用标题搜索。"
+        elif keyword_mode == "original":
+            search_keyword = original_keyword
+            search_keyword_changed = False
+            search_keyword_verified = original_matched
+            search_keyword_notice = "已手动选择保留原订阅搜索词和搜索方式；当前按原订阅搜索结果预览。"
+        else:
+            search_keyword_changed = bool(candidate and not original_matched and candidate_keywords and original_completed)
+            search_keyword = candidate_keywords[0] if search_keyword_changed else original_keyword
+            search_keyword_verified = original_matched or search_keyword_changed
+            if candidate and original_matched:
+                search_keyword_notice = "原订阅搜索已召回所选版本，确认后保留原搜索词和搜索方式；当前按原订阅搜索结果预览。"
+            elif search_keyword_changed:
+                search_keyword_notice = "原订阅搜索正常完成但未召回所选版本，带季查询已召回；确认后才改用该带季搜索词。"
+                if getattr(subscribe, "search_imdbid", False):
+                    search_keyword_notice += "同时从 IMDb ID 搜索改为已验证的标题搜索。"
+            elif candidate and original_completed:
+                search_keyword_notice = "本轮未召回所选版本，不会修改原订阅搜索词。"
+            elif candidate:
+                search_keyword_notice = "未能验证当前原订阅搜索（缓存缺少记录或站点失败），不能判断必须加季号；本次保留原搜索词，请重新搜索完成验证。"
         filtering_started = time.perf_counter()
         filter_params = SubscribeChain.get_params(working)
         groups_disabled = rules.get("filter_groups") == [] \
@@ -1342,9 +1459,11 @@ class SubscribeOverwatcher(_PluginBase):
                 continue
             if not item:
                 continue
-            if search_keyword_changed and search_keyword not in resource_keywords.get(item["id"], []):
+            if keyword_mode == "keyword" and selected_keyword not in resource_keywords.get(item["id"], []):
+                reason = "未由手动选择的搜索词召回"
+            elif keyword_mode == "auto" and search_keyword_changed and search_keyword not in resource_keywords.get(item["id"], []):
                 reason = "未由确认后使用的搜索词召回"
-            elif candidate and not search_keyword_changed and original_completed and item["id"] not in original_ids:
+            elif candidate and keyword_mode != "keyword" and not search_keyword_changed and original_completed and item["id"] not in original_ids:
                 reason = "未被原订阅搜索策略召回"
             elif require_episodes and item["kind"] == "cross_season":
                 reason = "跨季资源无法确定目标季集数，不能手动选集"
@@ -1376,7 +1495,8 @@ class SubscribeOverwatcher(_PluginBase):
                                    working=working, rules=rules, group_policy=policy)
         if candidate:
             summary.append({"field": "keyword", "label": "搜索词", "value": search_keyword or "默认使用剧名及别名",
-                            "source": "仅带季查询命中，确认后修改" if search_keyword_changed else "保留原订阅"})
+                            "source": "手动选择" if keyword_mode == "keyword" else
+                            "仅带季查询命中，确认后修改" if search_keyword_changed else "保留原订阅"})
         matched: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         for context, item, reason in records:
@@ -1429,6 +1549,7 @@ class SubscribeOverwatcher(_PluginBase):
             "search_source": source, "search_result_at": result_at, "search_sites": search_sites,
             "search_diagnostics": _search_diagnostics_snapshot(diagnostics),
             "search_keyword": search_keyword, "original_search_keyword": getattr(subscribe, "keyword", None),
+            "keyword_choice": keyword_choice,
             "search_keyword_notice": search_keyword_notice,
             "search_keyword_changed": search_keyword_changed, "search_keyword_verified": search_keyword_verified,
             "timings": {key: round(value, 3) for key, value in timings.items()},
@@ -1441,6 +1562,7 @@ class SubscribeOverwatcher(_PluginBase):
         self, choice: str, rule_json: str = "", rule_mode: str = "candidate",
         download_directory: str = "",
         *, refresh_search: bool = False,
+        keyword_choice: str = "auto",
     ) -> tuple[bool, str, str]:
         """
         生成候选规格的只读匹配预览，保持订阅暂停和原规则不变。
@@ -1479,6 +1601,7 @@ class SubscribeOverwatcher(_PluginBase):
                 subscribe, rules, download_directory=download_directory,
                 refresh_search=refresh_search, candidate=candidate,
                 auto_disable_rule_groups=True,
+                keyword_choice=keyword_choice,
             )
         except ValueError as error:
             logger.exception(f"预览订阅 {sid} 的规则匹配失败")
@@ -1506,6 +1629,7 @@ class SubscribeOverwatcher(_PluginBase):
     def confirm_candidate(
         self, choice: str, rule_json: Optional[str] = None, rule_mode: str = "candidate",
         download_directory: str = "",
+        *, keyword_choice: str = "auto",
     ) -> tuple[bool, str]:
         """
         回填所选版本的规则，再恢复订阅并安排补搜。
@@ -1544,6 +1668,7 @@ class SubscribeOverwatcher(_PluginBase):
             if preview.get("choice") != choice or preview.get("scope") != _rule_scope(subscribe) \
                     or preview.get("rule_groups_checked") is not True \
                     or preview.get("rule_mode", "candidate") != rule_mode \
+                    or preview.get("keyword_choice", "auto") != keyword_choice \
                     or not isinstance(preview.get("searched_ts"), (int, float)) \
                     or datetime.now(timezone.utc).timestamp() - preview["searched_ts"] > 1800:
                 return False, "请先为当前候选生成不超过 30 分钟的匹配预览"
@@ -1645,7 +1770,7 @@ class SubscribeOverwatcher(_PluginBase):
         else:
             return True, f"订阅 {sid} 已批准；原本由用户暂停，仍保持暂停"
         if candidate_id:
-            search_note = "已改用验证通过的带季搜索词" if payload and "keyword" in payload else "保留原搜索词"
+            search_note = "已改用验证通过的搜索词" if payload and "keyword" in payload else "保留原搜索词"
             return True, f"订阅 {sid} 已回填规则并恢复，{search_note}，将补齐缺集后继续追更"
         return True, f"订阅 {sid} 已直接批准，原有规则保持不变，将补齐缺集后继续追更"
 
@@ -1775,7 +1900,7 @@ class SubscribeOverwatcher(_PluginBase):
             if resource_id not in {item.get("id") for item in preview.get("matched") or []}:
                 return False, "资源不在当前规则的预览匹配列表中"
         try:
-            contexts = self._search_unfiltered(subscribe)
+            contexts = self._search_unfiltered(subscribe, preserve_duplicates=True)
         except Exception:
             logger.exception(f"重新搜索订阅 {sid} 的回刷资源失败")
             return False, "提交前重新搜索失败，未开始下载"
@@ -2037,6 +2162,24 @@ class SubscribeOverwatcher(_PluginBase):
                 }
                 for sid, entry in candidate_entries
             ]
+            verified_keywords = {}
+            verified_keywords_all_sites = {}
+            for sid, entry in candidate_entries:
+                subscribe = current.get(sid)
+                if subscribe is None:
+                    continue
+                full_cache = self._cached_search(subscribe, [])
+                full_keywords = ((full_cache or {}).get("diagnostics") or {}).get("resource_keywords") or {}
+                keywords_by_site = {}
+                for item in entry.get("candidates") or []:
+                    site = item.get("site_id")
+                    if site not in keywords_by_site:
+                        cached = self._cached_search(subscribe, [site]) if isinstance(site, int) else None
+                        keywords_by_site[site] = ((cached or {}).get("diagnostics") or {}).get("resource_keywords") or {}
+                    verified_keywords[(sid, item["id"])] = [word for word in
+                        keywords_by_site[site].get(item["id"], []) if isinstance(word, str) and word]
+                    verified_keywords_all_sites[(sid, item["id"])] = [word for word in
+                        full_keywords.get(item["id"], []) if isinstance(word, str) and word]
             choices = [
                 {
                     "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
@@ -2058,6 +2201,8 @@ class SubscribeOverwatcher(_PluginBase):
                     "page_url": public_page_url(item.get("page_url")),
                     "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
                     "site_id": item.get("site_id"),
+                    "verified_keywords": verified_keywords.get((sid, item["id"]), []),
+                    "verified_keywords_all_sites": verified_keywords_all_sites.get((sid, item["id"]), []),
                     "seeders_label": _seeders_label(item), "promotion": item.get("promotion") or "未知",
                     "original_sites": getattr(current.get(sid), "sites", None) or [],
                     "original_filter_groups": getattr(current.get(sid), "filter_groups", None) or [],
@@ -2065,6 +2210,13 @@ class SubscribeOverwatcher(_PluginBase):
                 }
                 for sid, entry in candidate_entries
                 for item in entry.get("candidates") or []
+            ]
+            keyword_choices = [
+                {"title": "自动判断", "value": "auto"},
+                {"title": "保留原订阅搜索方式", "value": "original"},
+            ] + [
+                {"title": f"使用已验证词：{word}", "value": f"keyword:{word}"}
+                for word in dict.fromkeys(word for words in verified_keywords.values() for word in words)
             ]
             pending_choices = [
                 {"title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d}", "value": sid}
@@ -2169,6 +2321,7 @@ class SubscribeOverwatcher(_PluginBase):
                     {"title": "不限站点", "value": "all_sites"},
                 ]), md=3),
             ),
+            row(col(select("keyword_choice", "确认后的订阅搜索词", keyword_choices))),
             row(
                 col(select("download_directory", "下载目录（留空保留原目录）", directory_choices(),
                            clearable=True, **{"hide-details": False,
@@ -2214,7 +2367,7 @@ class SubscribeOverwatcher(_PluginBase):
             "enabled": False, "confirm_full_pack": True, "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
             "historical_subscription": [], "scan_subscription": "", "candidate_subscription": "", "candidate": "",
-            "rule_mode": "candidate", "rule_json": "",
+            "rule_mode": "candidate", "rule_json": "", "keyword_choice": "auto",
             "download_directory": "",
             "direct_subscription": "", "revoke_subscription": "",
             "replace_subscription": "", "replace_resource": "", "replace_episodes": "",

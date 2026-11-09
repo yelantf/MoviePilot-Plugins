@@ -373,6 +373,41 @@ describe('custom configuration actions', () => {
     window.HTMLElement.prototype.scrollIntoView = previousScroll
   })
 
+  it('selects a verified keyword and marks the preview stale when the choice changes', async () => {
+    const data = candidateSnapshot()
+    const candidate = data.conf[0].content.find(node => node.props?.model === 'candidate')
+    candidate.props.items[0].verified_keywords = ['Show S01']
+    const api = {
+      get: vi.fn().mockImplementation(async () => data),
+      post: vi.fn().mockImplementation(async (url, submitted) => {
+        if (url.endsWith('/preview-status')) return { success: true, status: 'cached' }
+        const preview = {
+          ...previewSnapshot(submitted.rule_json), keyword_choice: submitted.keyword_choice,
+          search_keyword: 'Show S01', search_keyword_changed: true,
+          search_keyword_verified: true, search_keyword_notice: '已手动选择已验证搜索词。',
+        }
+        data.model._candidate_preview = preview
+        data.model.keyword_choice = submitted.keyword_choice
+        data.model._last_confirmation = { request_id: submitted.operation_request_id, success: true }
+        return { success: true, message: '预览完成', preview }
+      }),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    const choice = wrapper.find('select[aria-label="确认后的订阅搜索词"]')
+    expect(choice.text()).toContain('使用已验证词：Show S01')
+    await choice.setValue('keyword:Show S01')
+    await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
+    await flushPromises()
+    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'preview', keyword_choice: 'keyword:Show S01' })
+    expect(wrapper.find('.preview-results').text()).toContain('手动选择')
+    expect(wrapper.text()).not.toContain('以下是上次预览')
+    await choice.setValue('original')
+    expect(wrapper.text()).toContain('以下是上次预览')
+    wrapper.unmount()
+  })
+
   it.each([false, true])('shows rule group comparison and only switches the draft after all matches are filtered (automatic: %s)', async automatic => {
     const data = candidateSnapshot()
     const notice = '系统默认规则组过滤了全部可匹配资源；已自动选择“不使用规则组”，确认后才会修改订阅。'

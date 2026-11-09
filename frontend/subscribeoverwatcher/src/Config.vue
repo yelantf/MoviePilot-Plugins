@@ -105,6 +105,10 @@
                   :disabled="!!busy" density="comfortable" hide-details @update:model-value="updateSiteScope" />
               </v-col>
             </v-row>
+            <v-select v-model="form.keyword_choice" label="确认后的订阅搜索词"
+              :items="keywordChoices" :disabled="!!busy || !selectedCandidate" density="comfortable"
+              hint="可选自动判断、保留原订阅搜索方式，或本轮确实召回所选版本的搜索词；确认前请重新预览。"
+              persistent-hint class="mt-3 mb-4" />
             <p class="text-caption text-medium-emphasis mt-2 mb-4">
               候选比较带季查询与原订阅搜索，并收集包含目标季的合集；跳过全局搜索规则组及本订阅的站点和筛选规则，保留历史扫描版本。
               候选选择项和详情页均显示种子大小及精确字节数。跨站资源只在标题、字节大小、集数和解析规格一致时合并展示；这里仍逐站点选择。
@@ -130,7 +134,7 @@
             <p class="text-caption text-medium-emphasis mt-2 mb-0">
               只用所选站点时，预览仅搜索和筛选该站；“不限站点”保留其他规则选项。
               搜索缓存持久保存，重启和更新后继续复用对应站点范围的最新结果；每次重新核对规则和下载目录，点击“重新搜索”获取新资源。
-              原订阅能搜到所选版本时保留搜索词；只有原搜索正常完成却未命中、带季查询命中时，确认才调整搜索词。
+              自动判断时，原订阅能搜到所选版本便保留搜索词；只有原搜索正常完成却未命中、带季查询命中时才自动调整。
               确认后的候选和确认预览保留 24 小时，期满后定期清理。
             默认预览应用原订阅或系统默认规则组；结果不符合预期时可选择“不使用规则组”。
             </p>
@@ -256,7 +260,7 @@ import DataPage from './Page.vue'
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
   'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
-  'historical_subscription', 'scan_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json', 'download_directory',
+  'historical_subscription', 'scan_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json', 'keyword_choice', 'download_directory',
   'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
 ]
@@ -280,7 +284,7 @@ const form = reactive({
   enabled: false, confirm_full_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
   scan_subscription: '',
-  candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_json: '',
+  candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_json: '', keyword_choice: 'auto',
   download_directory: '',
   direct_subscription: '', revoke_subscription: '',
   replace_subscription: '', replace_resource: '', replace_episodes: '',
@@ -312,6 +316,15 @@ function candidateSubscriptionId(item) {
 const candidateChoices = computed(() => options.candidate.filter(item =>
   form.candidate_subscription && candidateSubscriptionId(item) === form.candidate_subscription))
 const selectedCandidate = computed(() => candidateChoices.value.find(item => item.value === form.candidate))
+const keywordChoices = computed(() => [
+  { title: '自动判断', value: 'auto' },
+  { title: '保留原订阅搜索方式', value: 'original' },
+  ...[...new Set((form.rule_mode === 'all_sites'
+    ? selectedCandidate.value?.verified_keywords_all_sites
+    : selectedCandidate.value?.verified_keywords) || [])].map(word => ({
+    title: `使用已验证词：${word}`, value: `keyword:${word}`,
+  })),
+])
 const selectedDownloadDirectory = computed(() => options.download_directory.find(
   item => item.value === form.download_directory))
 const selectedCandidateUrl = computed(() => {
@@ -336,6 +349,7 @@ function draftKey(raw) {
 }
 const previewStale = computed(() => selectedPreview.value && (
   selectedPreview.value.rule_mode !== form.rule_mode ||
+  (selectedPreview.value.keyword_choice || 'auto') !== form.keyword_choice ||
   (selectedPreview.value.download_directory || '') !== (form.download_directory || '') ||
   draftKey(form.rule_json) === null || draftKey(form.rule_json) !== draftKey(selectedPreview.value.draft_json)
 ))
@@ -344,6 +358,7 @@ function selectCandidateSubscription(subscription) {
   form.candidate_subscription = subscription || ''
   form.candidate = ''
   form.rule_json = ''
+  form.keyword_choice = 'auto'
   form.download_directory = ''
   handoffNotice.value = ''
 }
@@ -352,11 +367,13 @@ function selectCandidate(candidate) {
   form.candidate = candidate || ''
   const rules = selectedCandidate.value?.rules || {}
   form.rule_json = Object.keys(rules).length ? JSON.stringify(rules, null, 2) : ''
+  form.keyword_choice = 'auto'
   if (form.rule_mode === 'all_sites') updateSiteScope(form.rule_mode)
   handoffNotice.value = ''
 }
 
 function updateSiteScope(mode) {
+  if (!keywordChoices.value.some(item => item.value === form.keyword_choice)) form.keyword_choice = 'auto'
   if (!selectedCandidate.value && !form.rule_json) return
   try {
     const rules = form.rule_json.trim() ? JSON.parse(form.rule_json) : { ...selectedCandidate.value?.rules }
@@ -423,6 +440,7 @@ function applySnapshot(snapshot, { preserveForm = false } = {}) {
       }
     }
   }
+  if (!keywordChoices.value.some(item => item.value === form.keyword_choice)) form.keyword_choice = 'auto'
   return source.model._last_confirmation
 }
 
@@ -441,6 +459,7 @@ function applyCandidateSelection(candidateId = takeCandidateSelection()) {
   form.candidate_subscription = subscriptionId
   form.candidate = candidateId
   form.rule_mode = 'candidate'
+  form.keyword_choice = 'auto'
   form.rule_json = Object.keys(candidate.rules || {}).length
     ? JSON.stringify(candidate.rules, null, 2) : ''
   feedback.section = ''

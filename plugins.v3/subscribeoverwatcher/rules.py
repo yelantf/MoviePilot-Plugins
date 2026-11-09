@@ -378,15 +378,31 @@ def merge_candidates(
     :param limit: 每条订阅最多保存的候选数
     :return: 按最近发现时间排序的候选
     """
-    merged = {item["id"]: item for item in old if candidate_is_eligible(item)}
-    for candidate in fresh:
+    merged: dict[str, dict[str, Any]] = {}
+    page_ids: dict[tuple[int, str], str] = {}
+
+    def page_key(item: dict[str, Any]) -> Optional[tuple[int, str]]:
+        site = item.get("site_id")
+        page = public_page_url(item.get("page_url"))
+        return (site, page) if isinstance(site, int) and site > 0 and page else None
+
+    # 历史记录本来按最近发现时间排序，倒序加入使较新的快照优先。
+    for item in [*reversed(old), *fresh]:
+        candidate = dict(item)
         if not candidate_is_eligible(candidate):
             continue
-        previous = merged.get(candidate["id"])
+        key = page_key(candidate)
+        previous_id = candidate["id"] if candidate["id"] in merged else page_ids.get(key)
+        previous = merged.pop(previous_id, None) if previous_id else None
         if previous:
             candidate["first_seen"] = previous.get("first_seen") or candidate["first_seen"]
             candidate["page_url"] = candidate.get("page_url") or public_page_url(previous.get("page_url"))
+            previous_key = page_key(previous)
+            if previous_key and page_ids.get(previous_key) == previous_id:
+                page_ids.pop(previous_key)
         merged[candidate["id"]] = candidate
+        if key:
+            page_ids[key] = candidate["id"]
     kind_order = {"full_season": 3, "cross_season": 2, "suspected_full": 1, "first_episode": 0}
     return sorted(
         merged.values(),

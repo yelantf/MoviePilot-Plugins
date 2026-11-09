@@ -7,7 +7,8 @@
     <v-alert v-if="preview.search_keyword_notice" :type="preview.search_keyword_verified ? 'info' : 'warning'"
       variant="tonal" density="compact" class="mb-3">
       <div>确认后的订阅搜索词：<strong>{{ preview.search_keyword || '默认使用剧名及别名' }}</strong>
-        （{{ preview.search_keyword_changed ? '调整' : '保持原设置' }}）</div>
+        （{{ preview.keyword_choice?.startsWith('keyword:') ? '手动选择' :
+          preview.search_keyword_changed ? '调整' : '保持原设置' }}）</div>
       <div v-if="preview.search_keyword_changed">原搜索词：{{ preview.original_search_keyword || '默认使用剧名及别名' }}。</div>
       {{ preview.search_keyword_notice }}
     </v-alert>
