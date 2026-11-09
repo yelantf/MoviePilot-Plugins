@@ -38,7 +38,7 @@ from .rules import (
     target_seasons,
 )
 from .rulegroups import UNFILTERED_GROUP_NAME, ensure_unfiltered_group, group_rejections, preview_group_policy
-from .search import CandidateSearchChain, configure_candidate_budget, failure_hold, search_names
+from .search import CandidateSearchChain, search_names
 
 
 def _utc_now() -> str:
@@ -381,7 +381,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.5"
+    plugin_version = "1.9.6"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -433,6 +433,9 @@ class SubscribeOverwatcher(_PluginBase):
                 self._state = {"baseline": None, "entries": {}}
             if not isinstance(self._state.get("entries"), dict):
                 self._state["entries"] = {}
+            if "site_holds" in self._state:
+                self._state.pop("site_holds", None)
+                self._save_state()
             stale_candidates = False
             for entry in self._state["entries"].values():
                 if not isinstance(entry, dict) or not isinstance(entry.get("candidates"), list):
@@ -995,27 +998,6 @@ class SubscribeOverwatcher(_PluginBase):
                     self._save_state()
         return False
 
-    def _site_hold(self, site: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """冷却按站点共享，保存配置和重载插件不会提前解除。"""
-        with self._lock:
-            pause = (self._state.get("site_holds") or {}).get(str(site.get("id")))
-            return dict(pause) if pause and pause.get("until", 0) > time.time() else None
-
-    def _hold_site(self, site: dict[str, Any], outcome: str, detail: str) -> dict[str, Any]:
-        until, reason = failure_hold(outcome, detail, time.time())
-        with self._lock:
-            holds = self._state.setdefault("site_holds", {})
-            holds = {key: value for key, value in holds.items() if value.get("until", 0) > time.time()}
-            previous = holds.get(str(site.get("id"))) or {}
-            pause = {"until": max(until, previous.get("until", 0)), "reason": reason,
-                     "site_name": str(site.get("name") or "未知站点")[:100]}
-            holds[str(site.get("id"))] = pause
-            self._state["site_holds"] = holds
-            self._save_state()
-        logger.warning(f"站点 {site.get('name')} {reason}，插件候选搜索暂停至 "
-                       f"{datetime.fromtimestamp(pause['until']).astimezone().isoformat(timespec='seconds')}")
-        return pause
-
     def _search_unfiltered(
         self, subscribe: Any, timings: Optional[dict[str, float]] = None, *, sites: Optional[list[int]] = None,
         diagnostics: Optional[dict[str, Any]] = None,
@@ -1048,8 +1030,10 @@ class SubscribeOverwatcher(_PluginBase):
         rounds = []
         supplemental_failed = False
         original_search: dict[str, Any] = {"checked": False, "resource_ids": []}
-        # 长等待只在当前扫描内共享，避免换查询词后反复等同一站；不产生持久错误冷却。
+        # 只在这一条订阅的本轮中停止失败站点和复用相同查询，其他订阅独立尝试。
+        failed_sites: dict[Any, dict[str, Any]] = {}
         budget_deferrals: dict[int, dict[str, Any]] = {}
+        request_cache: dict[tuple, list[Any]] = {}
 
         def search(name: str, *, focused: bool) -> list[Any]:
             if search_stop.is_set():
@@ -1069,9 +1053,10 @@ class SubscribeOverwatcher(_PluginBase):
                 return retained
 
             round_started = time.perf_counter()
-            chain = CandidateSearchChain(self._site_hold, self._hold_site, focused_season=season if focused else None,
-                                         budget_deferrals=budget_deferrals)
-            budget_shared = configure_candidate_budget(chain, lambda: search_stop.is_set() or not self._enabled)
+            chain = CandidateSearchChain(focused_season=season if focused else None,
+                                         failed_sites=failed_sites, budget_deferrals=budget_deferrals,
+                                         request_cache=request_cache,
+                                         cancelled=lambda: search_stop.is_set() or not self._enabled)
             original_arguments = {}
             if not focused:
                 original_arguments = {
@@ -1103,22 +1088,27 @@ class SubscribeOverwatcher(_PluginBase):
                            **counts, "result_count": len(result),
                            "site_keywords": list(dict.fromkeys(report["keyword"] for report in chain.site_reports
                                                                 if report.get("keyword"))),
-                           "budget_shared": budget_shared,
+                           "requests_paced": True,
+                           "request_count": sum(bool(report.get("attempted")) for report in chain.site_reports),
+                           "reused_request_count": sum(report.get("status") == "reused_in_round"
+                                                       for report in chain.site_reports),
                            "site_waits": [{"site_id": sid,
-                                           "site_name": (chain._budget_sites.get(sid) or {}).get("name"),
+                                           "site_name": next((report["site_name"] for report in chain.site_reports
+                                                              if report.get("site_id") == sid), "未知站点"),
                                            "seconds": round(seconds, 3)}
                                           for sid, seconds in chain.site_waits.items()],
                            "seconds": round(time.perf_counter() - round_started, 3)})
             logger.info(f"订阅 {subscribe.id} {'带季搜索' if focused else '原订阅搜索验证'}：{label}，"
                         f"媒体匹配 {counts['identified_count']} 条，目标季 {len(result)} 条")
-            # 同一站失败后，由请求边界跳过后续词；记录不包含 URL、Cookie 或响应原文。
-            failures = [item for item in chain.site_reports if item.get("reason")]
+            # 只汇总这一条订阅本轮的站点问题，不重复统计同站点的后续跳过。
+            failures = list({item["site_id"]: item for item in reversed(chain.site_reports)
+                             if item.get("reason")}.values())
             if not focused:
                 original_search.update(checked=True, keyword=keyword, search_imdbid=bool(getattr(subscribe, "search_imdbid", False)),
                                        custom_words=getattr(subscribe, "custom_words", None) or None,
                                        site_failures=failures)
             if failures and not result:
-                logger.warning(f"订阅 {subscribe.id} 本轮有 {len(failures)} 个站点请求失败或处于冷却")
+                logger.warning(f"订阅 {subscribe.id} 本轮有 {len(failures)} 个站点失败或暂缓；仅本条订阅本轮跳过后续查询")
             return result
 
         contexts = search(names[0], focused=True)
@@ -1147,7 +1137,7 @@ class SubscribeOverwatcher(_PluginBase):
         if search_stop.is_set():
             raise RuntimeError("插件搜索已停止")
         if diagnostics is not None:
-            failures = {item["site_id"]: item for item in site_reports if item.get("reason")}
+            failures = {item["site_id"]: item for item in reversed(site_reports) if item.get("reason")}
             diagnostics.update(rounds=rounds, site_failures=list(failures.values()), target_season=season,
                                supplemental_failed=supplemental_failed, resource_keywords=resource_keywords,
                                original_search=original_search)
@@ -1950,10 +1940,6 @@ class SubscribeOverwatcher(_PluginBase):
                 status = "manual" if config.get("refresh_search") else (
                     "cache_miss" if cached is None else "cached" if cached["contexts"] else "cached_empty"
                 )
-                paused = [pause for sid, pause in (self._state.get("site_holds") or {}).items()
-                          if pause.get("until", 0) > time.time() and (not sites or sid in {str(site) for site in sites})]
-                if status == "cached_empty" and paused:
-                    status = "cached_paused"
                 return {"success": True, "status": status, "search_sites": sites,
                         "search_result_count": len(cached["contexts"]) if cached is not None else None}
         except (ValueError, TypeError) as error:
@@ -2300,7 +2286,7 @@ class SubscribeOverwatcher(_PluginBase):
             if failures:
                 page.append({"component": "VAlert", "props": {
                     "type": "warning", "variant": "tonal",
-                    "text": "最近扫描有等待、失败或暂停的站点，结果可能不完整："
+                    "text": "本条订阅最近扫描有失败或暂缓的站点，仅本轮停止后续查询，结果可能不完整："
                             + "；".join(f"{item['site_name']}：{item['reason']}" for item in failures),
                 }})
             rows = [

@@ -51,7 +51,7 @@
               hide-details no-data-text="暂无已纳入管理的待确认剧集" />
             <p class="text-caption text-medium-emphasis mt-3 mb-0">
               没有候选的剧集也可选择。只重新搜索这一条剧集并更新版本列表，预览可复用扫描结果。
-              请求仍遵守系统共享的站点占用、访问间隔及冷却；已批准剧集可使用回刷资源预览。
+              各订阅独立扫描；失败仅影响本条订阅本轮，不对其他订阅设置失败冷却。请求仍遵守站点间隔和访问额度；已批准剧集可使用回刷资源预览。
             </p>
             <v-alert v-if="busy === 'scan'" type="info" variant="tonal" density="compact" class="mt-3"
               role="status" aria-live="polite">已触发所选剧集扫描；正在等待站点间隔、响应和资源解析，可能需要较长时间。</v-alert>
@@ -495,7 +495,6 @@ async function showSearchProgress(submitted) {
       cache_miss: '当前站点范围没有可复用缓存，已触发搜索；正在等待站点响应和资源解析，可能需要较长时间。',
       cached: '正在复用搜索缓存并按当前规则筛选，无需重新搜索站点。',
       cached_empty: '当前站点范围的搜索缓存为空，本次将复用空结果；建议手动重新搜索。',
-      cached_paused: '当前搜索缓存为空，相关站点仍在冷却期间；本次复用空结果，重新搜索也会跳过暂停的站点。',
     }
     previewProgress.value = status?.success && messages[status.status] ||
       '正在执行预览；缓存状态暂无法确认，若需要搜索，需等待站点响应和资源解析。'

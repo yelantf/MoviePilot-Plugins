@@ -383,6 +383,10 @@ def plugin_host(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, f"{name}.directory", directory_module)
     directory_spec.loader.exec_module(directory_module)
     spec.loader.exec_module(module)
+    adapter = sys.modules[module.CandidateSearchChain.__module__]
+    monkeypatch.setattr(adapter, "REQUEST_PACER", SimpleNamespace(
+        acquire=lambda _site, _cancelled: ("test-lease", 0), release=lambda *_args: None,
+    ))
     return SimpleNamespace(
         module=module, subscriptions=subscriptions, storage=storage, jobs=jobs,
         search_results=search_results, search_calls=search_calls, downloads=downloads,
@@ -2956,15 +2960,15 @@ def test_translated_site_keyword_retains_subscription_season_and_pack_query_stay
 
     monkeypatch.setattr(host.module.SearchChain, method, site_search, raising=False)
     site = {"id": 5, "name": "英文站点", "language": "en"}
-    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site, focused_season=season)
+    chain = host.module.CandidateSearchChain(focused_season=season)
     search = getattr(chain, method)
     # 模拟宿主把带季中文查询词替换为不带季的英文名。
     search(site=site, keyword="All Creatures Great and Small")
     search(site=site, keyword=f"All Creatures Great and Small S{season:02d}")
-    pack = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    pack = host.module.CandidateSearchChain()
     getattr(pack, method)(site=site, keyword="All Creatures Great and Small")
-    assert calls == [f"All Creatures Great and Small S{season:02d}",
-                     f"All Creatures Great and Small S{season:02d}", "All Creatures Great and Small"]
+    assert calls == [f"All Creatures Great and Small S{season:02d}", "All Creatures Great and Small"]
+    assert [report["status"] for report in chain.site_reports] == ["unknown", "reused_in_round"]
 
 
 def test_search_name_fallback_is_bounded_and_original_search_error_keeps_target_results(plugin_host, monkeypatch):
@@ -3071,22 +3075,19 @@ def test_native_search_setting_changed_after_preview_requires_another_preview(pl
     assert host.subscriptions[2].state == "S"
 
 
-@pytest.mark.parametrize("outcome,seconds", [("timeout", 900), ("rate_limited", 14400)])
-def test_site_failure_stops_later_queries_and_other_subscriptions_until_cooldown(
-    plugin_host, monkeypatch, outcome, seconds,
-):
+@pytest.mark.parametrize("outcome", ["timeout", "rate_limited"])
+def test_failed_site_is_only_skipped_for_current_subscription_round(plugin_host, monkeypatch, outcome):
     from contextlib import contextmanager
     host = plugin_host
     plugin = host.module.SubscribeOverwatcher()
+    host.storage["gate_state"] = {"baseline": 1, "entries": {},
+                                  "site_holds": {"5": {"until": 9999999999, "reason": "旧共享冷却"}}}
     plugin.init_plugin({"enabled": True})
-    now = [1000.0]
-    monkeypatch.setattr(host.module.time, "time", lambda: now[0])
-    observations = []
-    calls = []
+    observations, calls = [], []
 
     @contextmanager
     def capture():
-        observation = SimpleNamespace(outcome="skipped", error=None)
+        observation = SimpleNamespace(attempted=False, outcome="skipped", error=None)
         observations.append(observation)
         yield observation
 
@@ -3096,52 +3097,39 @@ def test_site_failure_stops_later_queries_and_other_subscriptions_until_cooldown
 
     def site_search(_self, **kwargs):
         calls.append(kwargs)
+        observations[-1].attempted = True
         observations[-1].outcome = outcome
         observations[-1].error = "HTTP 429 https://secret.example/?cookie=cookie-secret" if outcome == "rate_limited" else "超时"
         return []
 
     monkeypatch.setattr(host.module.SearchChain, "search_site_torrents", site_search, raising=False)
     site = {"id": 5, "name": "天空"}
-    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    failed_sites = {}
+    chain = host.module.CandidateSearchChain(failed_sites=failed_sites)
     assert chain.search_site_torrents(site=site, keyword="Show S07") == []
-    assert chain.search_site_torrents(site=site, keyword="Show") == []
+    later_query = host.module.CandidateSearchChain(failed_sites=failed_sites)
+    assert later_query.search_site_torrents(site=site, keyword="Show") == []
+    assert later_query.search_site_torrents(site=site, keyword="Show S07", page=1) == []
+    assert len(calls) == 1
+    assert later_query.site_reports[-1]["status"] == "skipped_in_round"
     restarted = host.module.SubscribeOverwatcher()
     restarted.init_plugin({"enabled": True})
-    another = host.module.CandidateSearchChain(restarted._site_hold, restarted._hold_site)
-    assert another.search_site_torrents(site=site, keyword="Other Show") == []
-    assert len(calls) == 1
-    assert chain.site_reports[-1]["status"] == "paused"
-    assert host.storage["gate_state"]["site_holds"]["5"]["until"] == 1000 + seconds
-    assert "cookie-secret" not in json.dumps(host.storage)
-    assert "secret.example" not in json.dumps(host.storage)
-    now[0] += seconds + 1
-    another.search_site_torrents(site=site, keyword="Show S07")
+    another_subscription = host.module.CandidateSearchChain()
+    assert another_subscription.search_site_torrents(site=site, keyword="Other Show") == []
     assert len(calls) == 2
+    assert "site_holds" not in host.storage["gate_state"]
+    assert "cookie-secret" not in json.dumps(failed_sites)
+    assert "secret.example" not in json.dumps(failed_sites)
 
 
-def test_explicit_site_restriction_deadline_is_respected(plugin_host):
-    from datetime import datetime
-    now = datetime.now().timestamp()
-    expected = int(now + 3600)
-    deadline = datetime.fromtimestamp(expected).strftime("%Y-%m-%d %H:%M:%S")
-    until, reason = plugin_host.module.failure_hold(
-        "error", f"系统侦测到您的账户存在异常的浏览行为，限制该功能访问至：{deadline}。", now,
-    )
-    assert until == expected
-    assert reason == "站点限制访问或登录失效"
-
-
-def test_host_deferral_stops_later_queries_before_waiting_for_site_budget(plugin_host, monkeypatch):
+def test_host_access_deferral_only_stops_current_subscription_round(plugin_host, monkeypatch):
     from contextlib import contextmanager
     host = plugin_host
-    plugin = host.module.SubscribeOverwatcher()
-    plugin.init_plugin({"enabled": True})
-    observations = []
-    budget_calls = []
+    observations, calls = [], []
 
     @contextmanager
     def capture():
-        observation = SimpleNamespace(outcome="skipped", error=None)
+        observation = SimpleNamespace(attempted=False, outcome="skipped", error=None)
         observations.append(observation)
         yield observation
 
@@ -3149,20 +3137,21 @@ def test_host_deferral_stops_later_queries_before_waiting_for_site_budget(plugin
     module.capture_site_search_observation = capture
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
-    def budget_search(_self, **kwargs):
-        budget_calls.append(kwargs)
+    def search(_self, **kwargs):
+        calls.append(kwargs)
         observations[-1].outcome = "deferred"
         observations[-1].error = "站点已达到请求额度"
         return []
 
-    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget", budget_search, raising=False)
+    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget", search, raising=False)
+    failed_sites = {}
     site = {"id": 5, "name": "天空"}
-    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    chain = host.module.CandidateSearchChain(failed_sites=failed_sites)
     assert chain._search_site_torrents_with_budget(site=site, keyword="Show S07") == []
     assert chain._search_site_torrents_with_budget(site=site, keyword="Show") == []
-    assert len(budget_calls) == 1
-    assert plugin._site_hold(site) is not None
-    assert chain.site_reports[-1]["status"] == "paused"
+    assert len(calls) == 1 and chain.site_reports[0]["attempted"] is False
+    assert host.module.CandidateSearchChain()._search_site_torrents_with_budget(site=site, keyword="Other") == []
+    assert len(calls) == 2
 
 
 def test_candidate_observation_preserves_host_failure_and_pagination_facts(plugin_host, monkeypatch):
@@ -3202,12 +3191,76 @@ def test_candidate_observation_preserves_host_failure_and_pagination_facts(plugi
         return []
 
     monkeypatch.setattr(host.module.SearchChain, "search_site_torrents", site_search, raising=False)
-    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site)
+    chain = host.module.CandidateSearchChain()
     with capture() as outer:
         assert chain.search_site_torrents(site={"id": 5, "name": "天空"}, keyword="Show S07") == []
     assert outer.attempted is True
     assert outer.outcome == "timeout" and outer.error == "请求超时"
     assert outer.raw_count == 7 and outer.has_more is False
+
+
+@pytest.mark.parametrize("outcome", ["success", "timeout", "deferred"])
+def test_candidate_native_page_path_uses_real_permit_once_and_preserves_outcome(plugin_host, monkeypatch, outcome):
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+    host = plugin_host
+    current = ContextVar("native_page_observation", default=None)
+    calls = []
+
+    @contextmanager
+    def capture():
+        observation = SimpleNamespace(attempted=False, outcome="skipped", error=None, raw_count=None, has_more=None)
+        token = current.set(observation)
+        try:
+            yield observation
+        finally:
+            current.reset(token)
+
+    def report(**kwargs):
+        if current.get() is not None:
+            current.get().__dict__.update(kwargs)
+
+    observation_module = ModuleType("app.application.site.observation")
+    observation_module.capture_site_search_observation = capture
+    observation_module.report_site_search_outcome = report
+    observation_module.report_site_search_page = report
+    monkeypatch.setitem(sys.modules, observation_module.__name__, observation_module)
+    exceptions = ModuleType("app.schemas.exception")
+    exceptions.RateLimitExceededException = type("RateLimitExceededException", (RuntimeError,), {})
+    monkeypatch.setitem(sys.modules, exceptions.__name__, exceptions)
+
+    def permit(site):
+        calls.append(("permit", site["id"]))
+        if outcome == "deferred":
+            raise exceptions.RateLimitExceededException("站点明确限制访问")
+
+    throttle = ModuleType("app.application.site.throttle")
+    throttle.wait_for_site_request = permit
+    monkeypatch.setitem(sys.modules, throttle.__name__, throttle)
+
+    def request(_self, **kwargs):
+        calls.append(("request", kwargs["keyword"]))
+        report(attempted=True, outcome=outcome, error="超时" if outcome == "timeout" else None)
+        report(raw_count=1, has_more=False)
+        return ["resource"] if outcome == "success" else []
+
+    monkeypatch.setattr(host.module.SearchChain, "search_site_torrents", request, raising=False)
+    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget",
+                        lambda *_args, **_kwargs: pytest.fail("不应进入共享预算或嵌套活动观察"), raising=False)
+    site = {"id": 5, "name": "天空"}
+    chain = host.module.CandidateSearchChain()
+    with capture() as outer:
+        result = chain._search_site_torrents_with_budget(site=site, keyword="Show S07")
+    assert result == (["resource"] if outcome == "success" else [])
+    assert outer.outcome == outcome and outer.attempted is (outcome != "deferred")
+    assert chain.site_reports[0]["status"] == outcome
+    if outcome != "deferred":
+        assert outer.raw_count == 1 and outer.has_more is False
+    chain._search_site_torrents_with_budget(site=site, keyword="Show S07")
+    assert calls == ([("permit", 5)] if outcome == "deferred"
+                     else [("permit", 5), ("request", "Show S07")])
+    host.module.CandidateSearchChain()._search_site_torrents_with_budget(site=site, keyword="Other")
+    assert sum(call[0] == "permit" for call in calls) == 2
 
 
 def test_manual_scan_selects_empty_pending_show_and_only_refreshes_that_show(plugin_host):
@@ -3321,148 +3374,145 @@ def test_cancelled_scan_does_not_search_more_keywords_or_replace_cache(plugin_ho
     assert not plugin._scan_lock.locked()
 
 
-def _install_budget_contract(host, monkeypatch):
-    """装配预算接口替身；用虚拟时钟验证适配器，不访问数据库和网络。"""
-    from datetime import datetime, timezone
-    now = [1000.0]
-    calls = []
-    sleeps = []
-
-    class Unavailable(RuntimeError):
-        def __init__(self, seconds, reason="cooldown"):
-            self.retry_at = datetime.fromtimestamp(now[0] + seconds, timezone.utc).isoformat()
-            self.wait_reason = reason
-
-    class Cancelled(RuntimeError):
-        pass
-
-    stop = SimpleNamespace(is_system_stopped=False)
-    repository = SimpleNamespace(claim=lambda _site, _interval: SimpleNamespace(acquired=True))
-
-    class Budget:
-        def __init__(self, *, repository, owner, cancelled, stop_state):
-            self.repository, self.owner = repository, owner
-            self.cancelled, self.stop_state = cancelled, stop_state
-
-        def acquire(self, site_id, *, minimum_interval=0):
-            if self.cancelled() or self.stop_state.is_system_stopped:
-                raise Cancelled()
-            calls.append((site_id, minimum_interval))
-            return self.repository.claim(site_id, minimum_interval)
-
-    module = ModuleType("app.application.subscription.sitebudget")
-    module.SubscriptionSiteBudget = Budget
-    module.SubscriptionSiteBudgetUnavailable = Unavailable
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    runtime = ModuleType("app.runtime.stop")
-    runtime.runtime_stop_state = stop
-    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
-    monkeypatch.setattr(host.module.SearchChain, "subscription_search_repository", repository, raising=False)
-    monkeypatch.setattr(host.module.SearchChain, "configure_subscription_site_budget",
-                        lambda chain, budget: setattr(chain, "budget", budget), raising=False)
+def _install_pacing_clock(host, monkeypatch):
     adapter = sys.modules[host.module.CandidateSearchChain.__module__]
+    now = [1000.0]
+    sleeps = []
     monkeypatch.setattr(adapter.time, "time", lambda: now[0])
     monkeypatch.setattr(adapter.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(adapter.random, "uniform", lambda lower, upper: (lower + upper) / 2)
 
     def sleep(seconds):
         sleeps.append(seconds)
         now[0] += seconds
 
     monkeypatch.setattr(adapter.time, "sleep", sleep)
-    monkeypatch.setattr(adapter.random, "uniform", lambda lower, upper: (lower + upper) / 2)
-    return SimpleNamespace(now=now, calls=calls, sleeps=sleeps, repository=repository, adapter=adapter,
-                           Unavailable=Unavailable, Cancelled=Cancelled, stop=stop)
+    return SimpleNamespace(adapter=adapter, now=now, sleeps=sleeps)
 
 
 @pytest.mark.parametrize("site_interval,expected", [(0, 15), (45, 45)])
-def test_budget_wait_retries_and_respects_random_and_configured_site_intervals(
-    plugin_host, monkeypatch, site_interval, expected,
-):
+def test_pacing_preserves_request_start_interval_across_subscription_rounds(plugin_host, monkeypatch, site_interval, expected):
+    contract = _install_pacing_clock(plugin_host, monkeypatch)
+    pacer = contract.adapter.CandidateRequestPacer()
+    site = {"id": 5, "name": "天空", "limit_seconds": site_interval}
+    token, waited = pacer.acquire(site, lambda: False)
+    assert waited == 0
+    contract.now[0] += 3
+    pacer.release(site, token)
+    token, waited = pacer.acquire(site, lambda: False)
+    assert contract.now[0] == 1000 + expected and waited == expected - 3
+    pacer.release(site, token)
+    token, waited = pacer.acquire({"id": 7}, lambda: False)
+    assert waited == 0
+    pacer.release({"id": 7}, token)
+
+
+def test_pacing_wait_can_be_cancelled_without_a_network_request(plugin_host, monkeypatch):
+    contract = _install_pacing_clock(plugin_host, monkeypatch)
+    pacer = contract.adapter.CandidateRequestPacer()
+    site = {"id": 5}
+    token, _waited = pacer.acquire(site, lambda: False)
+    pacer.release(site, token)
+    with pytest.raises(RuntimeError, match="插件搜索已停止"):
+        pacer.acquire(site, lambda: contract.now[0] >= 1002)
+    assert contract.now[0] == 1002
+
+
+def test_long_pacing_wait_only_defers_that_site_in_current_round(plugin_host, monkeypatch):
     host = plugin_host
-    contract = _install_budget_contract(host, monkeypatch)
-    holds = []
-    chain = host.module.CandidateSearchChain(lambda _site: None, lambda *args: holds.append(args))
-    chain._budget_sites[5] = {"id": 5, "name": "天空", "limit_seconds": site_interval}
+    contract = _install_pacing_clock(host, monkeypatch)
+    pacer = contract.adapter.CandidateRequestPacer()
+    site = {"id": 5, "name": "天空", "limit_seconds": 120}
+    token, _waited = pacer.acquire(site, lambda: False)
+    pacer.release(site, token)
+    calls = []
+    monkeypatch.setattr(host.module.SearchChain, "search_site_torrents",
+                        lambda _self, **kwargs: calls.append(kwargs) or ["resource"], raising=False)
+    chain = host.module.CandidateSearchChain(pacer=pacer)
+    assert chain.search_site_torrents(site=site, keyword="Show") == []
+    assert chain.search_site_torrents(site=site, keyword="Other alias") == []
+    assert chain.search_site_torrents(site={"id": 7}, keyword="Show") == ["resource"]
+    assert len(calls) == 1 and chain.site_reports[0]["status"] == "deferred"
+    contract.now[0] = 1120
+    assert host.module.CandidateSearchChain(pacer=pacer).search_site_torrents(site=site, keyword="Another subscription") == ["resource"]
+    assert len(calls) == 2
 
-    def claim(_site, _interval):
-        if contract.now[0] < 1003:
-            raise contract.Unavailable(1003 - contract.now[0])
-        return "lease"
 
-    contract.repository.claim = claim
-    assert host.module.configure_candidate_budget(chain, lambda: False)
-    assert chain.budget.acquire(5) == "lease"
-    assert contract.calls == [(5, expected)] * 4
-    assert chain.site_waits[5] == 3
-    assert contract.sleeps == [1, 1, 1]
-    assert holds == [] and chain.site_reports == []
+def test_active_request_wait_is_bounded_and_does_not_invent_a_retry_time(plugin_host, monkeypatch):
+    contract = _install_pacing_clock(plugin_host, monkeypatch)
+    pacer = contract.adapter.CandidateRequestPacer()
+    site = {"id": 5}
+    token, _waited = pacer.acquire(site, lambda: False)
+    with pytest.raises(contract.adapter.RequestDeferred) as error:
+        pacer.acquire(site, lambda: False)
+    assert contract.now[0] == 1060 and error.value.until is None
+    pacer.release(site, token)
+    token, waited = pacer.acquire(site, lambda: False)
+    assert waited == 0
+    pacer.release(site, token)
 
 
-def test_budget_busy_waits_for_completion_and_cancel_stops_within_one_second(plugin_host, monkeypatch):
+def test_same_actual_query_is_reused_in_round_but_other_pages_and_subscriptions_search(plugin_host, monkeypatch):
     host = plugin_host
-    contract = _install_budget_contract(host, monkeypatch)
-    chain = host.module.CandidateSearchChain(lambda _site: None, lambda *_args: None)
-
-    def claim(_site, _interval):
-        if contract.now[0] < 1002:
-            raise contract.Unavailable(900, "busy")
-        return "lease"
-
-    contract.repository.claim = claim
-    assert host.module.configure_candidate_budget(chain, lambda: contract.now[0] >= 1003)
-    assert chain.budget.acquire(5) == "lease"
-    contract.repository.claim = lambda *_args: (_ for _ in ()).throw(contract.Unavailable(10))
-    with pytest.raises(contract.Cancelled):
-        chain.budget.acquire(5)
-    assert contract.now[0] == 1003 and chain.site_waits[5] == 3
+    calls = []
+    monkeypatch.setattr(host.module.SearchChain, "search_site_torrents",
+                        lambda _self, **kwargs: calls.append(kwargs) or [f"page-{kwargs['page']}"], raising=False)
+    cache = {}
+    site = {"id": 5}
+    first = host.module.CandidateSearchChain(focused_season=7, request_cache=cache)
+    second = host.module.CandidateSearchChain(focused_season=7, request_cache=cache)
+    assert first.search_site_torrents(site=site, keyword="Show S07") == ["page-0"]
+    assert second.search_site_torrents(site=site, keyword="Show S07") == ["page-0"]
+    assert len(calls) == 1 and second.site_reports[-1]["status"] == "reused_in_round"
+    assert second.search_site_torrents(site=site, keyword="Show S07", page=1) == ["page-1"]
+    assert host.module.CandidateSearchChain().search_site_torrents(site=site, keyword="Show S07") == ["page-0"]
+    assert len(calls) == 3
 
 
-@pytest.mark.parametrize("reason,seconds", [("cooldown", 120), ("failing", 10), ("busy", 900)])
-def test_long_budget_wait_defers_same_site_for_remaining_queries_without_error_hold(
-    plugin_host, monkeypatch, reason, seconds,
-):
+def test_independent_search_does_not_configure_host_failure_budget_and_counts_unique_failures(plugin_host, monkeypatch):
+    from contextlib import contextmanager
     host = plugin_host
     plugin = host.module.SubscribeOverwatcher()
     plugin.init_plugin({"enabled": True})
-    contract = _install_budget_contract(host, monkeypatch)
-    shared_deferrals = {}
-    calls = []
+    calls, observations = [], []
+    monkeypatch.setattr(host.module.MediaChain, "recognize_media", lambda _self, **kwargs: SimpleNamespace(
+        title="剧集", en_title="Show", original_title="Show", names=[], season=None,
+        media_source=kwargs["media_source"], media_id=kwargs["media_id"], type=kwargs["mtype"],
+    ))
+    monkeypatch.setattr(host.module.SearchChain, "configure_subscription_site_budget",
+                        lambda *_args: pytest.fail("不应接入系统共享失败预算"), raising=False)
 
-    def budget_search(chain, **kwargs):
-        calls.append(kwargs["site"]["id"])
-        try:
-            chain.budget.acquire(kwargs["site"]["id"])
-        except contract.Unavailable:
-            return []
-        return ["resource"]
+    @contextmanager
+    def capture():
+        observation = SimpleNamespace(attempted=False, outcome="skipped", error=None)
+        observations.append(observation)
+        yield observation
 
-    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget", budget_search, raising=False)
-    contract.repository.claim = lambda site, _interval: (_ for _ in ()).throw(
-        contract.Unavailable(seconds, reason)) if site == 5 else "lease"
-    chain = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site,
-                                           budget_deferrals=shared_deferrals)
-    assert host.module.configure_candidate_budget(chain, lambda: False)
-    site = {"id": 5, "name": "天空"}
-    assert chain._search_site_torrents_with_budget(site=site, keyword="Show S01") == []
-    assert sum(contract.sleeps) == (60 if reason == "busy" else 0)
-    another = host.module.CandidateSearchChain(plugin._site_hold, plugin._hold_site,
-                                             budget_deferrals=shared_deferrals)
-    assert host.module.configure_candidate_budget(another, lambda: False)
-    assert another._search_site_torrents_with_budget(site=site, keyword="Show") == []
-    assert another._search_site_torrents_with_budget(site={"id": 7}, keyword="Show") == ["resource"]
-    assert calls == [5, 7]
-    assert plugin._site_hold(site) is None
-    assert another.site_reports[-1]["status"] == "deferred"
+    module = ModuleType("app.application.site.observation")
+    module.capture_site_search_observation = capture
+    monkeypatch.setitem(sys.modules, module.__name__, module)
 
+    def request(_chain, **kwargs):
+        assert _chain._subscription_site_budget is None
+        calls.append(kwargs)
+        observations[-1].attempted = True
+        observations[-1].outcome = "timeout" if len(calls) == 1 else "success"
+        observations[-1].error = "超时" if len(calls) == 1 else None
+        return [] if len(calls) == 1 else [_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM")]
 
-def test_budget_missing_interface_safely_keeps_legacy_search(plugin_host, monkeypatch):
-    host = plugin_host
-    chain = host.module.CandidateSearchChain(lambda _site: None, lambda *_args: None)
-    assert host.module.configure_candidate_budget(chain, lambda: False) is False
-    contract = _install_budget_contract(host, monkeypatch)
-    monkeypatch.setattr(sys.modules["app.application.subscription.sitebudget"].SubscriptionSiteBudget,
-                        "acquire", lambda self, site_id: "legacy")
-    assert host.module.configure_candidate_budget(chain, lambda: False) is False
+    def process(chain, **kwargs):
+        contexts = chain._search_site_torrents_with_budget(site={"id": 5, "name": "天空"},
+                                                          keyword=kwargs.get("keyword") or "剧集")
+        return kwargs["candidate_filter"](contexts)
+
+    monkeypatch.setattr(host.module.SearchChain, "_search_site_torrents_with_budget", request, raising=False)
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    first_diagnostics, second_diagnostics = {}, {}
+    assert plugin._search_unfiltered(_subscribe(2), diagnostics=first_diagnostics) == []
+    assert len(calls) == 1 and len(first_diagnostics["site_failures"]) == 1
+    assert sum(item["request_count"] for item in first_diagnostics["rounds"]) == 1
+    assert plugin._search_unfiltered(_subscribe(3), diagnostics=second_diagnostics)
+    assert len(calls) == 3 and second_diagnostics["site_failures"] == []
 
 
 def test_stop_event_stays_cancelled_after_plugin_is_enabled_again(plugin_host):

@@ -174,17 +174,19 @@ describe('custom configuration actions', () => {
     wrapper.unmount()
   })
 
-  it('shows shared budget waiting separately from a failed site', () => {
+  it('shows paced requests, in-round reuse and actual failures without a fictitious retry time', () => {
     const preview = { ...previewSnapshot(''), search_diagnostics: {
       rounds: [{ keyword: 'Show S07', kind: 'target_season', identified_count: 1, result_count: 1,
-        seconds: 17, budget_shared: true, site_waits: [{ site_id: 5, site_name: '天空', seconds: 15 }] }],
-      site_failures: [{ site_id: 7, site_name: '另一站', reason: '站点搜索间隔尚未结束，本轮暂缓', until: 1800000000 }],
+        seconds: 17, requests_paced: true, request_count: 2, reused_request_count: 1,
+        site_waits: [{ site_id: 5, site_name: '天空', seconds: 15 }] }],
+      site_failures: [{ site_id: 7, site_name: '另一站', reason: '站点请求超时' }],
     } }
     const wrapper = mount(PreviewResults, { props: { preview }, global: { components } })
-    expect(wrapper.text()).toContain('请求共用系统站点间隔')
+    expect(wrapper.text()).toContain('请求遵守站点间隔；实际请求 2 次，复用相同查询 1 次')
     expect(wrapper.text()).toContain('天空 等待 15.00 秒')
-    expect(wrapper.text()).toContain('最早可重试')
-    expect(wrapper.text()).toContain('另一站：站点搜索间隔尚未结束，本轮暂缓')
+    expect(wrapper.text()).not.toContain('最早可重试')
+    expect(wrapper.text()).toContain('另一站：站点请求超时')
+    expect(wrapper.text()).toContain('其他订阅独立尝试')
     wrapper.unmount()
   })
 
