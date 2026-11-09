@@ -2,12 +2,12 @@
   <div class="preview-results" tabindex="-1" aria-label="规则预览结果">
     <div class="text-subtitle-1 mb-2">预览结果：通过 {{ preview.matched_count }} 条，排除 {{ preview.rejected_count }} 条</div>
     <v-alert v-if="stale" type="warning" variant="tonal" density="compact" class="mb-3">
-      规则、站点或目录已修改；以下是上次预览，请重新预览后确认。
+      搜索词、规则、站点或目录已修改；以下是上次预览，请重新预览后确认。
     </v-alert>
-    <v-alert v-if="preview.search_keyword_notice" :type="preview.search_keyword_verified ? 'info' : 'warning'"
+    <v-alert v-if="preview.search_keyword_notice" :type="preview.keyword_choice_auto_changed || !preview.search_keyword_verified ? 'warning' : 'info'"
       variant="tonal" density="compact" class="mb-3">
       <div>确认后的订阅搜索词：<strong>{{ preview.search_keyword || '默认使用剧名及别名' }}</strong>
-        （{{ preview.keyword_choice?.startsWith('keyword:') ? '手动选择' :
+        （{{ preview.keyword_choice_auto_changed ? '预览自动切换' : preview.keyword_choice === 'seasonal' ? '手动选择剧名＋季号' :
           preview.search_keyword_changed ? '调整' : '保持原设置' }}）</div>
       <div v-if="preview.search_keyword_changed">原搜索词：{{ preview.original_search_keyword || '默认使用剧名及别名' }}。</div>
       {{ preview.search_keyword_notice }}

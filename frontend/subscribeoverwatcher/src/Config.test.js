@@ -373,7 +373,7 @@ describe('custom configuration actions', () => {
     window.HTMLElement.prototype.scrollIntoView = previousScroll
   })
 
-  it('selects a verified keyword and marks the preview stale when the choice changes', async () => {
+  it('offers only original and seasonal search, and marks the preview stale when the choice changes', async () => {
     const data = candidateSnapshot()
     const candidate = data.conf[0].content.find(node => node.props?.model === 'candidate')
     candidate.props.items[0].verified_keywords = ['Show S01']
@@ -384,7 +384,7 @@ describe('custom configuration actions', () => {
         const preview = {
           ...previewSnapshot(submitted.rule_json), keyword_choice: submitted.keyword_choice,
           search_keyword: 'Show S01', search_keyword_changed: true,
-          search_keyword_verified: true, search_keyword_notice: '已手动选择已验证搜索词。',
+          search_keyword_verified: true, search_keyword_notice: '已手动选择剧名＋季号搜索词。',
         }
         data.model._candidate_preview = preview
         data.model.keyword_choice = submitted.keyword_choice
@@ -396,16 +396,61 @@ describe('custom configuration actions', () => {
       global: { components: { ...components, VSelect: Select } } })
     await flushPromises()
     const choice = wrapper.find('select[aria-label="确认后的订阅搜索词"]')
-    expect(choice.text()).toContain('使用已验证词：Show S01')
-    await choice.setValue('keyword:Show S01')
+    expect(choice.text()).toContain('沿用原订阅搜索方式')
+    expect(choice.text()).toContain('使用剧名＋季号搜索词')
+    expect(choice.text()).not.toContain('自动判断')
+    expect(choice.text()).not.toContain('使用已验证词')
+    await choice.setValue('seasonal')
     await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
     await flushPromises()
-    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'preview', keyword_choice: 'keyword:Show S01' })
-    expect(wrapper.find('.preview-results').text()).toContain('手动选择')
+    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'preview', keyword_choice: 'seasonal' })
+    expect(wrapper.find('.preview-results').text()).toContain('手动选择剧名＋季号')
+    expect(choice.classes()).not.toContain('preview-auto-changed')
     expect(wrapper.text()).not.toContain('以下是上次预览')
     await choice.setValue('original')
     expect(wrapper.text()).toContain('以下是上次预览')
     wrapper.unmount()
+  })
+
+  it('shows the search box change and uses the preview-selected choice for confirmation', async () => {
+    const data = candidateSnapshot()
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(async (url, submitted) => {
+        if (url.endsWith('/preview-status')) return { success: true, status: 'cached' }
+        if (submitted.operation === 'preview') {
+          const preview = { ...previewSnapshot(submitted.rule_json), keyword_choice: 'seasonal',
+            keyword_choice_auto_changed: true, search_keyword: 'Show S01',
+            search_keyword_changed: true, search_keyword_verified: true,
+            search_keyword_notice: '预览已自动切换为剧名＋季号搜索词。' }
+          data.model._candidate_preview = preview
+          data.model.keyword_choice = 'seasonal'
+          return { success: true, message: '预览完成', preview }
+        }
+        return { success: true, message: '确认完成' }
+      }),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    const choice = wrapper.find('select[aria-label="确认后的订阅搜索词"]')
+    expect(choice.element.value).toBe('original')
+    await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
+    await flushPromises()
+    expect(choice.element.value).toBe('seasonal')
+    expect(choice.classes()).toContain('preview-auto-changed')
+    expect(wrapper.text()).toContain('预览已自动切换搜索词为“使用剧名＋季号搜索词”')
+    expect(wrapper.text()).not.toContain('以下是上次预览')
+    await wrapper.findAll('button').find(button => button.text() === '确认并恢复').trigger('click')
+    await flushPromises()
+    expect(applyCalls(api)[1][1]).toMatchObject({ operation: 'confirm', keyword_choice: 'seasonal' })
+    wrapper.unmount()
+    const reopened = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    expect(reopened.find('select[aria-label="确认后的订阅搜索词"]').element.value).toBe('seasonal')
+    expect(reopened.find('select[aria-label="确认后的订阅搜索词"]').classes()).toContain('preview-auto-changed')
+    reopened.unmount()
   })
 
   it.each([false, true])('shows rule group comparison and only switches the draft after all matches are filtered (automatic: %s)', async automatic => {
@@ -437,6 +482,8 @@ describe('custom configuration actions', () => {
     expect(text).toContain('系统默认： 严格规则组')
     expect(text.includes('已自动选择')).toBe(automatic)
     expect(wrapper.find('select[aria-label="规则组"]').element.value).toBe(automatic ? '@no-groups' : '@subscription')
+    expect(wrapper.find('select[aria-label="规则组"]').classes().includes('preview-auto-changed')).toBe(automatic)
+    expect(wrapper.text().includes('预览已自动切换规则组为“不使用规则组”')).toBe(automatic)
     expect(wrapper.text()).not.toContain('以下是上次预览')
     expect(wrapper.text()).toContain('结果不符合预期时可选择“不使用规则组”')
     expect(api.post.mock.calls.filter(([url]) => url.endsWith('/apply'))).toHaveLength(1)

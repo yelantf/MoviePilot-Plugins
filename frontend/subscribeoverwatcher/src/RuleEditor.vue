@@ -25,7 +25,11 @@
       <v-col cols="12" md="6">
         <v-select :model-value="groupSelection" :items="groupOptions" label="规则组" :disabled="disabled"
           density="comfortable" :hint="groupHint" persistent-hint
+          :class="{ 'preview-auto-changed': groupAutoChanged }"
           @update:model-value="updateRule('filter_groups', $event === NO_GROUPS ? [] : { subscription: true })" />
+        <p v-if="groupAutoChanged" class="text-warning font-weight-bold mt-2 mb-0" role="status">
+          预览已自动切换规则组为“不使用规则组”；确认后才会修改订阅。
+        </p>
       </v-col>
     </v-row>
     <div class="d-flex justify-end mt-2">
@@ -47,6 +51,7 @@ const props = defineProps({
   candidate: { type: Object, default: () => ({}) },
   options: { type: Object, default: () => ({}) },
   disabled: { type: Boolean, default: false },
+  groupAutoChanged: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue'])
 const KEEP = '@subscription'
@@ -155,3 +160,12 @@ watch(() => props.candidate.value, () => {
   for (const field of specFields) customEditing[field.name] = false
 })
 </script>
+
+<style scoped>
+.preview-auto-changed :deep(.v-field) {
+  outline: 3px solid rgb(var(--v-theme-warning));
+  outline-offset: 2px;
+  border-radius: 6px;
+  background-color: rgba(var(--v-theme-warning), 0.12);
+}
+</style>

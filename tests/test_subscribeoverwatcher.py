@@ -3088,6 +3088,8 @@ def test_confirmation_keeps_original_search_unless_only_season_search_recalls_se
     assert plugin.preview_candidate(choice)[0]
     preview = host.storage["gate_state"]["entries"]["2"]["preview"]
     assert preview["search_keyword_changed"] is change_keyword
+    assert preview["keyword_choice"] == ("seasonal" if change_keyword else "original")
+    assert preview["keyword_choice_auto_changed"] is change_keyword
     assert preview["search_keyword_verified"] is True
     assert preview["search_keyword"] == ("Show S01" if change_keyword else "Custom Original Search")
     assert subscribe.keyword == "Custom Original Search" and subscribe.search_imdbid is True
@@ -3099,26 +3101,29 @@ def test_confirmation_keeps_original_search_unless_only_season_search_recalls_se
     submitted_search = []
     monkeypatch.setattr(host.module.SubscribeChain, "search", lambda _self, **kwargs: submitted_search.append(
         (host.subscriptions[kwargs["sid"]].keyword, host.subscriptions[kwargs["sid"]].search_imdbid)))
-    assert plugin.confirm_candidate(choice)[0]
+    if change_keyword:
+        assert plugin.confirm_candidate(choice)[0] is False
+    assert plugin.confirm_candidate(choice, keyword_choice=preview["keyword_choice"])[0]
     plugin._search_approved(2)
     assert submitted_search == [("Show S01" if change_keyword else "Custom Original Search", not change_keyword)]
 
 
-def test_manual_verified_keyword_can_override_recalled_original_search(plugin_host):
-    """用户可选已召回当前版本的词，预览核对后才覆盖原订阅搜索方式。"""
+def test_manual_seasonal_keyword_can_override_recalled_original_search(plugin_host):
+    """用户可选本轮带季词，预览核对后才覆盖原订阅搜索方式。"""
     host = plugin_host
     plugin, choice, _chosen = _prepare_directory_confirmation(host)
     subscribe = host.subscriptions[2]
     subscribe.search_imdbid = True
     option = next(item for item in _form_items(plugin, "candidate") if item["value"] == choice)
     keyword = option["verified_keywords"][0]
-    selection = f"keyword:{keyword}"
-    assert {item["value"] for item in _form_items(plugin, "keyword_choice")} >= {"auto", "original", selection}
+    selection = "seasonal"
+    assert {item["value"] for item in _form_items(plugin, "keyword_choice")} == {"original", "seasonal"}
 
     success, _message, draft = plugin.preview_candidate(choice, keyword_choice=selection)
     assert success
     preview = plugin._state["entries"]["2"]["preview"]
     assert preview["keyword_choice"] == selection
+    assert preview["keyword_choice_auto_changed"] is False
     assert preview["search_keyword"] == keyword
     assert preview["search_keyword_changed"] is True
     assert preview["matched_count"] == 1
@@ -3128,12 +3133,46 @@ def test_manual_verified_keyword_can_override_recalled_original_search(plugin_ho
     assert subscribe.keyword == keyword and subscribe.search_imdbid is False
 
 
-def test_manual_keyword_must_have_recalled_selected_version(plugin_host):
-    """任意拼写不能伪装成已验证搜索词写回订阅。"""
+def test_preview_operation_saves_automatically_selected_seasonal_choice(plugin_host, monkeypatch):
+    """操作入口把预览自动切换后的选项保存给界面，确认不再提交旧选项。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    subscribe = host.subscriptions[2]
+    subscribe.keyword = "Original Only"
+
+    def process(_self, **kwargs):
+        result = [] if kwargs["keyword"] == "Original Only" else [chosen]
+        return kwargs["candidate_filter"](result)
+
+    monkeypatch.setattr(host.module.SearchChain, "process", process)
+    plugin.init_plugin({"enabled": True, "operation": "preview", "candidate": choice,
+                        "keyword_choice": "original", "refresh_search": True})
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["keyword_choice"] == "seasonal"
+    assert preview["keyword_choice_auto_changed"] is True
+    assert host.storage["config"]["keyword_choice"] == "seasonal"
+    assert subscribe.keyword == "Original Only"
+
+
+@pytest.mark.parametrize("old_choice,new_choice", [
+    ("auto", "original"), ("keyword:Show S01", "seasonal"),
+])
+def test_legacy_search_choice_is_migrated_to_one_of_two_options(plugin_host, old_choice, new_choice):
+    plugin = plugin_host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True, "keyword_choice": old_choice})
+    assert plugin_host.storage["config"]["keyword_choice"] == new_choice
+
+
+def test_seasonal_keyword_must_have_recalled_selected_version(plugin_host):
+    """带季词必须由当前站点范围的搜索实际召回版本。"""
     host = plugin_host
     plugin, choice, _chosen = _prepare_directory_confirmation(host)
-    success, message, _draft = plugin.preview_candidate(choice, keyword_choice="keyword:unverified search")
+    diagnostics = next(iter(plugin._preview_search_cache.values()))["diagnostics"]
+    diagnostics["resource_keywords"] = {}
+    success, message, _draft = plugin.preview_candidate(choice, keyword_choice="seasonal")
     assert success is False and "未在最新搜索中召回" in message
+    success, message, _draft = plugin.preview_candidate(choice, keyword_choice="keyword:unverified search")
+    assert success is False and "只能选择" in message
     assert getattr(host.subscriptions[2], "keyword", None) is None
 
 
@@ -3149,13 +3188,11 @@ def test_manual_keyword_preview_excludes_resources_only_found_by_other_queries(p
 
     monkeypatch.setattr(host.module.SearchChain, "process", process)
     plugin.refresh_candidates()
-    candidate = next(item for item in _form_items(plugin, "candidate") if item["value"] == choice)
-    keyword = candidate["verified_keywords"][0]
-    assert plugin.preview_candidate(choice, keyword_choice=f"keyword:{keyword}")[0]
+    assert plugin.preview_candidate(choice, keyword_choice="seasonal")[0]
     preview = plugin._state["entries"]["2"]["preview"]
     assert preview["matched_count"] == 1
     assert preview["rejected_count"] == 1
-    assert preview["rejected"][0]["reason"] == "未由手动选择的搜索词召回"
+    assert preview["rejected"][0]["reason"] == "未由确认后使用的搜索词召回"
 
 
 def test_keep_original_keyword_choice_requires_original_search_to_recall_candidate(plugin_host):
@@ -3166,12 +3203,15 @@ def test_keep_original_keyword_choice_requires_original_search_to_recall_candida
     assert plugin._state["entries"]["2"]["preview"]["search_keyword_changed"] is False
     host.search_results.clear()
     assert plugin.scan_subscription("2")[0]
-    success, message, _draft = plugin.preview_candidate(choice, keyword_choice="original")
-    assert success is False and "原订阅搜索未召回" in message
+    assert plugin.preview_candidate(choice, keyword_choice="original")[0]
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["keyword_choice"] == "original"
+    assert preview["matched_count"] == 0
+    assert plugin.confirm_candidate(choice)[0] is False
 
 
 @pytest.mark.parametrize("reason", ["timeout", "budget_wait", "missing_observation", "changed_original_keyword"])
-def test_failed_or_unverified_original_search_does_not_replace_subscription_keyword(plugin_host, reason):
+def test_failed_or_unverified_original_search_does_not_auto_replace_subscription_keyword(plugin_host, reason):
     host = plugin_host
     plugin, choice, _chosen = _prepare_directory_confirmation(host)
     diagnostics = next(iter(plugin._preview_search_cache.values()))["diagnostics"]
@@ -3188,8 +3228,12 @@ def test_failed_or_unverified_original_search_does_not_replace_subscription_keyw
     assert preview["search_keyword_changed"] is False
     assert preview["search_keyword_verified"] is False
     assert "不能判断必须加季号" in preview["search_keyword_notice"]
-    assert plugin.confirm_candidate(choice)[0]
-    assert getattr(host.subscriptions[2], "keyword", None) is None
+    assert preview["matched_count"] == 0
+    assert plugin.confirm_candidate(choice)[0] is False
+    assert plugin.preview_candidate(choice, keyword_choice="seasonal")[0]
+    seasonal_keyword = plugin._state["entries"]["2"]["preview"]["search_keyword"]
+    assert plugin.confirm_candidate(choice, keyword_choice="seasonal")[0]
+    assert host.subscriptions[2].keyword == seasonal_keyword
 
 
 @pytest.mark.parametrize("field,value", [("keyword", "Changed Search"), ("search_imdbid", True)])
