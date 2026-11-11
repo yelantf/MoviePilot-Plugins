@@ -105,9 +105,13 @@
                   :disabled="!!busy" density="comfortable" hide-details @update:model-value="updateSiteScope" />
               </v-col>
             </v-row>
+            <v-select v-if="form.rule_mode === 'custom'" v-model="form.rule_sites" label="自选站点（可多选）"
+              :items="options.rule_sites" multiple chips closable-chips clearable :disabled="!!busy || !selectedCandidate"
+              density="comfortable" hint="至少选一个站点；预览只搜索所选站点，确认后写入订阅。"
+              persistent-hint class="mt-3" @update:model-value="updateCustomSites" />
             <v-select v-model="form.keyword_choice" label="确认后的订阅搜索词"
               :items="keywordChoices" :disabled="!!busy || !selectedCandidate" density="comfortable"
-              hint="剧名＋季号搜索词如“Show S01”；选择后预览会验证它能否召回所选版本。"
+              hint="剧名＋季号搜索词如“Show S01”；预览会验证它能否召回所选范围内符合规则的资源。"
               persistent-hint class="mt-3 mb-4" :class="{ 'preview-auto-changed': keywordPreviewAutoChanged }" />
             <p v-if="keywordPreviewAutoChanged" class="text-warning font-weight-bold mt-n2 mb-4" role="status">
               预览已自动切换搜索词为“使用剧名＋季号搜索词”；确认后才会修改订阅。
@@ -133,9 +137,11 @@
             <v-alert v-if="form.download_directory && !selectedDownloadDirectory" type="warning"
               variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
             <rule-editor v-if="selectedCandidate" v-model="form.rule_json" :candidate="selectedCandidate"
-              :options="ruleOptions" :disabled="!!busy" :group-auto-changed="groupPreviewAutoChanged" />
+              :options="ruleOptions" :site-options="options.rule_sites" :site-mode="form.rule_mode"
+              :selected-site-ids="form.rule_sites" :disabled="!!busy"
+              :group-auto-changed="groupPreviewAutoChanged" />
             <p class="text-caption text-medium-emphasis mt-2 mb-0">
-              只用所选站点时，预览仅搜索和筛选该站；“不限站点”保留其他规则选项。
+              可选候选站点、自选多个站点或不限站点；预览按所选范围搜索和筛选。
               搜索缓存持久保存，重启和更新后继续复用对应站点范围的最新结果；每次重新核对规则和下载目录，点击“重新搜索”获取新资源。
               默认沿用原订阅搜索方式；原搜索正常完成却未命中、剧名加季号查询命中时，预览会切换到剧名＋季号搜索词并标出改动。
               确认后的候选和确认预览保留 24 小时，期满后定期清理。
@@ -148,12 +154,12 @@
           </v-card-text>
           <v-card-actions class="px-4 pb-4 flex-wrap ga-2">
             <v-spacer />
-            <v-btn v-if="selectedPreview" variant="text" :disabled="!!busy || !selectedCandidate"
+            <v-btn v-if="selectedPreview" variant="text" :disabled="!!busy || !selectedCandidate || siteSelectionMissing"
               @click="submit('preview', true)">重新搜索并预览</v-btn>
             <v-btn color="info" variant="tonal" :loading="busy === 'preview'"
-              :disabled="!!busy || !selectedCandidate" @click="submit('preview')">预览匹配</v-btn>
+              :disabled="!!busy || !selectedCandidate || siteSelectionMissing" @click="submit('preview')">预览匹配</v-btn>
             <v-btn color="primary" variant="tonal" :loading="busy === 'confirm'"
-              :disabled="!!busy || !selectedCandidate" @click="submit('confirm')">确认并恢复</v-btn>
+              :disabled="!!busy || !selectedCandidate || siteSelectionMissing" @click="submit('confirm')">确认并恢复</v-btn>
           </v-card-actions>
         </v-card>
 
@@ -263,7 +269,7 @@ import DataPage from './Page.vue'
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
   'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
-  'historical_subscription', 'scan_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_json', 'keyword_choice', 'download_directory',
+  'historical_subscription', 'scan_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_sites', 'rule_json', 'keyword_choice', 'download_directory',
   'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
 ]
@@ -274,6 +280,7 @@ const sections = {
 }
 const ruleModes = [
   { title: '只用所选站点', value: 'candidate' },
+  { title: '自选站点', value: 'custom' },
   { title: '不限站点', value: 'all_sites' },
 ]
 
@@ -287,7 +294,7 @@ const form = reactive({
   enabled: false, confirm_full_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
   scan_subscription: '',
-  candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_json: '', keyword_choice: 'original',
+  candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_sites: [], rule_json: '', keyword_choice: 'original',
   download_directory: '',
   direct_subscription: '', revoke_subscription: '',
   replace_subscription: '', replace_resource: '', replace_episodes: '',
@@ -296,6 +303,7 @@ const options = reactive({
   notice_hour: [], notice_minute: [], historical_subscription: [],
   scan_subscription: [],
   candidate_subscription: [], candidate: [],
+  rule_sites: [],
   download_directory: [],
   direct_subscription: [], revoke_subscription: [], replace_subscription: [], replace_resource: [],
 })
@@ -319,6 +327,7 @@ function candidateSubscriptionId(item) {
 const candidateChoices = computed(() => options.candidate.filter(item =>
   form.candidate_subscription && candidateSubscriptionId(item) === form.candidate_subscription))
 const selectedCandidate = computed(() => candidateChoices.value.find(item => item.value === form.candidate))
+const siteSelectionMissing = computed(() => form.rule_mode === 'custom' && !form.rule_sites.length)
 const keywordChoices = [
   { title: '沿用原订阅搜索方式', value: 'original' },
   { title: '使用剧名＋季号搜索词', value: 'seasonal' },
@@ -342,6 +351,7 @@ function draftKey(raw) {
     if (!changes || Array.isArray(changes) || typeof changes !== 'object') return null
     const rules = { ...selectedCandidate.value?.rules, ...changes }
     if (form.rule_mode === 'all_sites') rules.sites = []
+    if (form.rule_mode === 'custom') rules.sites = [...form.rule_sites].sort((a, b) => a - b)
     return JSON.stringify(Object.entries(rules).sort(([a], [b]) => a.localeCompare(b)))
   } catch { return null }
 }
@@ -358,6 +368,7 @@ function selectCandidateSubscription(subscription) {
   form.candidate_subscription = subscription || ''
   form.candidate = ''
   form.rule_json = ''
+  form.rule_sites = []
   form.keyword_choice = 'original'
   form.download_directory = ''
   handoffNotice.value = ''
@@ -367,24 +378,35 @@ function selectCandidate(candidate) {
   form.candidate = candidate || ''
   const rules = selectedCandidate.value?.rules || {}
   form.rule_json = Object.keys(rules).length ? JSON.stringify(rules, null, 2) : ''
+  form.rule_sites = [...(rules.sites || [])]
   form.keyword_choice = 'original'
-  if (form.rule_mode === 'all_sites') updateSiteScope(form.rule_mode)
+  if (form.rule_mode !== 'candidate') updateSiteScope(form.rule_mode)
   handoffNotice.value = ''
 }
 
-function updateSiteScope(mode) {
+function updateSiteScope(mode, restoreDefault = true) {
   if (!keywordChoices.some(item => item.value === form.keyword_choice)) form.keyword_choice = 'original'
   if (!selectedCandidate.value && !form.rule_json) return
   try {
     const rules = form.rule_json.trim() ? JSON.parse(form.rule_json) : { ...selectedCandidate.value?.rules }
     if (!rules || Array.isArray(rules) || typeof rules !== 'object') throw new Error('invalid draft')
-    rules.sites = mode === 'all_sites' ? [] : selectedCandidate.value?.rules?.sites ?? null
+    if (mode === 'custom' && restoreDefault && !form.rule_sites.length) {
+      form.rule_sites = [...(selectedCandidate.value?.rules?.sites || [])]
+    }
+    rules.sites = mode === 'all_sites' ? []
+      : mode === 'custom' ? [...form.rule_sites]
+      : selectedCandidate.value?.rules?.sites ?? null
     form.rule_json = JSON.stringify(rules, null, 2)
   } catch {
     feedback.section = 'candidate'
     feedback.type = 'warning'
     feedback.text = '已保存的规则无法读取，请重置为候选规则或重新选择版本。'
   }
+}
+
+function updateCustomSites(sites) {
+  form.rule_sites = Array.isArray(sites) ? [...sites] : []
+  updateSiteScope('custom', false)
 }
 watch(() => form.replace_subscription, (subscription, previous) => {
   if (previous && subscription !== previous) {
@@ -414,6 +436,7 @@ function applySnapshot(snapshot, { preserveForm = false } = {}) {
     if (!Array.isArray(form.historical_subscription)) {
       form.historical_subscription = form.historical_subscription ? [form.historical_subscription] : []
     }
+    if (!Array.isArray(form.rule_sites)) form.rule_sites = []
   }
   walk(source.conf, node => {
     const name = node.props?.model
@@ -459,6 +482,7 @@ function applyCandidateSelection(candidateId = takeCandidateSelection()) {
   form.candidate_subscription = subscriptionId
   form.candidate = candidateId
   form.rule_mode = 'candidate'
+  form.rule_sites = [...(candidate.rules?.sites || [])]
   form.keyword_choice = 'original'
   form.rule_json = Object.keys(candidate.rules || {}).length
     ? JSON.stringify(candidate.rules, null, 2) : ''

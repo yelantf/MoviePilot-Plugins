@@ -39,7 +39,7 @@ def plugin_host(monkeypatch, tmp_path):
     group_filter_calls = []
     system_values = {}
 
-    for name in ("app", "app.application", "app.application.torrent", "app.chain",
+    for name in ("app", "app.application", "app.application.torrent", "app.application.site", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
         package = ModuleType(name)
         package.__path__ = []
@@ -334,6 +334,11 @@ def plugin_host(monkeypatch, tmp_path):
         },
         "app.schemas.file": {"FileURI": FileURI},
         "app.application.torrent.download": {"TorrentHelper": TorrentHelper},
+        "app.application.site.sites": {"SitesHelper": lambda: SimpleNamespace(get_indexers=lambda: [
+            {"id": 5, "name": "样例站", "is_active": True},
+            {"id": 7, "name": "另一个站", "is_active": True},
+            {"id": 9, "name": "已停用站", "is_active": False},
+        ])},
         "app.chain.download": {"DownloadChain": DownloadChain},
         "app.chain.media": {"MediaChain": MediaChain},
         "app.chain.search": {"SearchChain": SearchChain},
@@ -2055,6 +2060,85 @@ def test_all_sites_mode_clears_site_filter_and_keeps_candidate_specs(plugin_host
     assert subscribe.effect == "HDR"
     assert subscribe.include == "TEAM"
     assert host.storage["config"]["rule_mode"] == "candidate"
+
+
+def test_custom_sites_can_confirm_without_the_candidates_original_site(plugin_host):
+    """候选仅作规则模板；所选其他站点有符合规则的资源时允许确认。"""
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    other_site = copy.deepcopy(chosen)
+    other_site.torrent_info.site = 7
+    other_site.torrent_info.site_name = "另一个站"
+    host.search_results.append(other_site)
+    plugin.refresh_candidates()
+    assert _form_items(plugin, "rule_sites") == [
+        {"title": "另一个站", "value": 7}, {"title": "样例站", "value": 5},
+    ]
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "custom", "rule_sites": [7]}
+    assert plugin.preview_search_status(config)["search_sites"] == [7]
+    plugin.init_plugin({"enabled": True, **config})
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["site_id"] == 7
+    assert preview["search_keyword_verified"] is True
+    assert preview["search_cached"] is True
+    assert preview["rules"]["sites"] == [7]
+    plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
+    assert host.subscriptions[2].sites == [7]
+
+
+def test_custom_sites_preview_uses_selected_subset_and_keeps_full_cache(plugin_host):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    other_site = copy.deepcopy(chosen)
+    other_site.torrent_info.site = 7
+    other_site.torrent_info.site_name = "另一个站"
+    host.search_results.append(other_site)
+    plugin.refresh_candidates()
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice, '{"sites":[7,5,7]}', "custom", refresh_search=True)[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["rules"]["sites"] == [5, 7]
+    assert preview["matched_count"] == 2
+    assert host.search_calls[0]["sites"] == [5, 7]
+    assert plugin.preview_search_status({"operation": "preview", "candidate": choice,
+                                         "rule_mode": "all_sites"})["status"] == "cached"
+    calls = len(host.search_calls)
+    assert plugin.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert len(host.search_calls) == calls
+    assert plugin.confirm_candidate(choice, rule_mode="all_sites")[0]
+    assert host.subscriptions[2].sites == []
+
+
+def test_custom_site_auto_switches_keyword_using_selected_site_resource(plugin_host):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    other_site = copy.deepcopy(chosen)
+    other_site.torrent_info.site = 7
+    other_site.torrent_info.site_name = "另一个站"
+    host.search_results.append(other_site)
+    plugin.refresh_candidates()
+    cached = next(iter(plugin._preview_search_cache.values()))
+    other_id = host.module.preview_resource(other_site, 1, 8, host.module._utc_now())["id"]
+    cached["diagnostics"]["original_search"]["resource_ids"] = []
+    assert other_id in cached["diagnostics"]["resource_keywords"]
+    success, _message, draft = plugin.preview_candidate(choice, '{"sites":[7]}', "custom")
+    assert success
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["keyword_choice_auto_changed"] is True
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["site_id"] == 7
+    assert plugin.confirm_candidate(choice, draft, "custom", keyword_choice="seasonal")[0]
+    assert host.subscriptions[2].sites == [7]
+    assert host.subscriptions[2].keyword == preview["search_keyword"]
+
+
+def test_custom_sites_requires_selection(plugin_host):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    assert plugin.preview_search_status({"operation": "preview", "candidate": choice,
+                                         "rule_mode": "custom", "rule_sites": []})["success"] is False
+    assert plugin.preview_candidate(choice, '{"sites":[]}', "custom")[0] is False
 
 
 def test_candidate_labels_do_not_claim_unrecognized_or_sparse_episodes_are_complete(plugin_host):

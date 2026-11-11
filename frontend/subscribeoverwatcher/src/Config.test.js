@@ -22,10 +22,12 @@ components.VAlert = defineComponent({
   template: '<div>{{ text }}<slot /></div>',
 })
 const Select = defineComponent({
-  props: ['modelValue', 'items', 'label', 'disabled'],
+  props: ['modelValue', 'items', 'label', 'disabled', 'multiple'],
   emits: ['update:modelValue'],
-  template: `<select :aria-label="label" :disabled="disabled" :value="modelValue ?? ''"
-    @change="$emit('update:modelValue', $event.target.value)">
+  template: `<select :aria-label="label" :disabled="disabled" :multiple="multiple" :value="modelValue ?? ''"
+    @change="$emit('update:modelValue', multiple
+      ? Array.from($event.target.selectedOptions).map(option => items.find(item => String(item.value) === option.value)?.value)
+      : $event.target.value)">
     <option value="">请选择</option>
     <option v-for="item in items" :key="item.value" :value="item.value">{{ item.title }}</option>
   </select>`,
@@ -53,6 +55,9 @@ function candidateSnapshot() {
   const data = snapshot({ managed: '已纳入管理 1 条剧集订阅', historical: [] })
   const rules = { quality: { candidate: 'WEB-DL / WEBRip' }, include: { candidate: 'TEAM' }, sites: [5] }
   data.conf[0].content.push(
+    { component: 'VSelect', props: { model: 'rule_sites', items: [
+      { title: '样例站', value: 5 }, { title: '另一个站', value: 7 },
+    ] } },
     { component: 'VSelect', props: { model: 'candidate_subscription', items: [
       { title: '#2 剧集甲', value: '2' },
     ] } },
@@ -60,7 +65,7 @@ function candidateSnapshot() {
       { title: '甲版本', value: '2:a', subscription_id: '2', rules },
     ] } },
   )
-  Object.assign(data.model, { candidate_subscription: '2', candidate: '2:a', rule_mode: 'candidate',
+  Object.assign(data.model, { candidate_subscription: '2', candidate: '2:a', rule_mode: 'candidate', rule_sites: [],
     rule_json: JSON.stringify(rules, null, 2) })
   return data
 }
@@ -256,6 +261,31 @@ describe('custom configuration actions', () => {
     expect(api.get.mock.calls.filter(([url]) => url === 'plugin/form/SubscribeOverwatcher')).toHaveLength(1)
     expect(api.post).not.toHaveBeenCalled()
     expect(wrapper.emitted('switch')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('selects several sites, preserves them across scope changes, and sends them for preview', async () => {
+    const data = candidateSnapshot()
+    const api = { get: vi.fn().mockResolvedValue(data), post: vi.fn().mockResolvedValue({ success: false }) }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    const scope = wrapper.find('select[aria-label="站点范围"]')
+    await scope.setValue('custom')
+    wrapper.findAllComponents(Select).find(select => select.props('label') === '自选站点（可多选）')
+      .vm.$emit('update:modelValue', [5, 7])
+    await flushPromises()
+    expect(JSON.parse(wrapper.findComponent(RuleEditor).props('modelValue')).sites).toEqual([5, 7])
+    await scope.setValue('all_sites')
+    expect(JSON.parse(wrapper.findComponent(RuleEditor).props('modelValue')).sites).toEqual([])
+    await scope.setValue('custom')
+    expect(JSON.parse(wrapper.findComponent(RuleEditor).props('modelValue')).sites).toEqual([5, 7])
+    await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
+    await flushPromises()
+    const sent = applyCalls(api)[0][1]
+    expect(sent.rule_mode).toBe('custom')
+    expect(sent.rule_sites).toEqual([5, 7])
+    expect(JSON.parse(sent.rule_json).sites).toEqual([5, 7])
     wrapper.unmount()
   })
 

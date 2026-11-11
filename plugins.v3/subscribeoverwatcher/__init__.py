@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.application.torrent.download import TorrentHelper
+from app.application.site.sites import SitesHelper
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
@@ -223,13 +224,37 @@ def _size_cell(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _draft_rules(candidate: dict[str, Any], raw: str, mode: str) -> dict[str, Any]:
-    """选择所选站点或所有站点，其他候选规格照常回填。"""
-    if mode not in {"candidate", "all_sites"}:
+    """按所选站点范围生成草稿，其他候选规格照常回填。"""
+    if mode not in {"candidate", "all_sites", "custom"}:
         raise ValueError("站点范围无效，请重新选择")
     rules = normalize_draft_rules(candidate_default_rules(candidate), raw, candidate_rule_names(candidate))
     if mode == "all_sites":
         rules["sites"] = []
+    elif mode == "custom":
+        if not rules.get("sites"):
+            raise ValueError("自选站点至少需要选择一个站点")
+        rules["sites"] = sorted(set(rules["sites"]))
     return rules
+
+
+def _configured_draft_json(config: dict[str, Any]) -> str:
+    """原生配置表单和自定义组件共用多选站点输入。"""
+    raw = str(config.get("rule_json") or "")
+    if config.get("rule_mode") != "custom" or "rule_sites" not in config:
+        return raw
+    sites = config["rule_sites"]
+    if not isinstance(sites, list) or not sites or any(
+        not isinstance(site, int) or isinstance(site, bool) or site <= 0 for site in sites
+    ):
+        raise ValueError("自选站点至少需要选择一个有效站点")
+    try:
+        rules = json.loads(raw) if raw.strip() else {}
+    except (TypeError, ValueError) as error:
+        raise ValueError("规则 JSON 格式错误") from error
+    if not isinstance(rules, dict):
+        raise ValueError("规则 JSON 格式错误")
+    rules["sites"] = sites
+    return json.dumps(rules, ensure_ascii=False)
 
 
 def _rule_scope(subscribe: Any) -> str:
@@ -446,7 +471,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.12"
+    plugin_version = "1.9.13"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -586,20 +611,30 @@ class SubscribeOverwatcher(_PluginBase):
             elif actions[0] == "scan":
                 success, message = self.scan_subscription(config.get("scan_subscription"))
             elif actions[0] == "preview":
-                success, message, normalized_rules = self.preview_candidate(
-                    str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
-                    str(config.get("rule_mode") or "candidate"),
-                    str(config.get("download_directory") or ""),
-                    refresh_search=bool(config.get("refresh_search")),
-                    keyword_choice=str(config.get("keyword_choice") or "original"),
-                )
+                try:
+                    draft_json = _configured_draft_json(config)
+                except ValueError as error:
+                    success, message = False, str(error)
+                else:
+                    success, message, normalized_rules = self.preview_candidate(
+                        str(config.get("candidate") or ""), draft_json,
+                        str(config.get("rule_mode") or "candidate"),
+                        str(config.get("download_directory") or ""),
+                        refresh_search=bool(config.get("refresh_search")),
+                        keyword_choice=str(config.get("keyword_choice") or "original"),
+                    )
             elif actions[0] == "confirm":
-                success, message = self.confirm_candidate(
-                    str(config.get("candidate") or ""), str(config.get("rule_json") or ""),
-                    str(config.get("rule_mode") or "candidate"),
-                    str(config.get("download_directory") or ""),
-                    keyword_choice=str(config.get("keyword_choice") or "original"),
-                )
+                try:
+                    draft_json = _configured_draft_json(config)
+                except ValueError as error:
+                    success, message = False, str(error)
+                else:
+                    success, message = self.confirm_candidate(
+                        str(config.get("candidate") or ""), draft_json,
+                        str(config.get("rule_mode") or "candidate"),
+                        str(config.get("download_directory") or ""),
+                        keyword_choice=str(config.get("keyword_choice") or "original"),
+                    )
             elif actions[0] == "direct_approve":
                 success, message = self.approve_subscription(config.get("direct_subscription"))
             elif actions[0] == "revoke":
@@ -648,6 +683,7 @@ class SubscribeOverwatcher(_PluginBase):
                     updated_config["candidate_subscription"] = ""
                     updated_config["candidate"] = ""
                     updated_config["rule_mode"] = "candidate"
+                    updated_config["rule_sites"] = []
                     updated_config["keyword_choice"] = "original"
                     updated_config["rule_json"] = ""
                     updated_config["download_directory"] = ""
@@ -1343,13 +1379,18 @@ class SubscribeOverwatcher(_PluginBase):
             return (cached["contexts"], True, time.monotonic() - cached["at"], cached["source"],
                     cached["searched_at"], cached.get("diagnostics"))
         key = (_identity(subscribe), tuple(sorted(set(sites))))
-        with self._lock:
-            # 强制刷新失败时不能继续使用被要求淘汰的旧搜索。
-            self._forget_search_cache(lambda item: item[0] == key[0] and (not item[1] or
-                                      (sites and set(sites).issubset(item[1]))), extra_keys=(key,))
         diagnostics: dict[str, Any] = {}
-        contexts = self._search_unfiltered(subscribe, timings, sites=sites, diagnostics=diagnostics)
+        try:
+            contexts = self._search_unfiltered(subscribe, timings, sites=sites, diagnostics=diagnostics)
+        except Exception:
+            if refresh_search:
+                with self._lock:
+                    # 主动刷新失败后，旧的覆盖缓存不能伪装成本轮搜索结果。
+                    self._forget_search_cache(lambda item: item[0] == key[0] and (not item[1] or
+                                              (sites and set(sites).issubset(item[1]))), extra_keys=(key,))
+            raise
         searched_at = _utc_now()
+        # 成功时只替换当前范围，较宽范围的完整搜索仍可供切换范围后复用。
         self._remember_search(subscribe, contexts, sites, "规则预览搜索", searched_at, diagnostics)
         return contexts, False, 0.0, "规则预览搜索", searched_at, diagnostics
 
@@ -1438,9 +1479,25 @@ class SubscribeOverwatcher(_PluginBase):
             target_id = id_aliases.get(resource_id, resource_id)
             selected_words = resource_keywords.setdefault(target_id, [])
             selected_words.extend(word for word in words if word not in selected_words)
-        candidate_keywords = resource_keywords.get((candidate or {}).get("id")) or []
+        candidate_outside_scope = bool(candidate and search_sites and candidate.get("site_id") not in search_sites)
+        verification_ids = [(candidate or {}).get("id")]
+        if candidate_outside_scope:
+            # 候选只是规则模板；改选其他站点时，以该范围内符合规则的资源验证搜索词。
+            verification_ids = []
+            verification_params = SubscribeChain.get_params(working)
+            for context in contexts:
+                try:
+                    item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
+                    if item and self._rule_rejection(working, context, verification_params) is None:
+                        verification_ids.append(item["id"])
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    continue
+        candidate_keywords = next((resource_keywords.get(resource_id) for resource_id in verification_ids
+                                   if resource_keywords.get(resource_id)), [])
         seasonal_keyword = candidate_keywords[0] if candidate_keywords else None
         if requested_keyword_choice == "seasonal" and candidate and not seasonal_keyword:
+            if candidate_outside_scope:
+                raise ValueError("剧名＋季号搜索词未在当前站点范围召回符合规则的资源，请重新搜索或沿用原订阅")
             raise ValueError("剧名＋季号搜索词未在最新搜索中召回这个版本，请重新扫描或沿用原订阅")
         original_search = (diagnostics or {}).get("original_search") or {}
         original_keyword = getattr(subscribe, "keyword", None) or None
@@ -1450,23 +1507,26 @@ class SubscribeOverwatcher(_PluginBase):
                                 and original_search.get("custom_words") == (getattr(subscribe, "custom_words", None) or None))
         original_ids = {id_aliases.get(resource_id, resource_id)
                         for resource_id in original_search.get("resource_ids") or []} if original_checked else set()
-        original_matched = bool(candidate and candidate.get("id") in original_ids)
-        site_failed = any((candidate or {}).get("site_id") is None
-                          or item.get("site_id") == candidate.get("site_id")
-                          for item in original_search.get("site_failures") or [])
+        original_matched = bool(candidate and any(resource_id in original_ids for resource_id in verification_ids))
+        failed_site_ids = {item.get("site_id") for item in original_search.get("site_failures") or []}
+        site_failed = bool(set(search_sites) & failed_site_ids) if candidate_outside_scope else bool(
+            candidate and failed_site_ids and (candidate.get("site_id") is None
+                                             or candidate.get("site_id") in failed_site_ids)
+        )
         original_completed = original_checked and not site_failed
         keyword_choice_auto_changed = bool(candidate and requested_keyword_choice == "original"
                                            and not original_matched and original_completed and seasonal_keyword)
         effective_keyword_choice = "seasonal" if keyword_choice_auto_changed else requested_keyword_choice
+        verified_resource = "当前站点范围内符合规则的资源" if candidate_outside_scope else "所选版本"
         search_keyword_notice = ""
         if effective_keyword_choice == "seasonal":
             search_keyword = seasonal_keyword
             search_keyword_changed = seasonal_keyword != original_keyword or bool(getattr(subscribe, "search_imdbid", False))
             search_keyword_verified = True
             search_keyword_notice = (
-                "原订阅搜索正常完成但未召回所选版本；预览已自动切换为剧名＋季号搜索词。确认后才写入订阅。"
+                f"原订阅搜索正常完成但未召回{verified_resource}；预览已自动切换为剧名＋季号搜索词。确认后才写入订阅。"
                 if keyword_choice_auto_changed else
-                "已选择本轮召回所选版本的剧名＋季号搜索词；预览只计入该词召回的资源，确认后才写入订阅。"
+                f"已选择本轮召回{verified_resource}的剧名＋季号搜索词；预览只计入该词召回的资源，确认后才写入订阅。"
             )
             if getattr(subscribe, "search_imdbid", False):
                 search_keyword_notice += "确认时会改用标题搜索。"
@@ -1475,9 +1535,9 @@ class SubscribeOverwatcher(_PluginBase):
             search_keyword_changed = False
             search_keyword_verified = original_matched
             if candidate and original_matched:
-                search_keyword_notice = "原订阅搜索已召回所选版本，确认后保留原搜索词和搜索方式；当前按原订阅搜索结果预览。"
+                search_keyword_notice = f"原订阅搜索已召回{verified_resource}，确认后保留原搜索词和搜索方式；当前按原订阅搜索结果预览。"
             elif candidate and original_completed:
-                search_keyword_notice = "原订阅和带季搜索均未召回所选版本；不会修改搜索词，请重新搜索。"
+                search_keyword_notice = f"原订阅和带季搜索均未召回{verified_resource}；不会修改搜索词，请重新搜索。"
             elif candidate:
                 search_keyword_notice = "未能验证当前原订阅搜索（缓存缺少记录或站点失败），不能判断必须加季号；本次保留原搜索词，请重新搜索，或手动选择剧名＋季号搜索词并重新预览。"
         filtering_started = time.perf_counter()
@@ -1607,7 +1667,7 @@ class SubscribeOverwatcher(_PluginBase):
 
         :param choice: 订阅 ID 与候选 ID
         :param rule_json: 用户调整的草稿规则 JSON
-        :param rule_mode: 选择所选站点或所有站点
+        :param rule_mode: 选择候选站点、自选站点或不限站点
         :param download_directory: 从目录卡片选择的资源根目录；留空保留订阅原目录
         :return: 是否成功、结果消息和规范化草稿 JSON
         """
@@ -1721,10 +1781,13 @@ class SubscribeOverwatcher(_PluginBase):
                         return False, "规则已修改，请重新预览后确认"
                 except ValueError as error:
                     return False, str(error)
-            if not preview.get("matched_count") or candidate_id not in {
+            candidate_in_scope = not preview.get("search_sites") or candidate.get("site_id") in preview["search_sites"]
+            if not preview.get("matched_count") or (candidate_in_scope and candidate_id not in {
                 item.get("id") for item in preview.get("matched") or []
-            }:
-                return False, "所选版本未通过当前规则，请修改规则并重新预览"
+            }):
+                if candidate_in_scope:
+                    return False, "所选版本未通过当前规则，请修改规则并重新预览"
+                return False, "当前站点范围没有通过规则的资源，请修改规则并重新预览"
             if "search_keyword_changed" not in preview:
                 return False, "请重新预览，确认是否需要调整原订阅搜索词"
             if preview["search_keyword_changed"] and (not preview.get("search_keyword") or not preview.get("search_keyword_verified")):
@@ -2094,7 +2157,7 @@ class SubscribeOverwatcher(_PluginBase):
                                       if item.get("id") == candidate_id), None)
                     if entry.get("status") != "pending" or not candidate:
                         return {"success": False, "message": "候选或订阅已变化，请重新扫描"}
-                    rules = _draft_rules(candidate, str(config.get("rule_json") or ""),
+                    rules = _draft_rules(candidate, _configured_draft_json(config),
                                          str(config.get("rule_mode") or "candidate"))
                 else:
                     if not self._is_approved(subscribe):
@@ -2144,6 +2207,17 @@ class SubscribeOverwatcher(_PluginBase):
         """
         返回全集确认策略与互斥的历史接管、批准和撤销操作。
         """
+        try:
+            indexers = SitesHelper().get_indexers() or []
+        except Exception:
+            logger.exception("无法读取可选站点列表")
+            indexers = []
+        site_choices = sorted(({
+            "title": str(site.get("name") or f"站点 {site['id']}"), "value": site["id"],
+        } for site in indexers if isinstance(site, dict)
+            and isinstance(site.get("id"), int) and not isinstance(site["id"], bool)
+            and site["id"] > 0 and site.get("is_active", True)),
+            key=lambda site: site["title"].casefold())
         with self._lock:
             subscriptions = self._subscribes.list()
             current = {str(item.id): item for item in subscriptions}
@@ -2357,9 +2431,13 @@ class SubscribeOverwatcher(_PluginBase):
                 col(select("candidate", "选择该剧集版本（全集优先）", choices, clearable=True), md=5),
                 col(select("rule_mode", "站点范围", [
                     {"title": "只用所选站点", "value": "candidate"},
+                    {"title": "自选站点", "value": "custom"},
                     {"title": "不限站点", "value": "all_sites"},
                 ]), md=3),
             ),
+            row(col(select("rule_sites", "自选站点（可多选；仅自选站点范围生效）",
+                           site_choices, clearable=True, multiple=True, chips=True,
+                           **{"closable-chips": True}))),
             row(col(select("keyword_choice", "确认后的订阅搜索词", keyword_choices))),
             row(
                 col(select("download_directory", "下载目录（留空保留原目录）", directory_choices(),
@@ -2406,7 +2484,7 @@ class SubscribeOverwatcher(_PluginBase):
             "enabled": False, "confirm_full_pack": True, "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
             "historical_subscription": [], "scan_subscription": "", "candidate_subscription": "", "candidate": "",
-            "rule_mode": "candidate", "rule_json": "", "keyword_choice": "original",
+            "rule_mode": "candidate", "rule_sites": [], "rule_json": "", "keyword_choice": "original",
             "download_directory": "",
             "direct_subscription": "", "revoke_subscription": "",
             "replace_subscription": "", "replace_resource": "", "replace_episodes": "",

@@ -50,6 +50,9 @@ const props = defineProps({
   modelValue: { type: String, default: '' },
   candidate: { type: Object, default: () => ({}) },
   options: { type: Object, default: () => ({}) },
+  siteOptions: { type: Array, default: () => [] },
+  siteMode: { type: String, default: 'candidate' },
+  selectedSiteIds: { type: Array, default: () => [] },
   disabled: { type: Boolean, default: false },
   groupAutoChanged: { type: Boolean, default: false },
 })
@@ -83,11 +86,16 @@ const groupHint = computed(() => groupSelection.value === NO_GROUPS
   ? '本次预览跳过规则组；确认后按站点、质量、分辨率、特效和包含/排除条件追更。'
   : `当前：${props.candidate.original_filter_groups?.join('、') || '宿主默认规则组'}。预览会应用规则组；结果不符合预期时可选择“不使用规则组”。`)
 const siteSummary = computed(() => {
-  const sites = rules.value.sites ?? props.candidate.original_sites ?? []
-  if (!sites.length) return '不限站点'
+  const sites = props.siteMode === 'all_sites' ? []
+    : props.siteMode === 'custom' ? props.selectedSiteIds
+    : rules.value.sites ?? props.candidate.original_sites ?? []
+  if (!sites.length) return props.siteMode === 'custom' ? '未选择站点' : '不限站点'
   const candidateSite = props.candidate.site_id ?? props.candidate.rules?.sites?.[0]
-  return sites.map(id => id === candidateSite && props.candidate.site_name
-    ? `${props.candidate.site_name}（${id}）` : `站点 ${id}`).join('、')
+  return sites.map(id => {
+    const name = props.siteOptions.find(site => site.value === id)?.title
+      || (id === candidateSite ? props.candidate.site_name : '')
+    return name ? `${name}（${id}）` : `站点 ${id}`
+  }).join('、')
 })
 
 function candidateName(field) {
