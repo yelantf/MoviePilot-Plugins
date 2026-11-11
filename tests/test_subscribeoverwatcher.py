@@ -37,7 +37,13 @@ def plugin_host(monkeypatch, tmp_path):
     directories = []
     directory_calls = []
     group_filter_calls = []
-    system_values = {}
+    logs = []
+    system_values = {"IndexerSites": []}
+    indexers = [
+        {"id": 5, "name": "样例站", "is_active": True},
+        {"id": 7, "name": "另一个站", "is_active": True},
+        {"id": 9, "name": "已停用站", "is_active": False},
+    ]
 
     for name in ("app", "app.application", "app.application.torrent", "app.application.site", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
@@ -334,11 +340,10 @@ def plugin_host(monkeypatch, tmp_path):
         },
         "app.schemas.file": {"FileURI": FileURI},
         "app.application.torrent.download": {"TorrentHelper": TorrentHelper},
-        "app.application.site.sites": {"SitesHelper": lambda: SimpleNamespace(get_indexers=lambda: [
-            {"id": 5, "name": "样例站", "is_active": True},
-            {"id": 7, "name": "另一个站", "is_active": True},
-            {"id": 9, "name": "已停用站", "is_active": False},
-        ])},
+        "app.application.site.sites": {"SitesHelper": lambda: SimpleNamespace(get_indexers=lambda: indexers)},
+        "app.application.configuration": {"get_configured_system_config": lambda: SimpleNamespace(
+            get=lambda key: system_values.get(key),
+        )},
         "app.chain.download": {"DownloadChain": DownloadChain},
         "app.chain.media": {"MediaChain": MediaChain},
         "app.chain.search": {"SearchChain": SearchChain},
@@ -359,6 +364,7 @@ def plugin_host(monkeypatch, tmp_path):
             "MediaType": SimpleNamespace(TV=SimpleNamespace(value="电视剧")),
             "MessageType": SimpleNamespace(Plugin="plugin"),
             "SystemConfigKey": SimpleNamespace(
+                IndexerSites="IndexerSites",
                 UserFilterRuleGroups="UserFilterRuleGroups", CustomFilterRules="CustomFilterRules",
                 SubscribeFilterRuleGroups="SubscribeFilterRuleGroups",
                 BestVersionFilterRuleGroups="BestVersionFilterRuleGroups",
@@ -366,7 +372,9 @@ def plugin_host(monkeypatch, tmp_path):
         },
         "app.sdk.events": {"Event": SimpleNamespace, "eventmanager": SimpleNamespace(register=register)},
         "app.sdk.logging": {"logger": SimpleNamespace(
-            info=lambda *_args: None, warning=lambda *_args: None, exception=lambda *_args: None,
+            info=lambda message, *_args: logs.append(("info", str(message))),
+            warning=lambda message, *_args: logs.append(("warning", str(message))),
+            exception=lambda message, *_args: logs.append(("exception", str(message))),
         )},
         "app.sdk.scheduler": {"add_plugin_once_job": add_job, "remove_plugin_once_job": remove_job},
     }
@@ -378,6 +386,7 @@ def plugin_host(monkeypatch, tmp_path):
     name = "subscribeoverwatcher_isolated_test"
     # 搜索适配器继承当前夹具的宿主替身，不能跨场景复用上一个宿主的基类。
     monkeypatch.delitem(sys.modules, f"{name}.search", raising=False)
+    monkeypatch.delitem(sys.modules, f"{name}.cache", raising=False)
     spec = importlib.util.spec_from_file_location(
         name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)],
     )
@@ -398,7 +407,7 @@ def plugin_host(monkeypatch, tmp_path):
         messages=messages,
         directories=directories, directory_calls=directory_calls,
         directory_module=directory_module,
-        group_filter_calls=group_filter_calls, system_values=system_values,
+        group_filter_calls=group_filter_calls, system_values=system_values, indexers=indexers, logs=logs,
     )
 
 
@@ -2160,6 +2169,106 @@ def test_data_page_handoff_does_not_refresh_but_all_sites_needs_full_cache(plugi
     assert len(host.search_calls) == 2
 
 
+def test_default_site_change_only_searches_new_sites_and_persists_coverage(plugin_host):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    new_site = copy.deepcopy(chosen)
+    new_site.torrent_info.site = 11
+    new_site.torrent_info.site_name = "新增站点"
+    host.search_results.append(new_site)
+    host.indexers.append({"id": 11, "name": "新增站点", "is_active": True})
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
+    status = plugin.preview_search_status(config)
+    assert status["status"] == "partial_cache"
+    assert status["missing_sites"] == [{"id": 11, "name": "新增站点"}]
+    assert {item["id"] for item in status["reused_sites"]} == {5, 7, 9}
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert [call["sites"] for call in host.search_calls] == [[11], [11]]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert preview["search_trigger"] == "partial_cache"
+    assert preview["search_searched_sites"] == [11]
+    assert preview["search_reused_sites"] == [5, 7, 9]
+    assert preview["matched_count"] == 2
+    assert preview["search_keyword_verified"] is True
+    assert any("缺失" in message and "新增站点" in message for _level, message in host.logs)
+
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert restarted.preview_search_status(config)["status"] == "cached"
+    host.indexers.append({"id": 13, "name": "再新增站", "is_active": True})
+    assert restarted.preview_search_status(config)["missing_sites"] == [{"id": 13, "name": "再新增站"}]
+
+
+def test_all_sites_follows_host_default_site_selection(plugin_host):
+    host = plugin_host
+    host.system_values["IndexerSites"] = [5]
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
+    assert plugin.preview_search_status(config)["status"] == "cached"
+    host.system_values["IndexerSites"] = [5, 7]
+    status = plugin.preview_search_status(config)
+    assert status["status"] == "partial_cache"
+    assert status["missing_sites"] == [{"id": 7, "name": "另一个站"}]
+    assert status["reused_sites"] == [{"id": 5, "name": "样例站"}]
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert [call["sites"] for call in host.search_calls] == [[7], [7]]
+
+
+def test_legacy_default_cache_without_coverage_is_removed_and_researched(plugin_host):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    store = plugin._disk_search_cache()
+    file = next(store.path.glob("*.json"))
+    payload = json.loads(file.read_text())
+    payload.pop("covered_sites")
+    payload.pop("site_sources")
+    file.write_text(json.dumps(payload))
+
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
+    status = restarted.preview_search_status(config)
+    assert status["status"] == "cache_miss"
+    assert {site["id"] for site in status["missing_sites"]} == {5, 7, 9}
+    assert not file.exists()
+    assert any("旧默认范围缓存未记录实际覆盖站点" in message for _level, message in host.logs)
+
+
+def test_all_site_preview_merges_single_site_results_and_search_evidence(plugin_host):
+    host = plugin_host
+    plugin, choice, chosen = _prepare_directory_confirmation(host)
+    host.system_values["IndexerSites"] = [5, 7]
+    second = copy.deepcopy(chosen)
+    second.torrent_info.site = 7
+    second.torrent_info.site_name = "另一个站"
+    first_id = host.module.preview_resource(chosen, 1, host.subscriptions[2].total_episode,
+                                            host.module._utc_now())["id"]
+    second_id = host.module.preview_resource(second, 1, host.subscriptions[2].total_episode,
+                                             host.module._utc_now())["id"]
+    settings = {"checked": True, "keyword": None, "search_imdbid": False,
+                "custom_words": None, "site_failures": []}
+    plugin._forget_search_cache(lambda _key: True)
+    for site_id, context, resource_id in ((5, chosen, first_id), (7, second, second_id)):
+        diagnostics = {
+            "resource_keywords": {resource_id: ["Show S01"]}, "site_failures": [],
+            "original_search": {**settings, "resource_ids": [resource_id]},
+        }
+        plugin._remember_search(host.subscriptions[2], [context], [site_id], "单站预览", "搜索时间",
+                                diagnostics)
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
+    assert plugin.preview_search_status(config)["status"] == "cached"
+    host.search_calls.clear()
+    assert plugin.preview_candidate(choice, rule_mode="all_sites")[0]
+    preview = host.storage["gate_state"]["entries"]["2"]["preview"]
+    assert host.search_calls == []
+    assert preview["matched_count"] == 2
+    assert preview["search_keyword_verified"] is True
+    assert preview["search_reused_sites"] == [5, 7]
+    assert preview["search_searched_sites"] == []
+
+
 def test_candidate_labels_do_not_claim_unrecognized_or_sparse_episodes_are_complete(plugin_host):
     """标题整季词和已识别集号分别展示，跳号不能渲染成连续覆盖。"""
     module = plugin_host.module
@@ -2477,14 +2586,14 @@ def test_preview_reuses_search_without_age_limit_but_rechecks_rules_and_can_refr
     clock_value[0] += 3
     plugin.init_plugin({**host.storage["config"], "operation": "preview", "rule_mode": "all_sites"})
     assert len(host.search_calls) == 4
-    assert host.search_calls[2]["sites"] is None
+    assert host.search_calls[2]["sites"] == [7, 9]
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["search_cached"] is False
     clock_value[0] += 3
     plugin.init_plugin({**host.storage["config"], "operation": "preview"})
     cached = host.storage["gate_state"]["entries"]["2"]["preview"]
     assert len(host.search_calls) == 4
     assert cached["search_cached"] is True
-    assert cached["search_age_seconds"] == 3
+    assert cached["search_age_seconds"] == 6
     assert cached["matched_count"] == 2
     assert cached["timings"]["search_seconds"] == 0
     host.search_results[:] = [chosen]
@@ -2810,7 +2919,7 @@ def test_single_site_preview_filters_shared_scan_and_only_queries_selected_site_
     assert host.search_calls[-1]["sites"] == [5]
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 1
     assert plugin.preview_candidate(choice, rule_mode="all_sites", refresh_search=True)[0]
-    assert host.search_calls[-1]["sites"] is None
+    assert host.search_calls[-1]["sites"] == [5, 7, 9]
     assert host.storage["gate_state"]["entries"]["2"]["preview"]["matched_count"] == 2
 
 
@@ -2833,7 +2942,7 @@ def test_original_subscription_option_survives_preview_and_is_not_overwritten_by
     assert host.subscriptions[2].resolution == r"1080[pi]?|x1080"
 
 
-def test_search_cache_ignores_removed_duration_setting_and_is_bounded(plugin_host):
+def test_search_cache_ignores_removed_duration_setting_and_is_bounded(plugin_host, monkeypatch):
     """旧时长设置被移除；缓存始终复用，容量有上限，停用释放内存。"""
     host = plugin_host
     plugin, choice, chosen = _prepare_directory_confirmation(host)
@@ -2847,11 +2956,13 @@ def test_search_cache_ignores_removed_duration_setting_and_is_bounded(plugin_hos
     assert "search_cache_hours" not in json.dumps(plugin.get_form())
     plugin.init_plugin({"enabled": True, "search_cache_hours": 24})
     assert "search_cache_hours" not in host.storage["config"]
-    for number in range(70):
+    assert host.module.MAX_CACHE_ENTRIES == 256
+    monkeypatch.setattr(host.module, "MAX_CACHE_ENTRIES", 4)
+    for number in range(10):
         subscribe = _subscribe(number + 10)
         subscribe.media_id = str(number)
         plugin._remember_search(subscribe, [chosen], [], "候选扫描", "now")
-    assert len(plugin._preview_search_cache) == 64
+    assert len(plugin._preview_search_cache) == 4
     plugin.init_plugin({"enabled": False, "search_cache_hours": 24})
     assert plugin._preview_search_cache == {}
 
@@ -2893,7 +3004,10 @@ def test_preview_status_checks_the_actual_cache_without_searching_or_saving(plug
     preview = host.storage["gate_state"]["entries"]["2"]["preview"]
     assert preview["search_trigger"] == "cache_miss"
     assert preview["search_result_count"] == 1
-    assert plugin.preview_search_status({**config, "rule_mode": "all_sites"})["status"] == "cache_miss"
+    all_status = plugin.preview_search_status({**config, "rule_mode": "all_sites"})
+    assert all_status["status"] == "partial_cache"
+    assert {site["id"] for site in all_status["missing_sites"]} == {7, 9}
+    assert [site["id"] for site in all_status["reused_sites"]] == [5]
     assert plugin.preview_search_status({**config, "refresh_search": True})["status"] == "manual"
     # 有全站缓存，但其中没有所选站点的资源，也属于本次站点范围的空缓存。
     other_site = copy.deepcopy(chosen)
@@ -4179,7 +4293,9 @@ def test_empty_and_single_site_caches_restore_without_becoming_all_site_cache(pl
     host.search_calls.clear()
     config = {"operation": "preview", "candidate": choice}
     assert restarted.preview_search_status(config)["status"] == "cached_empty"
-    assert restarted.preview_search_status({**config, "rule_mode": "all_sites"})["status"] == "cache_miss"
+    all_status = restarted.preview_search_status({**config, "rule_mode": "all_sites"})
+    assert all_status["status"] == "partial_cache"
+    assert {site["id"] for site in all_status["missing_sites"]} == {7, 9}
     assert restarted.preview_candidate(choice)[0]
     assert host.search_calls == []
     assert restarted._state["entries"]["2"]["preview"]["search_result_count"] == 0
@@ -4200,6 +4316,7 @@ def test_corrupt_persistent_cache_is_removed_and_does_not_look_like_successful_e
     restarted = host.module.SubscribeOverwatcher()
     restarted.init_plugin({"enabled": True})
     assert not file.exists()
+    assert any("无法恢复或订阅身份已变化" in message for _level, message in host.logs)
     config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
     assert restarted.preview_search_status(config)["status"] == "cache_miss"
     host.search_calls.clear()
@@ -4214,6 +4331,7 @@ def test_approval_and_disabling_remove_persistent_cache_and_reload_cannot_restor
     assert plugin.confirm_candidate(choice)[0]
     folder = plugin.get_data_path() / "search-cache"
     assert list(folder.glob("*.json")) == []
+    assert any("订阅批准" in message for _level, message in host.logs)
     restarted = host.module.SubscribeOverwatcher()
     restarted.init_plugin({"enabled": True})
     assert restarted._preview_search_cache == {}
@@ -4221,6 +4339,7 @@ def test_approval_and_disabling_remove_persistent_cache_and_reload_cannot_restor
     assert list(folder.glob("*.json"))
     restarted.init_plugin({"enabled": False})
     assert not list(folder.glob("*.json"))
+    assert any("插件停用" in message and "缓存清理" in message for _level, message in host.logs)
 
 
 def test_deleted_or_changed_subscription_cache_is_removed_from_disk_at_scan_or_startup(plugin_host):
@@ -4249,6 +4368,7 @@ def test_cache_entry_and_disk_byte_limits_remove_oldest_results_from_memory_and_
     expected = {host.module._identity(host.subscriptions[number]) for number in (4, 5)}
     assert {key[0] for key in plugin._preview_search_cache} == expected
     assert len(list(store.path.glob("*.json"))) == 2
+    assert any("超过 2 组上限" in message for _level, message in host.logs)
     store.max_entries = 64
     store.max_bytes = sum(file.stat().st_size for file in store.path.glob("*.json")) + 100
     # 宿主时钟回调后，较早文件可能仍带未来的 mtime；当前新搜索必须保留。
@@ -4263,6 +4383,7 @@ def test_cache_entry_and_disk_byte_limits_remove_oldest_results_from_memory_and_
     assert {key[0] for key in plugin._preview_search_cache} == {
         host.module._identity(host.subscriptions[number]) for number in (5, 6)
     }
+    assert any("超过" in message and "总容量" in message for _level, message in host.logs)
 
 
 def test_failed_manual_refresh_does_not_restore_old_covering_cache_after_restart(plugin_host, monkeypatch):

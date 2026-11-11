@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from app.application.torrent.download import TorrentHelper
 from app.application.site.sites import SitesHelper
+from app.application.configuration import get_configured_system_config
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
@@ -21,7 +22,7 @@ from app.chain.subscribe import SubscribeChain
 from app.db.oper.subscribe import SubscribeOper
 from app.plugins import _PluginBase
 from app.schemas.media import build_media_key, resolve_media_identity
-from app.schemas.types import ChainEventType, EventType, MediaSource, MediaType, MessageType
+from app.schemas.types import ChainEventType, EventType, MediaSource, MediaType, MessageType, SystemConfigKey
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
@@ -58,6 +59,26 @@ def _search_diagnostics_snapshot(diagnostics: Optional[dict[str, Any]]) -> Optio
         snapshot["original_search"] = {key: value for key, value in snapshot["original_search"].items()
                                        if key not in {"resource_ids", "custom_words", "site_failures"}}
     return snapshot
+
+
+def _search_site_scope(sites: list[int]) -> tuple[list[int], dict[int, str]]:
+    """与宿主搜索链使用同一站点目录和默认站点配置。"""
+    indexers = SitesHelper().get_indexers() or []
+    names = {site["id"]: str(site.get("name") or f"站点 {site['id']}")
+             for site in indexers if isinstance(site, dict)
+             and isinstance(site.get("id"), int) and not isinstance(site["id"], bool)}
+    if sites:
+        requested = set(sites)
+        if not requested.issubset(names):
+            raise ValueError("所选站点已不可用，请重新选择站点")
+    else:
+        configured = get_configured_system_config().get(SystemConfigKey.IndexerSites) or []
+        requested = set(configured) if configured else set(names)
+    return sorted(requested & names.keys()), names
+
+
+def _site_labels(site_ids: set[int] | list[int], names: dict[int, str]) -> list[str]:
+    return [f"{names.get(site_id, '站点')}（{site_id}）" for site_id in sorted(site_ids)]
 
 
 def _identity(subscribe: Any) -> str:
@@ -448,6 +469,8 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
             "choice", "rule_mode", "download_directory", "draft_json", "searched_at", "searched_ts",
             "matched_count", "rejected_count", "search_cached", "search_age_seconds", "timings",
             "search_result_count", "search_trigger", "rule_groups_disabled",
+            "search_reused_sites", "search_searched_sites", "search_reused_site_labels",
+            "search_searched_site_labels", "search_site_sources",
             "rule_groups_checked", "rule_groups_auto_disabled", "rule_group_notice", "rule_group_comparison",
             "effective_rules", "rejection_summary", "search_source", "search_result_at", "search_sites",
             "search_diagnostics",
@@ -471,7 +494,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.13"
+    plugin_version = "1.9.14"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -548,6 +571,8 @@ class SubscribeOverwatcher(_PluginBase):
             self._enabled = bool(config.get("enabled"))
             if not self._enabled:
                 self._search_stop.set()
+                if self._preview_search_cache:
+                    logger.info(f"搜索缓存清理：插件停用，释放内存缓存 {len(self._preview_search_cache)} 组")
                 self._preview_search_cache.clear()
                 self._search_cache_loaded = False
                 store = self._disk_search_cache()
@@ -997,7 +1022,8 @@ class SubscribeOverwatcher(_PluginBase):
             active_identities = {_identity(subscribe) for subscribe in subscribes
                                  if subscribe.type == MediaType.TV.value}
             with self._lock:
-                self._forget_search_cache(lambda key: key[0] not in active_identities)
+                self._forget_search_cache(lambda key: key[0] not in active_identities,
+                                          reason="订阅删除或媒体身份变化")
                 stale_ids = set(self._state["entries"]) - active_ids
                 stale_ids.update(
                     str(subscribe.id) for subscribe in subscribes
@@ -1082,7 +1108,8 @@ class SubscribeOverwatcher(_PluginBase):
             return False
         try:
             diagnostics: dict[str, Any] = {}
-            contexts = self._search_unfiltered(subscribe, diagnostics=diagnostics)
+            scan_sites, _names = _search_site_scope([])
+            contexts = self._search_unfiltered(subscribe, sites=scan_sites, diagnostics=diagnostics)
             now = _utc_now()
             fresh = []
             for context in contexts:
@@ -1103,7 +1130,8 @@ class SubscribeOverwatcher(_PluginBase):
                     entry["last_scan_count"] = len(fresh)
                     entry["search_diagnostics"] = _search_diagnostics_snapshot(diagnostics)
                     entry.pop("last_error", None)
-                    self._remember_search(subscribe, contexts, [], "候选扫描", now, diagnostics)
+                    self._remember_search(subscribe, contexts, [], "候选扫描", now, diagnostics,
+                                          covered_sites=scan_sites)
                     self._save_state()
                     return True
         except Exception:
@@ -1285,19 +1313,36 @@ class SubscribeOverwatcher(_PluginBase):
     def _remember_search(
         self, subscribe: Any, contexts: list[Any], sites: list[int], source: str, searched_at: str,
         diagnostics: Optional[dict[str, Any]] = None,
+        *, covered_sites: Optional[list[int]] = None, site_sources: Optional[dict[int, dict[str, Any]]] = None,
+        oldest_at: Optional[float] = None,
     ) -> None:
-        """每个媒体和站点范围只保留最新一轮结果，不合并历次搜索。"""
+        """每个媒体和站点范围只保留一组结果，并记录实际覆盖的站点。"""
         with self._lock:
             key = (_identity(subscribe), tuple(sorted(set(sites))))
+            coverage = sorted(set(covered_sites if covered_sites is not None else _search_site_scope(sites)[0]))
             if key not in self._preview_search_cache and len(self._preview_search_cache) >= MAX_CACHE_ENTRIES:
                 oldest = min(self._preview_search_cache, key=lambda item: self._preview_search_cache[item]["at"])
-                self._forget_search_cache(lambda item: item == oldest)
+                self._forget_search_cache(lambda item: item == oldest, reason="超过内存缓存组数上限")
             self._search_cache_sequence += 1
+            stamp = time.time()
+            monotonic_stamp = time.monotonic()
+            sources = site_sources or {
+                site_id: {"source": source, "searched_at": searched_at,
+                          "searched_ts": stamp, "at": monotonic_stamp}
+                for site_id in coverage
+            }
+            oldest_stamp = min((item.get("searched_ts", stamp) for item in sources.values()), default=stamp)
             self._preview_search_cache[key] = {
-                "at": time.monotonic(), "contexts": contexts, "source": source, "searched_at": searched_at,
+                "at": monotonic_stamp, "contexts": contexts, "source": source, "searched_at": searched_at,
                 "sequence": self._search_cache_sequence,
-                "searched_ts": time.time(),
+                "searched_ts": stamp,
+                "oldest_searched_ts": oldest_stamp,
+                "oldest_at": oldest_at if oldest_at is not None else
+                             min((item.get("at", monotonic_stamp) for item in sources.values()),
+                                 default=monotonic_stamp),
                 "diagnostics": diagnostics,
+                "covered_sites": coverage,
+                "site_sources": sources,
             }
             store = self._disk_search_cache()
             if store is not None:
@@ -1336,63 +1381,202 @@ class SubscribeOverwatcher(_PluginBase):
         if restored:
             logger.info(f"已恢复 {len(restored)} 组持久搜索缓存，预览无需重新搜索对应站点范围")
 
-    def _forget_search_cache(self, predicate: Any, *, extra_keys: tuple = ()) -> None:
+    def _forget_search_cache(self, predicate: Any, *, extra_keys: tuple = (), reason: str = "主动清理") -> None:
         """容量淘汰、批准、删除订阅和主动刷新同时移除内存与磁盘结果。"""
         store = self._disk_search_cache()
         for key in set(self._preview_search_cache).union(extra_keys):
             if predicate(key):
                 self._preview_search_cache.pop(key, None)
+                logger.info(f"搜索缓存清理：订阅身份 {key[0]}，站点范围 {key[1] or '默认'}；原因：{reason}")
                 if store is not None:
                     try:
                         store.delete(key)
                     except OSError:
                         logger.warning("无法移除持久搜索缓存，请检查插件数据目录")
 
-    def _cached_search(self, subscribe: Any, sites: list[int]) -> Optional[dict[str, Any]]:
-        """预览及开始前的状态检查共用同一缓存选择和站点筛选。"""
+    def _cache_parts(self, subscribe: Any, required_sites: list[int]) -> tuple[list[dict[str, Any]], list[int]]:
+        """为每个站点选最近的覆盖缓存；未记录覆盖站点的旧默认缓存不能证明范围。"""
+        selected: dict[int, dict[str, Any]] = {}
         identity = _identity(subscribe)
-        selected_sites = set(sites)
         with self._lock:
-            compatible = [
-                entry for (media_identity, cached_sites), entry in self._preview_search_cache.items()
-                if media_identity == identity and (not cached_sites or
-                    (selected_sites and selected_sites.issubset(cached_sites)))
-            ]
-            if not compatible:
-                return None
-            cached = max(compatible, key=lambda item: (item["at"], item["sequence"]))
-            diagnostics = copy.deepcopy(cached.get("diagnostics"))
-            if sites and diagnostics:
-                diagnostics["site_failures"] = [item for item in diagnostics.get("site_failures", [])
-                                                if item.get("site_id") in selected_sites]
-            return {**cached, "diagnostics": diagnostics, "contexts": [
-                context for context in cached["contexts"]
-                if not sites or getattr(getattr(context, "torrent_info", None), "site", None) in sites
-            ]}
+            for (media_identity, cached_sites), entry in self._preview_search_cache.items():
+                if media_identity != identity:
+                    continue
+                recorded = entry.get("covered_sites")
+                covered = set(recorded) if isinstance(recorded, list) else set(cached_sites)
+                for site_id in set(required_sites) & covered:
+                    previous = selected.get(site_id)
+                    source = (entry.get("site_sources") or {}).get(site_id) or {}
+                    freshness = (source.get("searched_ts", entry["searched_ts"]),
+                                 entry["at"], entry["sequence"])
+                    if previous is None or freshness > previous["freshness"]:
+                        selected[site_id] = {"entry": entry, "key": (media_identity, cached_sites),
+                                             "freshness": freshness}
+        grouped: dict[tuple, dict[str, Any]] = {}
+        for site_id, choice in selected.items():
+            part = grouped.setdefault(choice["key"], {**choice, "sites": []})
+            part["sites"].append(site_id)
+        return list(grouped.values()), sorted(set(required_sites) - selected.keys())
+
+    @staticmethod
+    def _combine_cache_parts(subscribe: Any, parts: list[dict[str, Any]]) -> dict[str, Any]:
+        """按站点拼接资源与搜索词证据，避免把其他范围的结果算入预览。"""
+        contexts = []
+        site_sources: dict[int, dict[str, Any]] = {}
+        keywords: dict[str, list[str]] = {}
+        original_ids: set[str] = set()
+        failures: dict[int, dict[str, Any]] = {}
+        original_failures: dict[int, dict[str, Any]] = {}
+        original_settings = None
+        originals_compatible = True
+        supplemental_failed = False
+        for part in parts:
+            entry = part["entry"]
+            sites = set(part["sites"])
+            part_contexts = [context for context in entry["contexts"]
+                             if getattr(getattr(context, "torrent_info", None), "site", None) in sites]
+            contexts.extend(part_contexts)
+            resource_ids = set()
+            for context in part_contexts:
+                try:
+                    item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if item:
+                    resource_ids.add(item["id"])
+            diagnostics = entry.get("diagnostics") or {}
+            for resource_id in resource_ids:
+                words = keywords.setdefault(resource_id, [])
+                words.extend(word for word in (diagnostics.get("resource_keywords") or {}).get(resource_id, [])
+                             if word not in words)
+            original = diagnostics.get("original_search") or {}
+            settings = (original.get("keyword"), original.get("search_imdbid"), original.get("custom_words"))
+            if not original.get("checked") or (original_settings is not None and settings != original_settings):
+                originals_compatible = False
+            original_settings = settings if original_settings is None else original_settings
+            original_ids.update(resource_ids & set(original.get("resource_ids") or []))
+            for failure in diagnostics.get("site_failures") or []:
+                if failure.get("site_id") in sites:
+                    failures[failure["site_id"]] = failure
+            for failure in original.get("site_failures") or []:
+                if failure.get("site_id") in sites:
+                    original_failures[failure["site_id"]] = failure
+            supplemental_failed |= bool(diagnostics.get("supplemental_failed"))
+            for site_id in sites:
+                site_sources[site_id] = (entry.get("site_sources") or {}).get(site_id) or {
+                    "source": entry["source"], "searched_at": entry["searched_at"],
+                    "searched_ts": entry["searched_ts"], "at": entry["at"],
+                }
+        newest = max((part["entry"] for part in parts), key=lambda entry: (entry["at"], entry["sequence"]))
+        newest_source = max(site_sources.values(), key=lambda item: item["searched_ts"], default={})
+        oldest_at = min((site_sources[site_id].get("at", part["entry"]["at"])
+                         for part in parts for site_id in part["sites"]), default=time.monotonic())
+        original_keyword, original_imdb, original_words = original_settings or (None, None, None)
+        diagnostics = {
+            "resource_keywords": keywords, "site_failures": list(failures.values()),
+            "original_search": {
+                "checked": originals_compatible and bool(parts), "keyword": original_keyword,
+                "search_imdbid": original_imdb, "custom_words": original_words,
+                "resource_ids": sorted(original_ids) if originals_compatible else [],
+                "site_failures": list(original_failures.values()),
+            },
+            "supplemental_failed": supplemental_failed,
+            "rounds": copy.deepcopy((parts[0]["entry"].get("diagnostics") or {}).get("rounds") or [])
+            if len(parts) == 1 else [],
+        }
+        return {
+            "contexts": contexts, "diagnostics": diagnostics, "at": oldest_at,
+            "searched_at": newest_source.get("searched_at", newest["searched_at"]),
+            "searched_ts": newest_source.get("searched_ts", newest["searched_ts"]),
+            "source": newest["source"] if len(parts) == 1 else "多个站点范围的搜索缓存",
+            "site_sources": site_sources,
+        }
+
+    def _cached_search(self, subscribe: Any, sites: list[int]) -> Optional[dict[str, Any]]:
+        """从最近的覆盖缓存按站点组合结果；任一站点缺失则返回空。"""
+        required, _names = _search_site_scope(sites)
+        if not required:
+            with self._lock:
+                cached = self._preview_search_cache.get((_identity(subscribe), ()))
+                return cached if cached is not None and cached.get("covered_sites") == [] else None
+        parts, missing = self._cache_parts(subscribe, required)
+        return None if missing else self._combine_cache_parts(subscribe, parts)
 
     def _preview_contexts(
         self, subscribe: Any, refresh_search: bool, timings: dict[str, float], sites: list[int],
-    ) -> tuple[list[Any], bool, float, str, str, Any]:
-        """单站可复用覆盖该站的扫描；全站预览不能复用不完整的单站搜索。"""
+    ) -> tuple[list[Any], bool, float, str, str, Any, dict[str, Any]]:
+        """复用已覆盖站点，只向缺少缓存的站点发出搜索。"""
+        required, names = _search_site_scope(sites)
         cached = self._cached_search(subscribe, sites) if not refresh_search else None
         if cached is not None:
             return (cached["contexts"], True, time.monotonic() - cached["at"], cached["source"],
-                    cached["searched_at"], cached.get("diagnostics"))
+                    cached["searched_at"], cached.get("diagnostics"), {
+                        "reused_sites": required, "searched_sites": [],
+                        "reused_site_labels": _site_labels(required, names), "searched_site_labels": [],
+                        "site_sources": {site_id: {key: value for key, value in item.items() if key != "at"}
+                                         for site_id, item in (cached.get("site_sources") or {}).items()},
+                    })
+        parts, missing = self._cache_parts(subscribe, required) if not refresh_search else ([], required)
+        if not required:
+            missing = []
+        reused = sorted(set(required) - set(missing)) if not refresh_search else []
+        query_sites = missing if required else sites
+        logger.info(f"订阅 {subscribe.id} 预览缓存覆盖：复用 {_site_labels(reused, names) or '无'}；"
+                    f"{'手动刷新' if refresh_search else '缺失'} {_site_labels(required if refresh_search else missing, names) or '默认范围'}；"
+                    f"本轮只搜索 {_site_labels(required if refresh_search else missing, names) or '默认范围'}")
         key = (_identity(subscribe), tuple(sorted(set(sites))))
         diagnostics: dict[str, Any] = {}
         try:
-            contexts = self._search_unfiltered(subscribe, timings, sites=sites, diagnostics=diagnostics)
+            fresh_contexts = self._search_unfiltered(subscribe, timings, sites=query_sites,
+                                                     diagnostics=diagnostics)
         except Exception:
             if refresh_search:
                 with self._lock:
                     # 主动刷新失败后，旧的覆盖缓存不能伪装成本轮搜索结果。
-                    self._forget_search_cache(lambda item: item[0] == key[0] and (not item[1] or
-                                              (sites and set(sites).issubset(item[1]))), extra_keys=(key,))
+                    def affected(item: tuple) -> bool:
+                        if item[0] != key[0]:
+                            return False
+                        if not sites:
+                            return True
+                        entry = self._preview_search_cache.get(item) or {}
+                        covered = entry.get("covered_sites")
+                        old_scope = set(covered) if isinstance(covered, list) else set(item[1] or required)
+                        return bool(set(required) & old_scope)
+
+                    self._forget_search_cache(affected, extra_keys=(key,),
+                                              reason="主动重新搜索失败")
             raise
         searched_at = _utc_now()
-        # 成功时只替换当前范围，较宽范围的完整搜索仍可供切换范围后复用。
-        self._remember_search(subscribe, contexts, sites, "规则预览搜索", searched_at, diagnostics)
-        return contexts, False, 0.0, "规则预览搜索", searched_at, diagnostics
+        stamp = time.time()
+        if parts:
+            fresh_entry = {"contexts": fresh_contexts, "diagnostics": diagnostics,
+                           "source": "缺失站点补搜", "searched_at": searched_at,
+                           "searched_ts": stamp, "at": time.monotonic(),
+                           "sequence": self._search_cache_sequence + 1}
+            combined = self._combine_cache_parts(subscribe, [*parts, {
+                "entry": fresh_entry, "sites": missing,
+            }])
+            contexts = combined["contexts"]
+            diagnostics = combined["diagnostics"]
+            site_sources = combined["site_sources"]
+            oldest_at = combined["at"]
+            source = "部分站点复用缓存，其余站点补搜"
+        else:
+            contexts = fresh_contexts
+            site_sources = None
+            oldest_at = None
+            source = "规则预览搜索"
+        # 成功时补成当前完整范围；较宽范围已有缓存仍可供切换范围后复用。
+        self._remember_search(subscribe, contexts, sites, source, searched_at, diagnostics,
+                              covered_sites=required, site_sources=site_sources, oldest_at=oldest_at)
+        return (contexts, False, max(0.0, time.monotonic() - oldest_at) if parts else 0.0,
+                source, searched_at, diagnostics, {
+                    "reused_sites": reused, "searched_sites": required if refresh_search else missing,
+                    "reused_site_labels": _site_labels(reused, names),
+                    "searched_site_labels": _site_labels(required if refresh_search else missing, names),
+                    "site_sources": {site_id: {key: value for key, value in item.items() if key != "at"}
+                                     for site_id, item in (site_sources or {}).items()},
+                })
 
     @staticmethod
     def _rule_rejection(
@@ -1437,9 +1621,10 @@ class SubscribeOverwatcher(_PluginBase):
                 setattr(working, field, None)
         requested_keyword_choice = _keyword_selection(keyword_choice)
         search_sites = getattr(working, "sites", None) or []
-        contexts, cached, cache_age, source, result_at, diagnostics = self._preview_contexts(
+        contexts, cached, cache_age, source, result_at, diagnostics, cache_coverage = self._preview_contexts(
             subscribe, refresh_search, timings, search_sites,
         )
+        actual_search_sites = sorted(set(cache_coverage["reused_sites"] + cache_coverage["searched_sites"]))
         # 旧版持久缓存可能含同一详情页的多份结果，预览时也要收敛它们。
         distinct = _distinct_contexts(contexts)
         id_aliases = {}
@@ -1479,7 +1664,8 @@ class SubscribeOverwatcher(_PluginBase):
             target_id = id_aliases.get(resource_id, resource_id)
             selected_words = resource_keywords.setdefault(target_id, [])
             selected_words.extend(word for word in words if word not in selected_words)
-        candidate_outside_scope = bool(candidate and search_sites and candidate.get("site_id") not in search_sites)
+        candidate_outside_scope = bool(candidate and actual_search_sites
+                                       and candidate.get("site_id") not in actual_search_sites)
         verification_ids = [(candidate or {}).get("id")]
         if candidate_outside_scope:
             # 候选只是规则模板；改选其他站点时，以该范围内符合规则的资源验证搜索词。
@@ -1509,7 +1695,7 @@ class SubscribeOverwatcher(_PluginBase):
                         for resource_id in original_search.get("resource_ids") or []} if original_checked else set()
         original_matched = bool(candidate and any(resource_id in original_ids for resource_id in verification_ids))
         failed_site_ids = {item.get("site_id") for item in original_search.get("site_failures") or []}
-        site_failed = bool(set(search_sites) & failed_site_ids) if candidate_outside_scope else bool(
+        site_failed = bool(set(actual_search_sites) & failed_site_ids) if candidate_outside_scope else bool(
             candidate and failed_site_ids and (candidate.get("site_id") is None
                                              or candidate.get("site_id") in failed_site_ids)
         )
@@ -1636,14 +1822,20 @@ class SubscribeOverwatcher(_PluginBase):
             "searched_at": now, "searched_ts": datetime.now(timezone.utc).timestamp(),
             "search_cached": cached, "search_age_seconds": round(cache_age, 1),
             "search_result_count": len(contexts),
-            "search_trigger": "cache" if cached else "manual" if refresh_search else "cache_miss",
+            "search_trigger": "cache" if cached else "manual" if refresh_search else
+                              "partial_cache" if cache_coverage["reused_sites"] else "cache_miss",
+            "search_reused_sites": cache_coverage["reused_sites"],
+            "search_searched_sites": cache_coverage["searched_sites"],
+            "search_reused_site_labels": cache_coverage["reused_site_labels"],
+            "search_searched_site_labels": cache_coverage["searched_site_labels"],
+            "search_site_sources": cache_coverage["site_sources"],
             "rule_groups_checked": True, "rule_groups_disabled": groups_disabled,
             "rule_groups_auto_disabled": auto_disabled, "rule_group_notice": notice,
             "rule_group_comparison": {
                 "names": policy["names"], "source": policy["source"],
                 "with_groups_count": with_groups_count, "without_groups_count": len(base_matches),
             } if policy["names"] else None,
-            "search_source": source, "search_result_at": result_at, "search_sites": search_sites,
+            "search_source": source, "search_result_at": result_at, "search_sites": actual_search_sites,
             "search_diagnostics": _search_diagnostics_snapshot(diagnostics),
             "search_keyword": search_keyword, "original_search_keyword": getattr(subscribe, "keyword", None),
             "keyword_choice": effective_keyword_choice,
@@ -1869,7 +2061,7 @@ class SubscribeOverwatcher(_PluginBase):
             logger.exception(f"批准订阅 {sid} 时写入规则或状态失败")
             return False, "规则或状态保存失败，订阅仍保持拦截"
         with self._lock:
-            self._forget_search_cache(lambda key: key[0] == entry.get("identity"))
+            self._forget_search_cache(lambda key: key[0] == entry.get("identity"), reason="订阅批准")
         if resume_state != "S":
             self._schedule_approved_search(sid)
         else:
@@ -2166,12 +2358,26 @@ class SubscribeOverwatcher(_PluginBase):
                 sites = rules.get("sites")
                 if sites is None:
                     sites = getattr(subscribe, "sites", None) or []
+                required, names = _search_site_scope(sites)
                 cached = self._cached_search(subscribe, sites)
+                parts, missing = self._cache_parts(subscribe, required) if cached is None else ([], [])
+                reused = sorted(set(required) - set(missing)) if cached is None else required
                 status = "manual" if config.get("refresh_search") else (
+                    "partial_cache" if cached is None and reused else
                     "cache_miss" if cached is None else "cached" if cached["contexts"] else "cached_empty"
                 )
-                return {"success": True, "status": status, "search_sites": sites,
-                        "search_result_count": len(cached["contexts"]) if cached is not None else None}
+                result = {"success": True, "status": status, "search_sites": sites if sites else required,
+                          "search_result_count": len(cached["contexts"]) if cached is not None else None}
+                if cached is None or config.get("refresh_search"):
+                    result["missing_sites"] = [
+                        {"id": site_id, "name": names.get(site_id, f"站点 {site_id}")}
+                        for site_id in (required if config.get("refresh_search") else missing)
+                    ]
+                    result["reused_sites"] = [
+                        {"id": site_id, "name": names.get(site_id, f"站点 {site_id}")}
+                        for site_id in ([] if config.get("refresh_search") else reused)
+                    ]
+                return result
         except (ValueError, TypeError) as error:
             return {"success": False, "message": str(error) or "预览选项无效"}
 
@@ -2704,6 +2910,8 @@ class SubscribeOverwatcher(_PluginBase):
         """
         with self._lock:
             self._search_stop.set()
+            if self._preview_search_cache:
+                logger.info(f"搜索缓存清理：停止服务，释放内存缓存 {len(self._preview_search_cache)} 组；磁盘记录保留")
             self._preview_search_cache.clear()
             self._search_cache_loaded = False
             self._queued_scan_ids.clear()

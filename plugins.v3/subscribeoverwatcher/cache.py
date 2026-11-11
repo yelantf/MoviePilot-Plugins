@@ -16,7 +16,7 @@ from app.sdk.logging import logger
 from .rules import public_page_url
 
 
-MAX_CACHE_ENTRIES = 64
+MAX_CACHE_ENTRIES = 256
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 _TORRENT_FIELDS = (
     "site", "site_name", "site_order", "title", "description", "media_source", "media_id",
@@ -114,8 +114,11 @@ class SearchCacheStore:
         (self.path / self.filename(key)).unlink(missing_ok=True)
 
     def clear(self) -> None:
-        for file in self._files():
+        files = self._files()
+        for file in files:
             file.unlink(missing_ok=True)
+        if files:
+            logger.info(f"搜索缓存清理：插件停用，移除磁盘缓存 {len(files)} 组")
 
     def prune(self, *, newest: str = "") -> set[str]:
         files = sorted(self._files(), key=lambda file: (file.name == newest, file.stat().st_mtime_ns, file.name),
@@ -126,8 +129,16 @@ class SearchCacheStore:
         for file in files:
             size = file.stat().st_size
             if kept >= self.max_entries or total + size > self.max_bytes:
+                reason = f"超过 {self.max_entries} 组上限" if kept >= self.max_entries else \
+                    f"超过 {self.max_bytes // (1024 * 1024)} MiB 总容量"
+                try:
+                    values = json.loads(file.read_text())
+                    label = f"订阅身份 {values.get('identity')}，站点范围 {values.get('sites') or '默认'}"
+                except (OSError, ValueError, TypeError, AttributeError):
+                    label = f"缓存文件 {file.name}"
                 file.unlink(missing_ok=True)
                 removed.add(file.name)
+                logger.info(f"搜索缓存清理：{label}，{size} B；原因：{reason}")
             else:
                 kept += 1
                 total += size
@@ -139,12 +150,17 @@ class SearchCacheStore:
             payload = {"schema": 1, "identity": key[0], "sites": list(key[1]),
                        "searched_ts": entry["searched_ts"], "searched_at": entry["searched_at"],
                        "source": entry["source"], "sequence": entry["sequence"],
+                       "oldest_searched_ts": entry.get("oldest_searched_ts"),
                        "diagnostics": entry.get("diagnostics"),
+                       "covered_sites": entry.get("covered_sites"),
+                       "site_sources": {site_id: {key: value for key, value in source.items() if key != "at"}
+                                        for site_id, source in (entry.get("site_sources") or {}).items()},
                        "contexts": [context_snapshot(context) for context in entry["contexts"]]}
             data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
             if len(data) > self.max_bytes:
                 self.delete(key)
-                logger.warning("本轮搜索超过持久缓存容量上限，仅在内存中复用")
+                logger.warning(f"搜索缓存清理：订阅身份 {key[0]}，站点范围 {key[1] or '默认'}；"
+                               "本轮结果超过单组持久容量上限，旧磁盘记录已移除；本轮仅在内存中复用")
                 return set()
             with tempfile.NamedTemporaryFile(dir=self.path, prefix=".write-", delete=False) as stream:
                 temporary = Path(stream.name)
@@ -156,7 +172,8 @@ class SearchCacheStore:
         except (OSError, TypeError, ValueError, AttributeError, RecursionError):
             # 不允许重启后恢复上一轮结果，尤其是用户明确要求重新搜索的时候。
             self.delete(key)
-            logger.warning("搜索缓存无法写入磁盘，本轮仍可在内存中复用，详情请检查插件数据目录")
+            logger.warning(f"搜索缓存清理：订阅身份 {key[0]}，站点范围 {key[1] or '默认'}；"
+                           "写入失败，旧磁盘记录已移除；本轮仍可在内存中复用，请检查插件数据目录")
             return set()
         finally:
             if temporary is not None:
@@ -171,21 +188,47 @@ class SearchCacheStore:
                 identity = values["identity"]
                 sites = values["sites"]
                 stamp = values["searched_ts"]
+                covered = values.get("covered_sites")
+                oldest_stamp = values.get("oldest_searched_ts") or stamp
+                raw_sources = values.get("site_sources") or {}
                 if values.get("schema") != 1 or identity not in identities \
                         or not isinstance(sites, list) or any(type(site) is not int or site <= 0 for site in sites) \
                         or type(stamp) not in (float, int) or not math.isfinite(stamp) \
+                        or (covered is not None and (not isinstance(covered, list)
+                            or any(type(site) is not int or site <= 0 for site in covered))) \
+                        or (sites and covered is not None and set(covered) != set(sites)) \
+                        or type(oldest_stamp) not in (float, int) or not math.isfinite(oldest_stamp) \
+                        or not isinstance(raw_sources, dict) \
                         or not isinstance(values["contexts"], list) or type(values["sequence"]) is not int:
                     raise ValueError("缓存格式或订阅身份已变化")
+                sources = {}
+                for raw_id, source in raw_sources.items():
+                    site_id = int(raw_id)
+                    source_stamp = source["searched_ts"]
+                    if site_id <= 0 or not isinstance(source, dict) or type(source_stamp) not in (int, float) \
+                            or not math.isfinite(source_stamp):
+                        raise ValueError("缓存站点来源无效")
+                    sources[site_id] = {
+                        **source, "at": time.monotonic() - max(0.0, time.time() - source_stamp),
+                    }
                 key = (identity, tuple(sorted(set(sites))))
                 if self.filename(key) != file.name:
                     raise ValueError("缓存索引不匹配")
+                if not sites and covered is None:
+                    file.unlink(missing_ok=True)
+                    logger.info(f"搜索缓存清理：文件 {file.name}；原因：旧默认范围缓存未记录实际覆盖站点")
+                    continue
                 restored[key] = {
                     "at": time.monotonic() - max(0, time.time() - stamp), "searched_ts": stamp,
+                    "oldest_at": time.monotonic() - max(0, time.time() - oldest_stamp),
+                    "oldest_searched_ts": oldest_stamp,
                     "searched_at": values["searched_at"], "source": values["source"],
                     "sequence": values["sequence"], "diagnostics": values.get("diagnostics"),
+                    "covered_sites": values.get("covered_sites"),
+                    "site_sources": sources,
                     "contexts": [restore_context(context) for context in values["contexts"]],
                 }
             except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError, RecursionError):
                 file.unlink(missing_ok=True)
-                logger.info("已移除无法恢复或订阅身份已变化的搜索缓存")
+                logger.info(f"搜索缓存清理：文件 {file.name}；原因：无法恢复或订阅身份已变化")
         return restored

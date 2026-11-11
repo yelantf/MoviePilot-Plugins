@@ -535,10 +535,13 @@ async function showSearchProgress(submitted) {
   previewProgress.value = '正在检查当前站点范围是否有可复用的搜索缓存…'
   try {
     const status = responseBody(await props.api.post(`plugin/${PLUGIN_ID}/preview-status`, submitted))
+    const missing = (status?.missing_sites || []).map(site => `${site.name}（${site.id}）`).join('、')
+    const reused = (status?.reused_sites || []).map(site => `${site.name}（${site.id}）`).join('、')
     const messages = {
       cache_miss: submitted.rule_mode === 'all_sites' && submitted.operation === 'preview'
-        ? '当前没有可复用的全站搜索缓存。数据页候选是独立保存的历史记录，不能代替完整搜索；已触发全站搜索，正在等待站点响应和资源解析。'
-        : '当前站点范围没有可复用缓存，已触发搜索；正在等待站点响应和资源解析，可能需要较长时间。',
+        ? `当前没有可复用的全站搜索缓存。数据页候选是独立保存的历史记录，不能代替完整搜索；缺失站点：${missing || '当前默认范围'}。已触发搜索，正在等待站点响应和资源解析。`
+        : `当前站点范围没有可复用缓存，已触发搜索；缺失站点：${missing || '当前范围'}。正在等待站点响应和资源解析。`,
+      partial_cache: `已有缓存：${reused}；缺失站点：${missing}。本次只搜索缺失站点，正在等待站点响应和资源解析。`,
       cached: '正在复用搜索缓存并按当前规则筛选，无需重新搜索站点。',
       cached_empty: '当前站点范围的搜索缓存为空，本次将复用空结果；建议手动重新搜索。',
     }

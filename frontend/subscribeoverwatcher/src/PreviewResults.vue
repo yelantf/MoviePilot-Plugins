@@ -23,7 +23,7 @@
     </p>
     <v-alert v-if="preview.search_diagnostics?.site_failures?.length" type="warning"
       variant="tonal" density="compact" class="mb-3">
-      该次搜索有失败或暂缓的站点，结果可能不完整。失败站点仅在本条订阅本轮停止后续查询；其他订阅独立尝试，站点自身的访问限制仍生效。
+      当前结果涉及失败或暂缓的站点，可能不完整。失败站点仅在对应订阅的那轮搜索中停止后续查询；其他订阅独立尝试，站点自身的访问限制仍生效。
       <div v-for="site in preview.search_diagnostics.site_failures" :key="site.site_id">
         {{ site.site_name }}：{{ site.reason }}。
         <span v-if="site.until">{{ preview.search_cached ? '当时最早可重试' : '最早可重试' }} {{ localTime(site.until) }}。</span>
@@ -45,12 +45,18 @@
     <p class="text-caption text-medium-emphasis mb-2">
       预览生成于 {{ preview.searched_at }} · {{ preview.search_cached ? `复用 ${age(preview.search_age_seconds)}前的搜索结果`
         : preview.search_trigger === 'cache_miss' ? '没有可复用缓存，本次已触发搜索'
+        : preview.search_trigger === 'partial_cache' ? `复用最早 ${age(preview.search_age_seconds)}前的结果，仅补搜缺失站点`
         : preview.search_trigger === 'manual' ? '本次手动重新搜索' : '本次重新搜索' }}
+    </p>
+    <p v-if="preview.search_reused_site_labels?.length || preview.search_searched_site_labels?.length"
+      class="text-caption text-medium-emphasis mb-2">
+      复用缓存：{{ preview.search_reused_site_labels?.join('、') || '无' }}；
+      本次搜索：{{ preview.search_searched_site_labels?.join('、') || '无' }}。
     </p>
     <p v-if="preview.search_source" class="text-caption text-medium-emphasis mb-2">
       搜索结果来自{{ preview.search_source }} · {{ preview.search_result_at }} ·
-      {{ preview.search_sites?.length ? `搜索站点：${preview.search_sites.join('、')}` : '搜索全部站点' }}。
-      使用该范围最新一次完整搜索，历史候选仍保留展示；资源是否仍存在以重新搜索为准。
+      {{ preview.search_sites?.length ? `覆盖站点：${preview.search_sites.join('、')}` : '当前默认站点范围' }}。
+      已缓存站点可能来自不同搜索轮次；历史候选仍保留展示，资源是否仍存在以重新搜索为准。
     </p>
     <p v-if="preview.timings" class="text-body-2 mb-3">
       总耗时 {{ seconds(preview.timings.total_seconds) }} 秒：媒体识别 {{ seconds(preview.timings.recognition_seconds) }} 秒，

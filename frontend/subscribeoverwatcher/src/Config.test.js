@@ -216,7 +216,7 @@ describe('custom configuration actions', () => {
       site_failures: [{ site_id: 5, site_name: '天空', reason: '站点限制访问或登录失效', until: 1800000000 }] } }
     const wrapper = mount(PreviewResults, { props: { preview }, global: { components } })
     expect(wrapper.text()).toContain('天空：站点限制访问或登录失效')
-    expect(wrapper.text()).toContain('结果可能不完整')
+    expect(wrapper.text()).toContain('可能不完整')
     expect(wrapper.text()).toContain('All Creatures Great and Small S07')
     expect(wrapper.text()).toContain('媒体匹配 3 条，目标季保留 0 条')
     expect(wrapper.text()).not.toContain('建议手动重新搜索')
@@ -571,6 +571,37 @@ describe('custom configuration actions', () => {
     expect(wrapper.find('[role="status"]').text()).toContain('数据页候选是独立保存的历史记录')
     finishSearch({ success: false, message: '搜索失败' })
     await flushPromises()
+    wrapper.unmount()
+  })
+
+  it('names the missing sites while only searching the uncovered part of the default range', async () => {
+    const data = candidateSnapshot()
+    let finishSearch
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(url => url.endsWith('/preview-status')
+        ? Promise.resolve({ success: true, status: 'partial_cache',
+          reused_sites: [{ id: 5, name: '样例站' }],
+          missing_sites: [{ id: 7, name: '另一个站' }] })
+        : new Promise(resolve => { finishSearch = resolve })),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    await wrapper.find('select[aria-label="站点范围"]').setValue('all_sites')
+    await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
+    await flushPromises()
+    const status = wrapper.find('[role="status"]').text()
+    expect(status).toContain('样例站（5）')
+    expect(status).toContain('缺失站点：另一个站（7）')
+    expect(status).toContain('只搜索缺失站点')
+    const preview = { ...previewSnapshot(data.model.rule_json), search_cached: false,
+      search_trigger: 'partial_cache', search_reused_site_labels: ['样例站（5）'],
+      search_searched_site_labels: ['另一个站（7）'] }
+    finishSearch({ success: true, message: '预览完成', preview })
+    await flushPromises()
+    expect(wrapper.find('.preview-results').text()).toContain('复用缓存：样例站（5）')
+    expect(wrapper.find('.preview-results').text()).toContain('本次搜索：另一个站（7）')
     wrapper.unmount()
   })
 
