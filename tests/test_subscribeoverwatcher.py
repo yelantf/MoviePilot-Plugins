@@ -2141,6 +2141,25 @@ def test_custom_sites_requires_selection(plugin_host):
     assert plugin.preview_candidate(choice, '{"sites":[]}', "custom")[0] is False
 
 
+def test_data_page_handoff_does_not_refresh_but_all_sites_needs_full_cache(plugin_host):
+    host = plugin_host
+    plugin, choice, _chosen = _prepare_directory_confirmation(host)
+    host.search_calls.clear()
+    assert choice in json.dumps(plugin.get_page(), ensure_ascii=False)
+    plugin.get_form()
+    config = {"operation": "preview", "candidate": choice, "rule_mode": "all_sites"}
+    assert plugin.preview_search_status(config)["status"] == "cached"
+    assert plugin.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert host.search_calls == []
+
+    plugin._forget_search_cache(lambda _key: True)
+    assert choice in json.dumps(plugin.get_page(), ensure_ascii=False)
+    plugin.get_form()
+    assert plugin.preview_search_status(config)["status"] == "cache_miss"
+    assert plugin.preview_candidate(choice, rule_mode="all_sites")[0]
+    assert len(host.search_calls) == 2
+
+
 def test_candidate_labels_do_not_claim_unrecognized_or_sparse_episodes_are_complete(plugin_host):
     """标题整季词和已识别集号分别展示，跳号不能渲染成连续覆盖。"""
     module = plugin_host.module

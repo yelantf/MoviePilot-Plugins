@@ -105,9 +105,10 @@
                   :disabled="!!busy" density="comfortable" hide-details @update:model-value="updateSiteScope" />
               </v-col>
             </v-row>
-            <v-select v-if="form.rule_mode === 'custom'" v-model="form.rule_sites" label="自选站点（可多选）"
-              :items="options.rule_sites" multiple chips closable-chips clearable :disabled="!!busy || !selectedCandidate"
-              density="comfortable" hint="至少选一个站点；预览只搜索所选站点，确认后写入订阅。"
+            <v-autocomplete v-if="form.rule_mode === 'custom'" v-model="form.rule_sites" label="自选站点（可多选）"
+              :items="options.rule_sites" :filter-keys="['title']" multiple chips closable-chips clearable
+              :disabled="!!busy || !selectedCandidate" density="comfortable" placeholder="输入站点名称筛选"
+              no-data-text="没有匹配的站点" hint="输入名称可筛选站点；至少选一个，确认后写入订阅。"
               persistent-hint class="mt-3" @update:model-value="updateCustomSites" />
             <v-select v-model="form.keyword_choice" label="确认后的订阅搜索词"
               :items="keywordChoices" :disabled="!!busy || !selectedCandidate" density="comfortable"
@@ -535,7 +536,9 @@ async function showSearchProgress(submitted) {
   try {
     const status = responseBody(await props.api.post(`plugin/${PLUGIN_ID}/preview-status`, submitted))
     const messages = {
-      cache_miss: '当前站点范围没有可复用缓存，已触发搜索；正在等待站点响应和资源解析，可能需要较长时间。',
+      cache_miss: submitted.rule_mode === 'all_sites' && submitted.operation === 'preview'
+        ? '当前没有可复用的全站搜索缓存。数据页候选是独立保存的历史记录，不能代替完整搜索；已触发全站搜索，正在等待站点响应和资源解析。'
+        : '当前站点范围没有可复用缓存，已触发搜索；正在等待站点响应和资源解析，可能需要较长时间。',
       cached: '正在复用搜索缓存并按当前规则筛选，无需重新搜索站点。',
       cached_empty: '当前站点范围的搜索缓存为空，本次将复用空结果；建议手动重新搜索。',
     }

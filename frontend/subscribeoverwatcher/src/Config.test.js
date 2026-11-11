@@ -22,7 +22,7 @@ components.VAlert = defineComponent({
   template: '<div>{{ text }}<slot /></div>',
 })
 const Select = defineComponent({
-  props: ['modelValue', 'items', 'label', 'disabled', 'multiple'],
+  props: ['modelValue', 'items', 'label', 'disabled', 'multiple', 'filterKeys', 'placeholder'],
   emits: ['update:modelValue'],
   template: `<select :aria-label="label" :disabled="disabled" :multiple="multiple" :value="modelValue ?? ''"
     @change="$emit('update:modelValue', multiple
@@ -268,12 +268,15 @@ describe('custom configuration actions', () => {
     const data = candidateSnapshot()
     const api = { get: vi.fn().mockResolvedValue(data), post: vi.fn().mockResolvedValue({ success: false }) }
     const wrapper = mount(Config, { props: { api },
-      global: { components: { ...components, VSelect: Select } } })
+      global: { components: { ...components, VSelect: Select, VAutocomplete: Select } } })
     await flushPromises()
     const scope = wrapper.find('select[aria-label="站点范围"]')
     await scope.setValue('custom')
-    wrapper.findAllComponents(Select).find(select => select.props('label') === '自选站点（可多选）')
-      .vm.$emit('update:modelValue', [5, 7])
+    const sitePicker = wrapper.findAllComponents(Select)
+      .find(select => select.props('label') === '自选站点（可多选）')
+    expect(sitePicker.props('filterKeys')).toEqual(['title'])
+    expect(sitePicker.props('placeholder')).toBe('输入站点名称筛选')
+    sitePicker.vm.$emit('update:modelValue', [5, 7])
     await flushPromises()
     expect(JSON.parse(wrapper.findComponent(RuleEditor).props('modelValue')).sites).toEqual([5, 7])
     await scope.setValue('all_sites')
@@ -546,6 +549,28 @@ describe('custom configuration actions', () => {
     expect(wrapper.find('.preview-results').text()).toContain('没有可复用缓存，本次已触发搜索')
     expect(wrapper.find('[role="status"]').exists()).toBe(false)
     expect(applyCalls(api)[0][1].operation).toBe(action)
+    wrapper.unmount()
+  })
+
+  it('explains why an all-site preview searches when the full cache is missing', async () => {
+    const data = candidateSnapshot()
+    let finishSearch
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(url => url.endsWith('/preview-status')
+        ? Promise.resolve({ success: true, status: 'cache_miss' })
+        : new Promise(resolve => { finishSearch = resolve })),
+    }
+    const wrapper = mount(Config, { props: { api },
+      global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    await wrapper.find('select[aria-label="站点范围"]').setValue('all_sites')
+    await wrapper.findAll('button').find(button => button.text() === '预览匹配').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="status"]').text()).toContain('没有可复用的全站搜索缓存')
+    expect(wrapper.find('[role="status"]').text()).toContain('数据页候选是独立保存的历史记录')
+    finishSearch({ success: false, message: '搜索失败' })
+    await flushPromises()
     wrapper.unmount()
   })
 
