@@ -159,6 +159,8 @@ def _candidate_label(candidate: dict[str, Any]) -> str:
         return "跨季资源（含目标季）"
     if kind == "suspected_full":
         return "疑似整季（集数待核实）"
+    if kind == "first_episode_bundle":
+        return "含首集的多集资源"
     if kind == "episode":
         return "分集"
     return "单集 E01"
@@ -444,7 +446,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.11"
+    plugin_version = "1.9.12"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1032,7 +1034,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def _scan_one(self, sid: int) -> bool:
         """
-        搜索一条待确认订阅的首集、整季及含目标季的跨季资源，并保留历史候选。
+        搜索一条待确认订阅的首集、含首集多集资源、整季及跨季资源，并保留历史候选。
         """
         subscribe = self._subscribes.get(sid)
         if not subscribe:
@@ -1552,8 +1554,8 @@ class SubscribeOverwatcher(_PluginBase):
                 finally:
                     directory_seconds += time.perf_counter() - directory_started
                 matched.append(item)
-        priority = {"full_season": 4, "cross_season": 3, "suspected_full": 2,
-                    "first_episode": 1, "episode": 0}
+        priority = {"full_season": 5, "cross_season": 4, "suspected_full": 3,
+                    "first_episode_bundle": 2, "first_episode": 1, "episode": 0}
         matched.sort(key=lambda item: priority.get(item["kind"], 0), reverse=True)
         rejected.sort(key=lambda item: priority.get(item["kind"], 0), reverse=True)
         timings.update({
@@ -2459,7 +2461,7 @@ class SubscribeOverwatcher(_PluginBase):
             ]})
         if not pending:
             page.append({"component": "VAlert", "props": {
-                "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集首集、整季及含目标季的跨季候选。",
+                "type": "info", "text": "暂无待确认剧集。新增或手动纳入电视剧订阅后会收集首集、含首集多集资源、整季及含目标季的跨季候选。",
             }})
         for sid, entry in pending:
             groups = _display_groups(entry.get("candidates") or [])

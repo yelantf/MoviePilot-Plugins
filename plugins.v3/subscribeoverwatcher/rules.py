@@ -250,7 +250,7 @@ def _candidate_kind(
     *, description: Any = None, labels: Any = None,
 ) -> Optional[str]:
     """
-    区分跨季资源、识别集数覆盖全集、疑似全集和单集 E01。
+    区分跨季资源、识别集数覆盖全集、疑似全集、含首集的多集资源和单集 E01。
     """
     seasons = target_seasons(meta, season)
     if not seasons:
@@ -273,6 +273,8 @@ def _candidate_kind(
                                                  and not isinstance(begin_episode, bool) and begin_episode > 1):
             return None
         return "suspected_full"
+    if len(episodes) > 1 and 1 in episodes:
+        return "first_episode_bundle"
     return None
 
 
@@ -432,7 +434,8 @@ def merge_candidates(
         merged[candidate["id"]] = candidate
         if key:
             page_ids[key] = candidate["id"]
-    kind_order = {"full_season": 3, "cross_season": 2, "suspected_full": 1, "first_episode": 0}
+    kind_order = {"full_season": 4, "cross_season": 3, "suspected_full": 2,
+                  "first_episode_bundle": 1, "first_episode": 0}
     return sorted(
         merged.values(),
         key=lambda item: (kind_order.get(item.get("kind"), 0), item.get("last_seen") or ""),

@@ -711,7 +711,9 @@ def test_delayed_added_event_is_gated_until_rules_are_confirmed(plugin_host):
     ])
     plugin.refresh_candidates()
     entry = host.storage["gate_state"]["entries"]["2"]
-    assert len(entry["candidates"]) == 1
+    assert {item["kind"] for item in entry["candidates"]} == {
+        "first_episode", "first_episode_bundle",
+    }
     assert "secret.example" not in json.dumps(entry)
     assert "cookie-secret" not in json.dumps(entry)
     assert host.search_calls[0]["rule_groups"] == []
@@ -849,7 +851,7 @@ def test_invalid_choice_and_reload_keep_pending_subscription_blocked(plugin_host
 
 def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host):
     """
-    候选只收单集 E01，并在资源消失后保留发现记录。
+    候选收单集 E01 与含首集多集资源，并在资源消失后保留发现记录。
     """
     rules = importlib.import_module(f"{plugin_host.module.__name__}.rules")
     first = rules.resource_candidate(_context(
@@ -857,7 +859,12 @@ def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host
         page_url="https://tracker.example/details.php?id=42&hit=1&passkey=secret",
     ), 1, "2026-11-02T01:00:00+00:00")
     assert first is not None
-    assert rules.resource_candidate(_context("Show.S01E01-E02", episodes=(1, 2)), 1, "now") is None
+    bundle = rules.resource_candidate(_context("Show.S01E01-E02", episodes=(1, 2)),
+                                      1, "now", total_episode=12)
+    assert bundle["kind"] == "first_episode_bundle"
+    assert bundle["episodes"] == [1, 2]
+    assert plugin_host.module._candidate_label(bundle) == "含首集的多集资源"
+    assert plugin_host.module._candidate_coverage(bundle) == "E01–E02/12"
     assert rules.resource_candidate(_context("Show.S01E02", episodes=(2,)), 1, "now") is None
     assert rules.resource_candidate(_context("Show.S01E01"), 2, "now") is None
     unspecified_season = _context("Show.E01.1080p.WEB-DL")
@@ -874,6 +881,41 @@ def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host
     assert merged[0]["last_seen"] == "2026-11-02T02:00:00+00:00"
     assert merged[0]["page_url"] == first["page_url"]
     assert rules.merge_candidates(merged, []) == merged
+
+
+def test_subtitle_first_episode_bundle_is_scanned_and_previewed_without_full_season_bypass(plugin_host):
+    """宿主从副标题识别第1-3集后，插件展示候选但不当成12集全集。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.total_episode = subscribe.lack_episode = 12
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    resource = _context(
+        "Love in Disguise S01 1080p AMZN WEB-DL DDP.2.0 H.264-CHDWEB",
+        episodes=(1, 2, 3), page_url="https://tracker.example/details.php?id=123",
+    )
+    resource.torrent_info.description = "韩剧：我的有罪之人 第1-3集 / Love in Disguise"
+    resource.meta_info.resource_team = "CHDWEB"
+    host.search_results.append(resource)
+
+    assert plugin.scan_subscription("2")[0]
+    candidates = plugin._state["entries"]["2"]["candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["kind"] == "first_episode_bundle"
+    assert candidates[0]["episodes"] == [1, 2, 3]
+    assert host.module._candidate_coverage(candidates[0]) == "E01–E03/12"
+    choice = _form_items(plugin, "candidate")[0]
+    assert "含首集的多集资源 E01–E03/12" in choice["title"]
+    assert plugin.preview_candidate(choice["value"])[0]
+    preview = plugin._state["entries"]["2"]["preview"]
+    assert preview["matched_count"] == 1
+    assert preview["matched"][0]["kind"] == "first_episode_bundle"
+    assert not host.module.is_complete_season_download(
+        _download_event(2, context=resource, episodes={1, 2, 3}).event_data, subscribe,
+    )
 
 
 def test_late_episode_with_pack_word_is_not_a_candidate(plugin_host):
@@ -1772,18 +1814,20 @@ def test_complete_and_cross_season_candidates_are_shown_before_first_episode(plu
     )
     full_2160 = _context("Show.S01.Complete.2160p.WEB-DL", episodes=tuple(range(1, 9)))
     suspect = _context("Show.S01.Complete.Unknown", episodes=(1, 2))
+    bundle = _context("Show.S01E01-E03.1080p.WEB-DL", episodes=(1, 2, 3))
     cross_season = _context("Show.S01-S02.Complete", episodes=tuple(range(1, 9)))
     cross_season.meta_info.season_list = [1, 2]
     cross_season.meta_info.end_season = 2
     other_season = _context("Show.S03.Complete", episodes=tuple(range(1, 9)))
     other_season.meta_info.begin_season = 3
     other_season.meta_info.season_list = [3]
-    host.search_results.extend([first, full_1080, full_2160, suspect, cross_season, other_season])
+    host.search_results.extend([first, full_1080, full_2160, suspect, bundle, cross_season, other_season])
 
     plugin.refresh_candidates()
     candidates = host.storage["gate_state"]["entries"]["2"]["candidates"]
     assert [item["kind"] for item in candidates] == [
-        "full_season", "full_season", "cross_season", "suspected_full", "first_episode",
+        "full_season", "full_season", "cross_season", "suspected_full",
+        "first_episode_bundle", "first_episode",
     ]
     assert all(item["episodes"] == list(range(1, 9)) for item in candidates[:2])
     assert candidates[2]["seasons"] == [1, 2]
