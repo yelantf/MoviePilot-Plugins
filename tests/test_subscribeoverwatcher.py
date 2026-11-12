@@ -1914,6 +1914,82 @@ def test_cross_season_resource_is_not_eligible_for_manual_episode_replacement(pl
     assert host.downloads == []
 
 
+def test_pending_candidate_can_be_downloaded_once_as_full_torrent_without_rule_approval(plugin_host):
+    """跨季候选走单资源手动入口整包提交，订阅保持待确认。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.directories.extend([_directory("默认盘", "/default"), _directory("目标盘", "/chosen")])
+    context = _context("Show.S01-S05.Complete.1080p", episodes=tuple(range(1, 9)),
+                       page_url="https://tracker.example/details.php?id=42")
+    context.meta_info.season_list = [1, 2, 3, 4, 5]
+    context.meta_info.end_season = 5
+    context.media_info = SimpleNamespace(media_source="themoviedb", media_id="123", type="电视剧")
+    host.search_results.append(context)
+    assert plugin.refresh_candidates() is True
+    candidate = plugin._state["entries"]["2"]["candidates"][0]
+    assert candidate["kind"] == "cross_season"
+    choice = f"2:{candidate['id']}"
+
+    plugin.init_plugin({
+        "enabled": True, "candidate": choice, "download_directory": "/chosen",
+        "rule_json": "{invalid rule draft",
+        "operation": "download_candidate", "operation_request_id": "download-1",
+    })
+
+    assert plugin._state["last_confirmation"]["success"] is True
+    assert plugin._state["last_confirmation"]["request_id"] == "download-1"
+    assert len(host.downloads) == 1
+    downloaded, options = host.downloads[0]
+    assert downloaded.torrent_info.page_url == context.torrent_info.page_url
+    assert options == {"episodes": None, "source": "Manual", "save_path": "/chosen", "return_detail": True}
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+    assert plugin._state["entries"]["2"].get("preview") is None
+    assert host.subscriptions[2].state == "S"
+    assert host.subscriptions[2].sites == []
+    assert plugin._state["entries"]["2"]["direct_download_history"][0]["candidate_id"] == candidate["id"]
+    assert "最近一次性整包下载提交" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert host.storage["config"]["operation"] == "save"
+
+
+def test_one_time_download_rechecks_link_and_media_before_submission(plugin_host):
+    """旧候选、无详情链接和媒体身份变化都不能误下另一颗种子。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.directories.append(_directory("默认盘", "/downloads"))
+    context = _context("Show.S01.Complete.1080p", episodes=tuple(range(1, 9)),
+                       page_url="https://tracker.example/details.php?id=42")
+    context.media_info = SimpleNamespace(media_source="themoviedb", media_id="123", type="电视剧")
+    host.search_results.append(context)
+    assert plugin.refresh_candidates() is True
+    candidate = plugin._state["entries"]["2"]["candidates"][0]
+    choice = f"2:{candidate['id']}"
+
+    host.search_results.clear()
+    assert plugin.download_candidate_once(choice)[0] is False
+    assert host.downloads == []
+    wrong_link = copy.deepcopy(context)
+    wrong_link.torrent_info.page_url = "https://tracker.example/details.php?id=43"
+    host.search_results.append(wrong_link)
+    assert plugin.download_candidate_once(choice)[0] is False
+    assert host.downloads == []
+    host.search_results[:] = [context]
+    context.media_info.media_id = "other-show"
+    assert plugin.download_candidate_once(choice)[0] is False
+    assert host.downloads == []
+    context.media_info.media_id = "123"
+    candidate["page_url"] = None
+    assert "详情链接" in plugin.download_candidate_once(choice)[1]
+    assert host.downloads == []
+
+
 def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     """仅同大小的跨站候选合并展示，并在选择项和表格显示大小。"""
     host = plugin_host
@@ -2001,10 +2077,16 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
         "https://three.example/details.php?id=33"
     assert all(row["content"][3] == {"component": "td", "text": title} for row in rows)
     actions = grouped_row["content"][-1]["content"]
-    assert {action["props"]["data-candidate-id"] for action in actions} == {
+    config_actions = [action for action in actions if action["content"][0]["text"].startswith("配置·")]
+    download_actions = [action for action in actions if action["content"][0]["text"].startswith("下载·")]
+    assert {action["props"]["data-candidate-id"] for action in config_actions} == {
         f"2:{first_candidate['id']}", f"2:{second_candidate['id']}",
     }
-    assert {action["content"][0]["text"] for action in actions} == {"配置·样例站", "配置·另一个站"}
+    assert {action["content"][0]["text"] for action in config_actions} == {"配置·样例站", "配置·另一个站"}
+    assert {action["props"]["data-candidate-id"] for action in download_actions} == {
+        f"2:{first_candidate['id']}", f"2:{second_candidate['id']}",
+    }
+    assert all("前往配置页下载" in action["props"]["aria-label"] for action in download_actions)
     assert other_row["content"][-1]["content"][0]["props"]["data-candidate-id"] == \
         f"2:{third_candidate['id']}"
 

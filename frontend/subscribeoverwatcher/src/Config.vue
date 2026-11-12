@@ -137,6 +137,24 @@
               persistent-hint class="mb-4" />
             <v-alert v-if="form.download_directory && !selectedDownloadDirectory" type="warning"
               variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
+            <v-alert v-if="selectedCandidate && !selectedCandidateUrl" type="info" variant="tonal"
+              density="compact" class="mb-4">这条候选没有可核对的站点详情链接，不能一次性下载。</v-alert>
+            <v-alert v-if="directDownloadChoice === form.candidate && selectedCandidate" type="warning"
+              variant="tonal" class="mb-4">
+              <div class="font-weight-bold">即将一次性下载所选种子的全部文件</div>
+              <div>{{ selectedCandidate.resource_title || selectedCandidate.title }}</div>
+              <div>站点：{{ selectedCandidateSite }} · 大小：{{ selectedCandidate.size_label || '未知' }}</div>
+              <div>识别范围：{{ selectedCandidate.coverage || '请在站点详情中核对' }}。跨季合集也会下载所有季。</div>
+              <div>下载目录：{{ selectedDownloadDirectory?.title || '订阅原目录或 MoviePilot 默认目录' }}</div>
+              <div>本次不会应用规则草稿，也不会批准或恢复订阅。提交前会重新搜索并核对这颗种子。</div>
+              <a :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
+                class="text-primary text-decoration-underline">打开站点详情核对种子</a>
+              <div class="d-flex flex-wrap ga-2 mt-3">
+                <v-btn color="warning" :loading="busy === 'download_candidate'" :disabled="!!busy"
+                  @click="submit('download_candidate')">确认整包下载</v-btn>
+                <v-btn variant="text" :disabled="!!busy" @click="directDownloadChoice = ''">取消</v-btn>
+              </div>
+            </v-alert>
             <rule-editor v-if="selectedCandidate" v-model="form.rule_json" :candidate="selectedCandidate"
               :options="ruleOptions" :site-options="options.rule_sites" :site-mode="form.rule_mode"
               :selected-site-ids="form.rule_sites" :disabled="!!busy"
@@ -155,6 +173,9 @@
           </v-card-text>
           <v-card-actions class="px-4 pb-4 flex-wrap ga-2">
             <v-spacer />
+            <v-btn color="warning" variant="outlined"
+              :disabled="!!busy || !selectedCandidateUrl || !!form.download_directory && !selectedDownloadDirectory"
+              @click="armCandidateDownload">一次性下载整个种子</v-btn>
             <v-btn v-if="selectedPreview" variant="text" :disabled="!!busy || !selectedCandidate || siteSelectionMissing"
               @click="submit('preview', true)">重新搜索并预览</v-btn>
             <v-btn color="info" variant="tonal" :loading="busy === 'preview'"
@@ -276,6 +297,7 @@ const fields = [
 ]
 const sections = {
   adopt: 'history', scan: 'scan', preview: 'candidate', confirm: 'candidate',
+  download_candidate: 'candidate',
   direct_approve: 'approve', revoke: 'revoke',
   preview_replace: 'replace', submit_replace: 'replace',
 }
@@ -316,6 +338,7 @@ const previewProgress = ref('')
 const candidateCard = ref(null)
 const previewCard = ref(null)
 const candidatePreview = ref(null)
+const directDownloadChoice = ref('')
 const replacementPreview = ref(null)
 const ruleOptions = ref({})
 const handoffNotice = ref('')
@@ -364,6 +387,12 @@ const previewStale = computed(() => selectedPreview.value && (
 ))
 const keywordPreviewAutoChanged = computed(() => !!selectedPreview.value?.keyword_choice_auto_changed && !previewStale.value)
 const groupPreviewAutoChanged = computed(() => !!selectedPreview.value?.rule_groups_auto_disabled && !previewStale.value)
+
+function armCandidateDownload() {
+  if (!busy.value && selectedCandidateUrl.value && (!form.download_directory || selectedDownloadDirectory.value)) {
+    directDownloadChoice.value = form.candidate
+  }
+}
 
 function selectCandidateSubscription(subscription) {
   form.candidate_subscription = subscription || ''
@@ -415,6 +444,7 @@ watch(() => form.replace_subscription, (subscription, previous) => {
     form.replace_episodes = ''
   }
 })
+watch(() => [form.candidate, form.download_directory], () => { directDownloadChoice.value = '' })
 
 function walk(nodes, visit) {
   for (const node of nodes || []) {
@@ -489,7 +519,7 @@ function applyCandidateSelection(candidateId = takeCandidateSelection()) {
     ? JSON.stringify(candidate.rules, null, 2) : ''
   feedback.section = ''
   feedback.text = ''
-  handoffNotice.value = '已选中详情页里的版本。可修改规则草稿，再预览匹配。'
+  handoffNotice.value = '已选中详情页里的版本。可预览规则后确认并恢复，或一次性下载整个种子。'
   return true
 }
 
@@ -554,6 +584,7 @@ async function showSearchProgress(submitted) {
 
 async function submit(action, refreshSearch = false) {
   if (busy.value) return
+  if (action === 'download_candidate' && directDownloadChoice.value !== form.candidate) return
   busy.value = action
   feedback.section = ''
   feedback.text = ''
@@ -602,6 +633,7 @@ async function submit(action, refreshSearch = false) {
     feedback.text = error?.message || '操作失败，请稍后重试'
     try { await refreshForm() } catch { /* 保留当前输入供重试 */ }
   } finally {
+    if (action === 'download_candidate') directDownloadChoice.value = ''
     busy.value = ''
   }
 }

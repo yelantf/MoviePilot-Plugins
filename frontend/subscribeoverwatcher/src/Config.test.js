@@ -87,6 +87,87 @@ function previewSnapshot(draft) {
 }
 
 describe('custom configuration actions', () => {
+  it('submits an explicitly selected whole torrent without confirming subscription rules', async () => {
+    const data = candidateSnapshot()
+    const candidate = data.conf[0].content.find(item => item.props?.model === 'candidate').props.items[0]
+    Object.assign(candidate, {
+      kind: 'cross_season', coverage: 'S01、S05（各季集数待核实）',
+      size_label: '133.90 GiB', resource_title: 'Show S01-S05 Complete', site_name: '样例站',
+      page_url: 'https://tracker.example/details.php?id=42',
+    })
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(async (_url, submitted) => {
+        data.model._last_confirmation = { request_id: submitted.operation_request_id, success: true }
+        return { success: true, message: '已提交整包下载；订阅仍待确认' }
+      }),
+    }
+    const wrapper = mount(Config, {
+      props: { api }, global: { components: { ...components, VSelect: Select } },
+    })
+    await flushPromises()
+
+    const arm = wrapper.findAll('button').find(item => item.text() === '一次性下载整个种子')
+    expect(arm.element.disabled).toBe(false)
+    await arm.trigger('click')
+    expect(applyCalls(api)).toHaveLength(0)
+    expect(wrapper.text()).toContain('跨季合集也会下载所有季')
+    expect(wrapper.text()).toContain('133.90 GiB')
+    expect(wrapper.findAll('a').some(item => item.text() === '打开站点详情核对种子')).toBe(true)
+
+    await wrapper.findAll('button').find(item => item.text() === '确认整包下载').trigger('click')
+    await flushPromises()
+    expect(applyCalls(api)).toHaveLength(1)
+    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'download_candidate', candidate: '2:a' })
+    expect(wrapper.text()).toContain('已提交整包下载；订阅仍待确认')
+    wrapper.unmount()
+  })
+
+  it('routes the data-page download button through config before submitting', async () => {
+    window.sessionStorage.clear()
+    const data = candidateSnapshot()
+    data.model.candidate_subscription = ''
+    data.model.candidate = ''
+    Object.assign(data.conf[0].content.find(item => item.props?.model === 'candidate').props.items[0], {
+      resource_title: 'Show S01-S05 Complete', site_name: '样例站',
+      page_url: 'https://tracker.example/details.php?id=42',
+    })
+    const pageData = { page: [{
+      component: 'VBtn', props: { 'data-candidate-id': '2:a' },
+      content: [{ component: 'span', text: '下载·样例站' }],
+    }] }
+    const api = {
+      get: vi.fn().mockImplementation(async url => url.startsWith('plugin/page/') ? pageData : data),
+      post: vi.fn().mockImplementation(async (_url, submitted) => {
+        data.model._last_confirmation = { request_id: submitted.operation_request_id, success: true }
+        return { success: true, message: '已提交整包下载；订阅仍待确认' }
+      }),
+    }
+    const page = mount(Page, { props: { api }, global: { components } })
+    await flushPromises()
+
+    await page.find('button[data-candidate-id="2:a"]').trigger('click')
+    await flushPromises()
+    expect(page.emitted('switch')).toHaveLength(1)
+    expect(api.post).not.toHaveBeenCalled()
+    page.unmount()
+
+    const config = mount(Config, {
+      props: { api }, global: { components: { ...components, VSelect: Select } },
+    })
+    await flushPromises()
+    expect(config.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe('2:a')
+    expect(config.text()).toContain('可预览规则后确认并恢复，或一次性下载整个种子')
+    expect(api.post).not.toHaveBeenCalled()
+    await config.findAll('button').find(item => item.text() === '一次性下载整个种子').trigger('click')
+    expect(api.post).not.toHaveBeenCalled()
+    await config.findAll('button').find(item => item.text() === '确认整包下载').trigger('click')
+    await flushPromises()
+    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'download_candidate', candidate: '2:a' })
+    expect(config.text()).toContain('已提交整包下载；订阅仍待确认')
+    config.unmount()
+  })
+
   it('scans an empty managed show, shows progress, and refreshes its versions', async () => {
     const initial = snapshot({ managed: '已纳入管理 1 条剧集订阅', historical: [] })
     initial.conf[0].content.push({ component: 'VSelect', props: { model: 'scan_subscription', items: [
@@ -332,7 +413,7 @@ describe('custom configuration actions', () => {
     expect(wrapper.find('select[aria-label="下载目录（留空保留原目录）"]').element.value).toBe('/chosen')
     expect(wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe(refreshFails ? '2:a' : '2:b')
     expect(wrapper.findComponent(RuleEditor).props('modelValue')).toBe(refreshFails ? draft : JSON.stringify(rules, null, 2))
-    expect(wrapper.text()).toContain(refreshFails ? '刷新版本失败' : '可修改规则草稿，再预览匹配')
+    expect(wrapper.text()).toContain(refreshFails ? '刷新版本失败' : '可预览规则后确认并恢复，或一次性下载整个种子')
     expect(api.post).not.toHaveBeenCalled()
     expect(window.sessionStorage.length).toBe(0)
     expect(wrapper.emitted('switch')).toBeUndefined()
@@ -738,7 +819,7 @@ describe('custom configuration actions', () => {
     expect(config.find('select[aria-label="选择有版本的剧集"]').element.value).toBe('2')
     expect(config.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe('2:site7')
     expect(config.findComponent(RuleEditor).props('modelValue')).toBe(JSON.stringify({ quality: 'WEB-DL', sites: [7] }, null, 2))
-    expect(config.text()).toContain('可修改规则草稿，再预览匹配')
+    expect(config.text()).toContain('可预览规则后确认并恢复，或一次性下载整个种子')
     expect(window.sessionStorage.length).toBe(0)
 
     await setRuleDraft(config, '{"quality":"BluRay","sites":[7]}')

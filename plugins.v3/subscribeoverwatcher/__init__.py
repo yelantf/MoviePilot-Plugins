@@ -392,15 +392,22 @@ def _site_cell(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _candidate_action_cell(sid: str, items: list[dict[str, Any]]) -> dict[str, Any]:
-    """合并展示的候选仍按站点分别进入配置。"""
+    """合并展示的候选按站点分别选中，并统一前往配置页操作。"""
     buttons = []
     for item in items:
         site = item.get("site_name") or str(item.get("site_id") or "未知站点")
+        choice = f"{sid}:{item['id']}"
         buttons.append({"component": "VBtn", "props": {
             "variant": "tonal", "color": "primary", "size": "small", "class": "ma-1",
-            "data-candidate-id": f"{sid}:{item['id']}",
+            "data-candidate-id": choice,
             "aria-label": f"选择{site}的版本并前往配置",
         }, "content": [{"component": "span", "text": f"配置·{site}"}]})
+        if public_page_url(item.get("page_url")):
+            buttons.append({"component": "VBtn", "props": {
+                "variant": "outlined", "color": "warning", "size": "small", "class": "ma-1",
+                "data-candidate-id": choice,
+                "aria-label": f"选择{site}的版本并前往配置页下载",
+            }, "content": [{"component": "span", "text": f"下载·{site}"}]})
     return {"component": "td", "content": buttons}
 
 
@@ -492,9 +499,9 @@ class SubscribeOverwatcher(_PluginBase):
     """
 
     plugin_name = "剧集守门员"
-    plugin_desc = "剧集订阅先预览规则再确认，可手动选择集数重新下载，并每日汇总待确认订阅。"
+    plugin_desc = "剧集订阅可预览规则再确认、一次性整包下载候选，并接收待确认提醒。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.14"
+    plugin_version = "1.9.17"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -600,7 +607,8 @@ class SubscribeOverwatcher(_PluginBase):
                 self._save_state()
 
         actions = [name for name in (
-            "adopt", "preview", "confirm", "direct_approve", "revoke", "preview_replace", "submit_replace",
+            "adopt", "preview", "confirm", "download_candidate", "direct_approve", "revoke",
+            "preview_replace", "submit_replace",
         ) if config.get(name)]
         if config.get("operation") not in (None, "", "save"):
             actions.append(str(config["operation"]))
@@ -615,7 +623,7 @@ class SubscribeOverwatcher(_PluginBase):
                     self._save_state()
                 self.update_config({
                     **config, "operation": "save", "adopt": False, "preview": False, "confirm": False,
-                    "direct_approve": False, "revoke": False,
+                    "download_candidate": False, "direct_approve": False, "revoke": False,
                     "preview_replace": False, "submit_replace": False,
                     "historical_subscription": [], "scan_subscription": "", "candidate_subscription": "", "candidate": "",
                     "keyword_choice": "original",
@@ -630,7 +638,7 @@ class SubscribeOverwatcher(_PluginBase):
         normalized_rules = ""
         if actions:
             if len(actions) != 1:
-                success, message = False, "一次只能提交一个纳入、扫描、预览、批准、撤销或回刷操作"
+                success, message = False, "一次只能提交一个纳入、扫描、预览、下载、批准、撤销或回刷操作"
             elif actions[0] == "adopt":
                 success, message = self.adopt_subscriptions(config.get("historical_subscription") or [])
             elif actions[0] == "scan":
@@ -660,6 +668,11 @@ class SubscribeOverwatcher(_PluginBase):
                         str(config.get("download_directory") or ""),
                         keyword_choice=str(config.get("keyword_choice") or "original"),
                     )
+            elif actions[0] == "download_candidate":
+                success, message = self.download_candidate_once(
+                    str(config.get("candidate") or ""),
+                    str(config.get("download_directory") or ""),
+                )
             elif actions[0] == "direct_approve":
                 success, message = self.approve_subscription(config.get("direct_subscription"))
             elif actions[0] == "revoke":
@@ -688,7 +701,8 @@ class SubscribeOverwatcher(_PluginBase):
                 **config, "operation": "save", "operation_request_id": "",
                 "refresh_search": False,
                 "adopt": False, "preview": False, "confirm": False,
-                "direct_approve": False, "revoke": False, "preview_replace": False, "submit_replace": False,
+                "download_candidate": False, "direct_approve": False, "revoke": False,
+                "preview_replace": False, "submit_replace": False,
             }
             if actions == ["preview"] and success:
                 updated_config["rule_json"] = normalized_rules
@@ -1997,6 +2011,98 @@ class SubscribeOverwatcher(_PluginBase):
                 payload["save_path"] = download_directory
             return self._approve(sid, entry, payload, candidate_id)
 
+    def download_candidate_once(self, choice: str, download_directory: str = "") -> tuple[bool, str]:
+        """重新搜索用户选中的种子并整包提交一次，不改变订阅规则或批准状态。"""
+        try:
+            sid_text, candidate_id = choice.split(":", 1)
+            sid = int(sid_text)
+        except (ValueError, TypeError):
+            return False, "请先选择一条候选资源"
+        with self._lock:
+            subscribe = self._subscribes.get(sid)
+            entry = self._state["entries"].get(str(sid)) or {}
+            candidate = next((item for item in entry.get("candidates") or []
+                              if item.get("id") == candidate_id), None)
+            if (not self._enabled or not subscribe or subscribe.type != MediaType.TV.value
+                    or entry.get("status") != "pending" or entry.get("identity") != _identity(subscribe)
+                    or not candidate):
+                return False, "候选或待确认订阅已变化，请重新选择"
+            site_id = candidate.get("site_id")
+            page_url = public_page_url(candidate.get("page_url"))
+            if not isinstance(site_id, int) or isinstance(site_id, bool) or site_id <= 0 or not page_url:
+                return False, "候选缺少可核对的站点详情链接，不能直接下载"
+            try:
+                save_path = selected_directory_root(download_directory) if download_directory \
+                    else getattr(subscribe, "save_path", None) or None
+                _search_site_scope([site_id])
+            except ValueError as error:
+                return False, str(error)
+
+        try:
+            contexts = self._search_unfiltered(subscribe, sites=[site_id])
+        except Exception:
+            logger.exception(f"订阅 {sid} 的一次性下载重查失败")
+            return False, "重新搜索所选站点失败，未提交下载"
+        matches = []
+        for context in contexts:
+            try:
+                item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (item and item["id"] == candidate_id and item.get("site_id") == site_id
+                    and item.get("page_url") == page_url):
+                matches.append(context)
+        if len(matches) != 1:
+            return False, "所选种子已消失或不唯一，请重新扫描后选择，未提交下载"
+        context = matches[0]
+        media = getattr(context, "media_info", None)
+        if media is None:
+            return False, "资源缺少媒体信息，未提交下载"
+        media_source, media_id = resolve_media_identity(media=media)
+        expected_media_key = build_media_key(subscribe.media_source, subscribe.media_id)
+        if not expected_media_key or build_media_key(media_source, media_id) != expected_media_key:
+            return False, "资源的媒体身份与订阅不符，未提交下载"
+        try:
+            preview_download_path(media, save_path)
+        except ValueError as error:
+            return False, f"下载目录不可用：{error}；未提交下载"
+
+        with self._lock:
+            current = self._subscribes.get(sid)
+            entry = self._state["entries"].get(str(sid)) or {}
+            selected = next((item for item in entry.get("candidates") or []
+                             if item.get("id") == candidate_id), None)
+            if (not self._enabled or not current or current.type != MediaType.TV.value
+                    or entry.get("status") != "pending" or entry.get("identity") != _identity(current)
+                    or not selected or public_page_url(selected.get("page_url")) != page_url
+                    or (not download_directory and (getattr(current, "save_path", None) or None) != save_path)):
+                return False, "提交前订阅或候选已变化，未提交下载"
+            if download_directory:
+                try:
+                    selected_directory_root(download_directory)
+                except ValueError as error:
+                    return False, f"{error}；未提交下载"
+            try:
+                result = DownloadChain().download_single(
+                    context, episodes=None, source="Manual", save_path=save_path, return_detail=True,
+                )
+            except Exception:
+                logger.exception(f"订阅 {sid} 的候选整包下载提交失败")
+                return False, "下载提交失败，请查看 MoviePilot 日志"
+            download_hash = result[0] if isinstance(result, tuple) else result
+            if not download_hash:
+                return False, "下载器未接受所选种子，请查看 MoviePilot 日志"
+            history = entry.setdefault("direct_download_history", [])
+            history.insert(0, {
+                "candidate_id": candidate_id, "title": str(context.torrent_info.title)[:240],
+                "site_name": str(candidate.get("site_name") or site_id)[:80],
+                "size_bytes": candidate.get("size_bytes"), "submitted_at": _utc_now(),
+            })
+            del history[20:]
+            self._save_state()
+        return True, (f"已提交整包下载：{context.torrent_info.title}；"
+                      "订阅仍待确认，规则和追更状态未改变")
+
     def approve_subscription(self, sid_value: Any) -> tuple[bool, str]:
         """
         直接批准待确认订阅，保留现有筛选规则并补齐缺集。
@@ -2513,6 +2619,10 @@ class SubscribeOverwatcher(_PluginBase):
                              f"{item.get('team') or ''} · {item.get('title')}",
                     "value": f"{sid}:{item['id']}",
                     "subscription_id": sid,
+                    "kind": item.get("kind"),
+                    "coverage": _candidate_coverage(item),
+                    "size_label": _size_label(item.get("size_bytes"), exact=True),
+                    "resource_title": item.get("title") or "",
                     "rule_names": candidate_rule_names(item),
                     "rule_patterns": item.get("rules") or {},
                     "rules": display_draft_rules(item, {
@@ -2651,6 +2761,10 @@ class SubscribeOverwatcher(_PluginBase):
                            "hint": "确认只回填资源根目录；完整分类路径在预览中显示，实际下载由 MoviePilot 处理",
                            "persistent-hint": True})),
             ),
+            row(col(info(
+                "一次性下载会提交所选种子的全部文件，包括跨季合集的所有季；不应用规则草稿，"
+                "不批准或恢复订阅。提交前会重新搜索并核对站点详情链接。"
+            ))),
             divider,
             row(
                 col(select("direct_subscription", "直接批准的待确认订阅", pending_choices,
@@ -2680,6 +2794,7 @@ class SubscribeOverwatcher(_PluginBase):
                     {"title": "扫描所选已纳入剧集", "value": "scan"},
                     {"title": "预览候选规则", "value": "preview"},
                     {"title": "确认候选规则并恢复订阅", "value": "confirm"},
+                    {"title": "一次性下载所选候选种子的全部文件", "value": "download_candidate"},
                     {"title": "直接批准订阅（保留原规则）", "value": "direct_approve"},
                     {"title": "撤销批准并暂停订阅", "value": "revoke"},
                     {"title": "预览可回刷资源", "value": "preview_replace"},
@@ -2787,10 +2902,19 @@ class SubscribeOverwatcher(_PluginBase):
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现", "配置")
+                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现", "操作")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})
+            direct_history = entry.get("direct_download_history") or []
+            if direct_history:
+                latest = direct_history[0]
+                page.append({"component": "VAlert", "props": {
+                    "type": "success", "variant": "tonal",
+                    "text": f"最近一次性整包下载提交：{latest.get('submitted_at') or '?'} · "
+                            f"{latest.get('site_name') or '?'} · {latest.get('title') or '?'} · "
+                            f"{_size_label(latest.get('size_bytes'), exact=True)}。订阅仍待确认。",
+                }})
             preview = entry.get("preview") or {}
             if preview:
                 page.append({"component": "VAlert", "props": {
@@ -2827,6 +2951,14 @@ class SubscribeOverwatcher(_PluginBase):
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
                         f"{mode} · 批准于 {entry.get('approved_at') or '?'}",
             }})
+            direct_history = entry.get("direct_download_history") or []
+            if direct_history:
+                latest = direct_history[0]
+                page.append({"component": "VAlert", "props": {
+                    "type": "success", "variant": "tonal",
+                    "text": f"此前一次性整包下载提交：{latest.get('submitted_at') or '?'} · "
+                            f"{latest.get('site_name') or '?'} · {latest.get('title') or '?'}。",
+                }})
             confirmed_preview = entry.get("preview") or {}
             if confirmed_preview:
                 page.append({"component": "VAlert", "props": {
