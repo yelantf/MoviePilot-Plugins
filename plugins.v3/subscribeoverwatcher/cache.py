@@ -1,4 +1,4 @@
-"""有容量上限的预览搜索缓存，保存资源事实而不保存下载凭据。"""
+"""有容量上限的持久搜索缓存，只把预览事实写盘，不写入下载凭据。"""
 
 import json
 import math
@@ -52,7 +52,7 @@ def _plain(value: Any) -> Any:
 
 
 def context_snapshot(context: Any) -> dict:
-    """保留所有预览筛选事实、媒体分类和离散季集，下载地址在提交时重新获取。"""
+    """保留预览筛选事实、媒体分类和离散季集，不把内存中的下载地址写盘。"""
     meta = getattr(context, "meta_info", None)
     torrent = getattr(context, "torrent_info", None)
     if meta is None or torrent is None:
@@ -201,6 +201,13 @@ class SearchCacheStore:
                         or not isinstance(raw_sources, dict) \
                         or not isinstance(values["contexts"], list) or type(values["sequence"]) is not int:
                     raise ValueError("缓存格式或订阅身份已变化")
+                # 曾经写入下载上下文的缓存不能继续留在磁盘或恢复到内存。
+                allowed_torrent_fields = set(_TORRENT_FIELDS) | {"page_url"}
+                if any(not isinstance(context, dict) or
+                       not isinstance(context.get("torrent_info"), dict) or
+                       set(context["torrent_info"]) - allowed_torrent_fields
+                       for context in values["contexts"]):
+                    raise ValueError("搜索缓存含下载上下文字段")
                 sources = {}
                 for raw_id, source in raw_sources.items():
                     site_id = int(raw_id)

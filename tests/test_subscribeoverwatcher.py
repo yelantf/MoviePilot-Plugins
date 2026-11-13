@@ -1933,6 +1933,7 @@ def test_pending_candidate_can_be_downloaded_once_as_full_torrent_without_rule_a
     candidate = plugin._state["entries"]["2"]["candidates"][0]
     assert candidate["kind"] == "cross_season"
     choice = f"2:{candidate['id']}"
+    searches_before_download = len(host.search_calls)
 
     plugin.init_plugin({
         "enabled": True, "candidate": choice, "download_directory": "/chosen",
@@ -1945,6 +1946,8 @@ def test_pending_candidate_can_be_downloaded_once_as_full_torrent_without_rule_a
     assert len(host.downloads) == 1
     downloaded, options = host.downloads[0]
     assert downloaded.torrent_info.page_url == context.torrent_info.page_url
+    assert downloaded.torrent_info.enclosure == context.torrent_info.enclosure
+    assert len(host.search_calls) == searches_before_download
     assert options == {"episodes": None, "source": "Manual", "save_path": "/chosen", "return_detail": True}
     assert plugin._state["entries"]["2"]["status"] == "pending"
     assert plugin._state["entries"]["2"].get("preview") is None
@@ -1955,8 +1958,8 @@ def test_pending_candidate_can_be_downloaded_once_as_full_torrent_without_rule_a
     assert host.storage["config"]["operation"] == "save"
 
 
-def test_one_time_download_rechecks_link_and_media_before_submission(plugin_host):
-    """旧候选、无详情链接和媒体身份变化都不能误下另一颗种子。"""
+def test_one_time_download_uses_cached_link_and_checks_selected_resource(plugin_host):
+    """清空站点结果不触发重搜，内存资源链接或媒体身份变化时拒绝提交。"""
     host = plugin_host
     host.subscriptions[1] = _subscribe(1)
     plugin = host.module.SubscribeOverwatcher()
@@ -1971,23 +1974,81 @@ def test_one_time_download_rechecks_link_and_media_before_submission(plugin_host
     assert plugin.refresh_candidates() is True
     candidate = plugin._state["entries"]["2"]["candidates"][0]
     choice = f"2:{candidate['id']}"
+    searches_after_scan = len(host.search_calls)
 
     host.search_results.clear()
+    assert plugin.download_candidate_once(choice)[0] is True
+    assert len(host.search_calls) == searches_after_scan
+    assert host.downloads[0][0].torrent_info.enclosure == context.torrent_info.enclosure
+    host.downloads.clear()
+
+    context.torrent_info.page_url = "https://tracker.example/details.php?id=43"
     assert plugin.download_candidate_once(choice)[0] is False
     assert host.downloads == []
-    wrong_link = copy.deepcopy(context)
-    wrong_link.torrent_info.page_url = "https://tracker.example/details.php?id=43"
-    host.search_results.append(wrong_link)
-    assert plugin.download_candidate_once(choice)[0] is False
-    assert host.downloads == []
-    host.search_results[:] = [context]
+    context.torrent_info.page_url = "https://tracker.example/details.php?id=42"
     context.media_info.media_id = "other-show"
     assert plugin.download_candidate_once(choice)[0] is False
     assert host.downloads == []
     context.media_info.media_id = "123"
+    context.torrent_info.enclosure = None
+    assert "下载链接" in plugin.download_candidate_once(choice)[1]
+    assert host.downloads == []
+    context.torrent_info.enclosure = "https://secret.example/torrent"
     candidate["page_url"] = None
     assert "详情链接" in plugin.download_candidate_once(choice)[1]
     assert host.downloads == []
+    assert len(host.search_calls) == searches_after_scan
+
+
+def test_one_time_download_requires_rescan_after_restart_and_purges_credential_cache(plugin_host):
+    """下载凭据只留在内存；重启后不暗中搜索，旧凭据缓存直接删除。"""
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.directories.append(_directory("默认盘", "/downloads"))
+    context = _context("Show.S01.Complete.1080p", episodes=tuple(range(1, 9)),
+                       page_url="https://tracker.example/details.php?id=42")
+    context.torrent_info.enclosure = "https://secret.example/torrent?passkey=private"
+    context.media_info = SimpleNamespace(media_source="themoviedb", media_id="123", type="电视剧")
+    host.search_results.append(context)
+    assert plugin.refresh_candidates() is True
+    candidate = plugin._state["entries"]["2"]["candidates"][0]
+    choice = f"2:{candidate['id']}"
+    searches_after_scan = len(host.search_calls)
+    cache_dir = plugin.get_data_path() / "search-cache"
+    cache_file = next(cache_dir.glob("*.json"))
+    cache_text = cache_file.read_text()
+    assert "passkey=private" not in cache_text and "cookie-secret" not in cache_text
+
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert "secret.example" not in json.dumps(host.storage)
+    visible = json.dumps((restarted.get_form(), restarted.get_page()))
+    assert "cookie-secret" not in visible and "passkey=private" not in visible
+    assert "下载链接" in restarted.download_candidate_once(choice)[1]
+    assert len(host.search_calls) == searches_after_scan
+    assert host.downloads == []
+
+    # 如果磁盘上残留过渡版本写入的凭据缓存，启动时删除整个文件。
+    cached = json.loads(cache_text)
+    cached["contexts"][0]["torrent_info"]["enclosure"] = context.torrent_info.enclosure
+    cached["contexts"][0]["torrent_info"]["site_cookie"] = context.torrent_info.site_cookie
+    cache_file.write_text(json.dumps(cached))
+    legacy = host.module.SubscribeOverwatcher()
+    legacy.init_plugin({"enabled": True})
+    assert not cache_file.exists()
+    assert legacy.download_candidate_once(choice)[0] is False
+    assert len(host.search_calls) == searches_after_scan
+    assert legacy.scan_subscription("2")[0] is True
+    searches_after_rescan = len(host.search_calls)
+    assert legacy.download_candidate_once(choice)[0] is True
+    assert len(host.search_calls) == searches_after_rescan
+    assert len(host.downloads) == 1
+    assert host.downloads[0][0].torrent_info.enclosure == context.torrent_info.enclosure
+    assert host.downloads[0][0].torrent_info.site_cookie == context.torrent_info.site_cookie
 
 
 def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
@@ -4333,6 +4394,7 @@ def test_persistent_cache_survives_stop_and_restart_with_keyword_provenance_and_
     assert len(files) == 1
     text = files[0].read_text()
     assert "cookie-secret" not in text and "secret.example/torrent" not in text
+    assert "cookie-secret" not in json.dumps(host.storage)
     clock[:] = [5.0, 2000.0 + 90 * 24 * 3600]
     restarted = host.module.SubscribeOverwatcher()
     restarted.init_plugin({"enabled": True})
