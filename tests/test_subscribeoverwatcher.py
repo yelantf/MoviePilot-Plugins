@@ -38,6 +38,9 @@ def plugin_host(monkeypatch, tmp_path):
     directory_calls = []
     group_filter_calls = []
     logs = []
+    library_episodes = {}
+    library_checks = []
+    completion_calls = []
     system_values = {"IndexerSites": []}
     indexers = [
         {"id": 5, "name": "样例站", "is_active": True},
@@ -45,7 +48,8 @@ def plugin_host(monkeypatch, tmp_path):
         {"id": 9, "name": "已停用站", "is_active": False},
     ]
 
-    for name in ("app", "app.application", "app.application.torrent", "app.application.site", "app.chain",
+    for name in ("app", "app.application", "app.application.torrent", "app.application.site",
+                 "app.application.subscription", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
         package = ModuleType(name)
         package.__path__ = []
@@ -137,10 +141,10 @@ def plugin_host(monkeypatch, tmp_path):
     class MediaChain:
         """返回与订阅身份对应的媒体信息。"""
 
-        def recognize_media(self, *, media_source, media_id, mtype):
+        def recognize_media(self, *, media_source, media_id, mtype, **_kwargs):
             """模拟宿主按媒体 ID 识别目标剧集。"""
             return SimpleNamespace(media_source=media_source, media_id=media_id,
-                                   type=mtype, season=None)
+                                   type=mtype, season=None, seasons={1: list(range(1, 9))})
 
     class NotExistMediaInfo:
         """记录按目标季搜索所需的缺集占位信息。"""
@@ -161,6 +165,14 @@ def plugin_host(monkeypatch, tmp_path):
         """
         记录确认后发起的目标补搜。
         """
+
+        def __init__(self):
+            self.subscription_repository = SubscribeOper()
+
+        def reconcile_subscription_completion(self, subscribe, meta, mediainfo):
+            """订阅完成流程不应由本插件的媒体库核对调用。"""
+            completion_calls.append(subscribe.id)
+            raise AssertionError("插件不得触发订阅完成流程")
 
         def search(self, **kwargs):
             """
@@ -209,6 +221,22 @@ def plugin_host(monkeypatch, tmp_path):
         """
         记录用户明确选择后的单资源下载调用。
         """
+
+        def get_no_exists_info(self, *, meta, mediainfo, totals):
+            """模拟宿主只读媒体库接口及整季缺失的空列表约定。"""
+            library_checks.append(meta.subscription_id)
+            present = library_episodes.get(meta.subscription_id)
+            if present is None:
+                return False, {}
+            season, total = next(iter(totals.items()))
+            missing = sorted(set(range(1, total + 1)) - set(present))
+            if not missing:
+                return True, {}
+            key = build_media_key(mediainfo.media_source, mediainfo.media_id)
+            return False, {key: {season: SimpleNamespace(
+                episodes=[] if len(missing) == total else missing,
+                total_episode=total, start_episode=1,
+            )}}
 
         def download_single(self, context, **kwargs):
             """
@@ -335,6 +363,12 @@ def plugin_host(monkeypatch, tmp_path):
             self.__dict__.update(copy.deepcopy(values))
 
     exports = {
+        "app.application.subscription.contract": {
+            "build_subscribe_meta": lambda subscribe: SimpleNamespace(
+                type=SimpleNamespace(value=subscribe.type), begin_season=subscribe.season,
+                subscription_id=subscribe.id,
+            ),
+        },
         "app.application.directory": {
             "DirectoryHelper": DirectoryHelper, "build_media_download_path": build_media_download_path,
             "validate_download_save_path": validate_download_save_path,
@@ -406,6 +440,8 @@ def plugin_host(monkeypatch, tmp_path):
     ))
     return SimpleNamespace(
         module=module, subscriptions=subscriptions, storage=storage, jobs=jobs,
+        library_episodes=library_episodes, library_checks=library_checks,
+        completion_calls=completion_calls,
         search_results=search_results, search_calls=search_calls, downloads=downloads,
         messages=messages,
         directories=directories, directory_calls=directory_calls,
@@ -542,9 +578,10 @@ def test_directory_confirmation_previews_full_path_and_only_fills_root(plugin_ho
     assert host.subscriptions[2].save_path == "/old/downloads"
     assert "预计下载目录：/PtResourceDir2/bt/downloads/电视剧/国产剧" in \
         host.storage["gate_state"]["last_confirmation"]["message"]
-    page = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert "预计下载目录" in page
-    assert "/PtResourceDir2/bt/downloads/电视剧/国产剧" in page
+    panel = json.dumps(plugin.get_form()[1]["_candidate_preview"], ensure_ascii=False)
+    assert "预计下载目录" in panel
+    assert "/PtResourceDir2/bt/downloads/电视剧/国产剧" in panel
+    assert "预计下载目录" not in json.dumps(plugin.get_page(), ensure_ascii=False)
     plugin.init_plugin({**host.storage["config"], "operation": "confirm"})
     assert host.storage["gate_state"]["last_confirmation"]["success"] is True
     assert host.subscriptions[2].save_path == root
@@ -1490,6 +1527,177 @@ def test_progress_complete_auto_approval_keeps_rules_and_skips_candidate_search(
     assert any("subscription_search" in call for call in host.search_calls)
 
 
+def test_first_library_check_updates_full_progress_and_releases_subscription_without_finishing(plugin_host):
+    """已全集入库时恢复接管前状态，退出插件管理，但保留活动订阅给其他插件。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    host.library_episodes[2] = set(range(1, 9))
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert subscribe.state == "S"
+
+    assert plugin.approve_progress_complete() == 0
+    assert subscribe.total_episode == 8 and subscribe.lack_episode == 0
+    assert subscribe.state == "N" and host.subscriptions[2] is subscribe
+    assert plugin._state["entries"]["2"]["status"] == "library_complete"
+    assert plugin._is_managed(subscribe) is False
+    assert host.library_checks == [2] and host.completion_calls == []
+    event = _download_event(2)
+    plugin.intercept_download(event)
+    assert event.event_data.cancel is False
+    assert plugin.refresh_candidates() is True
+    assert host.library_checks == [2]
+    assert not any("candidate_filter" in call for call in host.search_calls)
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert restarted._is_managed(subscribe) is False
+    restarted.refresh_candidates()
+    assert host.library_checks == [2] and restarted._state["entries"]["2"]["status"] == "library_complete"
+
+
+def test_first_library_check_updates_partial_progress_then_scans_only_once(plugin_host):
+    """部分入库同步缺集数，候选照常扫描；手动和重启后的扫描不重复查库。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    host.library_episodes[2] = {1, 2, 4}
+    host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+
+    assert plugin.refresh_candidates() is True
+    assert subscribe.lack_episode == 5 and subscribe.state == "S"
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+    assert plugin._state["entries"]["2"]["candidates"]
+    assert host.library_checks == [2] and host.completion_calls == []
+    assert plugin.scan_subscription("2")[0] is True
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    restarted.refresh_candidates()
+    assert host.library_checks == [2]
+
+
+def test_first_library_check_treats_empty_missing_list_as_whole_season_missing(plugin_host):
+    """宿主用空 episodes 表示整季缺失，不能误判为进度已满。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.lack_episode = 0
+    host.subscriptions[2] = subscribe
+    host.library_episodes[2] = set()
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+
+    assert plugin.approve_progress_complete() == 0
+    assert subscribe.lack_episode == 8 and subscribe.state == "S"
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+    assert host.library_checks == [2] and host.completion_calls == []
+
+
+def test_library_check_failure_keeps_candidate_scan_and_does_not_repeat(plugin_host, monkeypatch):
+    """媒体库查询失败只影响首次进度核对，后续候选扫描仍可用。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    host.search_results.append(_context("Show.S01E01.1080p.WEB-DL.HDR-TEAM"))
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    attempts = []
+
+    def fail(_chain, **_kwargs):
+        attempts.append(2)
+        raise RuntimeError("media server unavailable")
+
+    monkeypatch.setattr(host.module.DownloadChain, "get_no_exists_info", fail)
+    assert plugin.refresh_candidates() is True
+    entry = plugin._state["entries"]["2"]
+    assert entry["library_checked"] is True and entry["candidates"]
+    assert "library_check_error" in entry
+    assert host.subscriptions[2].state == "S"
+    assert plugin.refresh_candidates() is True
+    assert attempts == [2] and host.completion_calls == []
+
+
+def test_library_complete_scope_growth_starts_a_new_management_cycle(plugin_host):
+    """齐集后目标总集数扩张时可以重新接管，并按新范围再查一次。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    host.library_episodes[2] = set(range(1, 9))
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert plugin.refresh_candidates() is True
+    assert plugin._state["entries"]["2"]["status"] == "library_complete"
+
+    subscribe.total_episode = 10
+    subscribe.lack_episode = 2
+    assert plugin.refresh_candidates() is True
+    assert host.library_checks == [2, 2]
+    assert subscribe.lack_episode == 2 and subscribe.state == "S"
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+    assert host.completion_calls == []
+
+
+def test_first_library_check_preserves_historical_manual_pause(plugin_host):
+    """手动暂停的历史订阅即使已齐集，也只刷新进度并保留原暂停。"""
+    host = plugin_host
+    historical = _subscribe(1)
+    historical.state = "S"
+    host.subscriptions[1] = historical
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.library_episodes[1] = set(range(1, 9))
+    assert plugin.adopt_subscription(1)[0] is True
+    assert plugin.refresh_candidates() is True
+    assert historical.state == "S" and historical.lack_episode == 0
+    assert plugin._state["entries"]["1"]["status"] == "library_complete"
+    assert plugin._is_managed(historical) is False
+    assert host.completion_calls == []
+
+
+@pytest.mark.parametrize("state,best_version", [("P", 0), ("N", 1)])
+def test_first_library_check_skips_pending_upgrade_and_best_version(plugin_host, state, best_version):
+    """待定及洗版订阅保留原有确认流程，不以已有文件判为完成。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.state = state
+    subscribe.best_version = best_version
+    host.subscriptions[2] = subscribe
+    host.library_episodes[2] = set(range(1, 9))
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+
+    assert plugin.approve_progress_complete() == 0
+    assert plugin.refresh_candidates() is True
+    assert host.library_checks == [] and host.completion_calls == []
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+
+
+def test_first_library_check_uses_expanded_media_total_before_treating_show_as_complete(plugin_host, monkeypatch):
+    """订阅记录总集数过旧时，新识别的季集数会阻止错误退出管理。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    host.library_episodes[2] = set(range(1, 9))
+    monkeypatch.setattr(host.module.MediaChain, "recognize_media", lambda _self, **kwargs: SimpleNamespace(
+        media_source=kwargs["media_source"], media_id=kwargs["media_id"],
+        type=kwargs["mtype"], season=None, seasons={1: list(range(1, 11))},
+    ))
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+
+    assert plugin.approve_progress_complete() == 0
+    assert subscribe.total_episode == 10 and subscribe.lack_episode == 2
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+    assert host.library_checks == [2] and host.completion_calls == []
+
+
 @pytest.mark.parametrize("total,start,lack", [
     (0, 1, 0), (8, 9, 0), (8, 1, None), (8, 1, 1),
 ])
@@ -2276,9 +2484,7 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert plugin.preview_candidate(choice, '{"sites": []}')[0] is True
     preview = host.storage["gate_state"]["entries"]["2"]["preview"]
     assert preview["matched_count"] == 3
-    preview_table = next(item for item in plugin.get_page()
-                         if item["component"] == "VTable"
-                         and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
+    preview_table = plugin.get_form()[1]["_candidate_preview"]["table"]
     preview_rows = preview_table["content"][1]["content"]
     assert len(preview_rows) == 2
     grouped_preview = next(row for row in preview_rows
@@ -2578,12 +2784,9 @@ def test_preview_shows_matches_rejections_and_requires_same_draft(plugin_host):
     assert host.subscriptions[2].state == "S"
     assert host.subscriptions[2].quality is None
     page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert "符合当前规则" in page_text
-    assert "排除" in page_text
-    assert "规则预览" in page_text
-    preview_table = next(item for item in plugin.get_page()
-                         if item["component"] == "VTable"
-                         and "结果" in json.dumps(item["content"][0], ensure_ascii=False))
+    assert "规则预览" not in page_text
+    assert "符合当前规则" not in page_text
+    preview_table = plugin.get_form()[1]["_candidate_preview"]["table"]
     assert preview_table["content"][1]["content"][0]["content"][3]["content"][0]["props"]["href"] == \
         "https://tracker.example/details.php?id=1"
     assert preview_table["content"][1]["content"][0]["content"][4] == \
@@ -2623,7 +2826,10 @@ def test_multiple_full_season_versions_need_narrower_rules(plugin_host):
     assert success is False
     assert "多个全集版本" in message
     assert host.subscriptions[2].state == "S"
-    assert "多个集数覆盖全集" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert host.module._full_season_version_count(
+        host.storage["gate_state"]["entries"]["2"]["preview"]["matched"]
+    ) == 2
+    assert "规则匹配多个集数覆盖全集" not in json.dumps(plugin.get_page(), ensure_ascii=False)
 
     success, _message, draft = plugin.preview_candidate(choice, r'{"include": "TEAM\\.A"}')
     assert success is True
@@ -2689,6 +2895,8 @@ def test_approved_subscription_can_preview_and_submit_selected_episodes(plugin_h
     assert preview["rejected_count"] == 2
     assert any("未明确识别集数" in item["reason"] for item in preview["rejected"])
     assert "secret.example" not in json.dumps(preview)
+    assert plugin.get_form()[1]["_replacement_preview"]["table"]["component"] == "VTable"
+    assert "回刷预览于" not in json.dumps(plugin.get_page(), ensure_ascii=False)
     choice = _form_items(plugin, "replace_resource")[0]["value"]
     assert "集数覆盖全集" in _form_items(plugin, "replace_resource")[0]["title"]
     assert "1.00 KiB（1,024 B）" in _form_items(plugin, "replace_resource")[0]["title"]
@@ -2973,7 +3181,7 @@ def test_scan_cache_replaces_previous_round_while_candidates_merge_and_approval_
     approved = host.storage["gate_state"]["entries"]["2"]
     assert len(approved["candidates"]) == 2
     assert approved["preview"]["matched_count"] == 2
-    assert "确认时的规则预览（历史记录）" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "确认时的规则预览（历史记录）" not in json.dumps(plugin.get_page(), ensure_ascii=False)
     assert next(service for service in plugin.get_service() if service["id"] == "candidate_refresh")["kwargs"] == {"hours": 4}
 
 
@@ -3543,7 +3751,8 @@ def test_preview_compares_groups_and_only_updates_draft_when_groups_remove_every
         "with_groups_count": 0, "without_groups_count": 1,
     }
     assert origin in preview["rule_group_notice"]
-    assert "已自动选择" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "已自动选择" in json.dumps(plugin.get_form()[1]["_candidate_preview"], ensure_ascii=False)
+    assert "已自动选择" not in json.dumps(plugin.get_page(), ensure_ascii=False)
     assert len(host.search_calls) == round_count
     assert len(calls) == 1
     assert calls[0]["rule_groups"] == expected_groups
