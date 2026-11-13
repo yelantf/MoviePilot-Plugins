@@ -15,7 +15,6 @@ from typing import Any, Optional
 from app.application.torrent.download import TorrentHelper
 from app.application.site.sites import SitesHelper
 from app.application.configuration import get_configured_system_config
-from app.application.subscription.contract import build_subscribe_meta
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.search import SearchChain
@@ -300,7 +299,7 @@ def _rule_scope(subscribe: Any) -> str:
 
 
 def _subscription_progress(subscribe: Any) -> tuple[Optional[int], Optional[int]]:
-    """按宿主订阅字段计算已完成集数；总集数未知时不猜测进度。"""
+    """按宿主订阅字段计算进度；总集数未知时不猜测。"""
     try:
         total = int(getattr(subscribe, "total_episode", 0) or 0)
     except (TypeError, ValueError):
@@ -343,7 +342,7 @@ def _progress_label(subscribe: Any) -> str:
     completed, total = _subscription_progress(subscribe)
     if completed is None:
         return "订阅进度未知"
-    kind = "洗版完成" if getattr(subscribe, "best_version", False) else "已入库"
+    kind = "洗版完成" if getattr(subscribe, "best_version", False) else "订阅进度"
     return f"{kind} {completed}/{total} 集"
 
 
@@ -500,9 +499,9 @@ class SubscribeOverwatcher(_PluginBase):
     """
 
     plugin_name = "剧集守门员"
-    plugin_desc = "剧集订阅可预览规则、一次性整包下载；媒体库齐集后自动保留规则恢复。"
+    plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.19"
+    plugin_version = "1.9.20"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -518,7 +517,7 @@ class SubscribeOverwatcher(_PluginBase):
         self._scan_lock = threading.Lock()
         self._search_stop = threading.Event()
         self._queued_scan_ids: set[int] = set()
-        self._queued_library_ids: set[int] = set()
+        self._queued_progress_ids: set[int] = set()
         # 搜索事实单独落盘，不把凭据或完整搜索结果放入候选和预览展示记录。
         self._preview_search_cache: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
         self._search_cache_sequence = 0
@@ -739,7 +738,7 @@ class SubscribeOverwatcher(_PluginBase):
             self.update_config(config)
         self._reconcile_pending_states()
         if not was_active:
-            self._schedule_library_check()
+            self._schedule_progress_check()
             self._schedule_scan()
 
     def _save_state(self) -> None:
@@ -858,7 +857,7 @@ class SubscribeOverwatcher(_PluginBase):
                 if not self._ensure_pending(subscribe, force_historical=True):
                     return False, f"订阅 {subscribe.id} 纳入管理失败，请检查已纳入列表"
         self._schedule_scan(ids)
-        self._schedule_library_check(ids)
+        self._schedule_progress_check(ids)
         if len(ids) == 1:
             return True, f"订阅 {ids[0]} 已纳入管理，原有筛选规则暂未修改"
         return True, f"已纳入管理 {len(ids)} 条历史剧集订阅，原有筛选规则暂未修改"
@@ -892,12 +891,30 @@ class SubscribeOverwatcher(_PluginBase):
             return
         subscribe = self._subscribes.get(sid)
         if subscribe and self._ensure_pending(subscribe):
-            self._schedule_library_check([sid])
+            self._schedule_progress_check([sid])
             self._schedule_scan([sid])
+
+    @eventmanager.register(EventType.SubscribeModified)
+    def on_subscribe_modified(self, event: Optional[Event] = None) -> None:
+        """订阅进度或状态变化后安排一次轻量的自动批准检查。"""
+        if not self._enabled or event is None or not isinstance(event.event_data, dict):
+            return
+        data = event.event_data
+        sid = data.get("subscribe_id")
+        if not isinstance(sid, int) or isinstance(sid, bool):
+            return
+        fields = data.get("fields")
+        if isinstance(fields, list) and not {"lack_episode", "total_episode", "start_episode", "state"}.intersection(fields):
+            return
+        with self._lock:
+            entry = self._state["entries"].get(str(sid)) or {}
+            if entry.get("status") != "pending" or entry.get("revoked"):
+                return
+        self._schedule_progress_check([sid])
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Optional[Event] = None) -> None:
-        """整理完成后尽快复核同一媒体的待确认订阅；真正批准仍以媒体库查询为准。"""
+        """整理完成后尽快复核同一媒体的待确认订阅进度。"""
         if not self._enabled or event is None or not isinstance(event.event_data, dict):
             return
         mediainfo = event.event_data.get("mediainfo")
@@ -920,10 +937,10 @@ class SubscribeOverwatcher(_PluginBase):
                     and (season is None or subscribe.season == season)
                 ]
         except Exception:
-            logger.exception("整理完成后的订阅匹配失败，留待定时媒体库齐集检查")
+            logger.exception("整理完成后的订阅匹配失败，留待定时进度检查")
             return
         if ids:
-            self._schedule_library_check(ids)
+            self._schedule_progress_check(ids)
 
     @eventmanager.register(ChainEventType.ResourceDownload, priority=1000)
     def intercept_download(self, event: Optional[Event] = None) -> None:
@@ -1010,8 +1027,8 @@ class SubscribeOverwatcher(_PluginBase):
         if ids and not self.refresh_candidates(subscription_ids=ids):
             self._schedule_scan(ids)
 
-    def _schedule_library_check(self, subscription_ids: Optional[list[int]] = None) -> None:
-        """合并整理事件和启动检查，避免每次入库都遍历所有待确认订阅。"""
+    def _schedule_progress_check(self, subscription_ids: Optional[list[int]] = None) -> None:
+        """合并订阅变更、整理事件和启动时的进度检查。"""
         if not self._enabled:
             return
         with self._lock:
@@ -1020,24 +1037,24 @@ class SubscribeOverwatcher(_PluginBase):
                     int(key) for key, entry in self._state["entries"].items()
                     if entry.get("status") == "pending" and not entry.get("revoked")
                 ]
-            self._queued_library_ids.update(subscription_ids)
-            if not self._queued_library_ids:
+            self._queued_progress_ids.update(subscription_ids)
+            if not self._queued_progress_ids:
                 return
         try:
             add_plugin_once_job(
-                self.__class__.__name__, "library-check", self._run_scheduled_library_check,
-                "核对待确认剧集媒体库", delay_seconds=10,
+                self.__class__.__name__, "progress-check", self._run_scheduled_progress_check,
+                "核对待确认剧集进度", delay_seconds=2,
             )
         except RuntimeError:
-            logger.warning("调度器尚未就绪，媒体库齐集检查将在周期任务中执行")
+            logger.warning("调度器尚未就绪，订阅进度检查将在周期任务中执行")
 
-    def _run_scheduled_library_check(self) -> None:
-        """只消费已合并的订阅 ID；失败或未齐集交给下一次事件或周期检查。"""
+    def _run_scheduled_progress_check(self) -> None:
+        """只消费已合并的订阅 ID；未满进度交给后续变更或周期检查。"""
         with self._lock:
-            ids = sorted(self._queued_library_ids)
-            self._queued_library_ids.clear()
+            ids = sorted(self._queued_progress_ids)
+            self._queued_progress_ids.clear()
         if ids:
-            self.approve_library_complete(subscription_ids=ids)
+            self.approve_progress_complete(subscription_ids=ids)
 
     @staticmethod
     def _can_auto_approve(subscribe: Any, entry: dict[str, Any]) -> bool:
@@ -1052,63 +1069,19 @@ class SubscribeOverwatcher(_PluginBase):
         )
 
     @staticmethod
-    def _library_has_all_target_episodes(subscribe: Any) -> bool:
-        """按媒体身份和目标集号查询真实媒体库，不消费下载记录或页面进度。"""
-        season = subscribe.season
+    def _subscribe_progress_complete(subscribe: Any) -> bool:
+        """按普通剧集卡片的总集数与缺失集数口径判断进度是否已满。"""
         total = subscribe.total_episode
         start = subscribe.start_episode or 1
-        if (not isinstance(season, int) or isinstance(season, bool) or season < 0
-                or not isinstance(total, int) or isinstance(total, bool) or total < 1
-                or not isinstance(start, int) or isinstance(start, bool) or not 1 <= start <= total
-                or not subscribe.media_source or not subscribe.media_id):
-            return False
-        media_key = build_media_key(subscribe.media_source, subscribe.media_id)
-        if not media_key:
-            return False
-        meta = build_subscribe_meta(subscribe)
-        media = MediaChain().recognize_media(
-            meta=meta, mtype=MediaType.TV,
-            media_source=MediaSource(subscribe.media_source), media_id=str(subscribe.media_id),
-            episode_group=subscribe.episode_group, cache=False,
+        lack = subscribe.lack_episode
+        return bool(
+            isinstance(total, int) and not isinstance(total, bool) and total > 0
+            and isinstance(start, int) and not isinstance(start, bool) and 1 <= start <= total
+            and isinstance(lack, int) and not isinstance(lack, bool) and lack == 0
         )
-        if (media is None or media.type != MediaType.TV
-                or build_media_key(*resolve_media_identity(media=media)) != media_key
-                or (subscribe.episode_group and getattr(media, "episode_group", None) != subscribe.episode_group)):
-            return False
-        listed = (getattr(media, "seasons", None) or {}).get(season)
-        if not isinstance(listed, (list, tuple, set)) or not listed:
-            return False
-        if any(not isinstance(episode, int) or isinstance(episode, bool) for episode in listed):
-            return False
-        targets = set(range(start, total + 1))
-        first_listed = min(listed)
-        if first_listed > start:
-            # 主程序缺集查询以元数据最小集号为起点，不能证明更早目标集已入库。
-            return False
-        if (not getattr(subscribe, "manual_total_episode", False)
-                and max(listed) > total):
-            # 主程序尚未刷新更大的目标总集数，先让它更新订阅。
-            return False
-        media.season = season
-        query_last = max(total, max(listed))
-        exists, missing = DownloadChain().get_no_exists_info(
-            meta=meta, mediainfo=media, totals={season: query_last - first_listed + 1},
-        )
-        if exists and not missing:
-            return True
-        season_missing = (missing or {}).get(media_key, {}).get(season)
-        if season_missing is None:
-            return False
-        episodes = getattr(season_missing, "episodes", None)
-        if not isinstance(episodes, (list, tuple, set)) or not episodes:
-            # 空集号在宿主缺集结构中表示整季不存在。
-            return False
-        if any(not isinstance(episode, int) or isinstance(episode, bool) for episode in episodes):
-            return False
-        return targets.isdisjoint(episodes)
 
-    def approve_library_complete(self, *, subscription_ids: Optional[list[int]] = None) -> int:
-        """媒体库真实覆盖目标范围后直接批准；规则原样保留。"""
+    def approve_progress_complete(self, *, subscription_ids: Optional[list[int]] = None) -> int:
+        """普通剧集订阅进度已满后直接批准；规则原样保留。"""
         if not self._enabled:
             return 0
         with self._lock:
@@ -1125,27 +1098,30 @@ class SubscribeOverwatcher(_PluginBase):
                     continue
                 identity = _identity(subscribe)
                 scope = (subscribe.season, subscribe.start_episode, subscribe.total_episode,
-                         subscribe.best_version, getattr(subscribe, "manual_total_episode", False), subscribe.state)
+                         subscribe.lack_episode, subscribe.best_version,
+                         getattr(subscribe, "manual_total_episode", False), subscribe.state)
             try:
-                if not self._library_has_all_target_episodes(subscribe):
+                if not self._subscribe_progress_complete(subscribe):
                     continue
             except Exception:
-                logger.exception(f"订阅 {sid} 媒体库齐集检查失败，保持待确认")
+                logger.exception(f"订阅 {sid} 进度检查失败，保持待确认")
                 continue
             with self._lock:
                 current = self._subscribes.get(sid)
                 entry = self._state["entries"].get(str(sid)) or {}
                 if (current is None or _identity(current) != identity
                         or (current.season, current.start_episode, current.total_episode,
-                            current.best_version, getattr(current, "manual_total_episode", False), current.state) != scope
+                            current.lack_episode, current.best_version,
+                            getattr(current, "manual_total_episode", False), current.state) != scope
+                        or not self._subscribe_progress_complete(current)
                         or not self._can_auto_approve(current, entry)):
                     continue
                 success, message = self._approve(sid, entry, None, None)
             if success:
                 approved += 1
-                logger.info(f"剧集守门员：订阅 {sid} 目标集已全部在媒体库，自动直接批准；原规则保持不变")
+                logger.info(f"剧集守门员：订阅 {sid} 进度已满，自动直接批准；原规则保持不变")
             else:
-                logger.warning(f"剧集守门员：订阅 {sid} 媒体库齐集后自动批准失败：{message}")
+                logger.warning(f"剧集守门员：订阅 {sid} 进度已满但自动批准失败：{message}")
         return approved
 
     def scan_subscription(self, sid_value: Any) -> tuple[bool, str]:
@@ -1226,8 +1202,8 @@ class SubscribeOverwatcher(_PluginBase):
             for subscribe in subscribes:
                 if self._is_managed(subscribe) and subscribe.type == MediaType.TV.value:
                     self._ensure_pending(subscribe)
-            # 已齐集的订阅无需继续搜索站点候选。
-            self.approve_library_complete(subscription_ids=subscription_ids)
+            # 进度已满的订阅无需继续搜索站点候选。
+            self.approve_progress_complete(subscription_ids=subscription_ids)
             with self._lock:
                 pending_ids = [
                     int(key) for key, entry in self._state["entries"].items()
@@ -2279,7 +2255,7 @@ class SubscribeOverwatcher(_PluginBase):
             del history[20:]
             self._save_state()
         return True, (f"已提交整包下载：{context.torrent_info.title}；"
-                      "订阅仍待确认，目标集入库齐全后将保留原规则自动恢复")
+                      "订阅仍待确认，进度满后将保留原规则自动恢复")
 
     def approve_subscription(self, sid_value: Any) -> tuple[bool, str]:
         """
@@ -3198,7 +3174,7 @@ class SubscribeOverwatcher(_PluginBase):
         )
 
     def get_service(self) -> list[dict[str, Any]]:
-        """注册媒体库齐集复核、候选扫描和每日待确认订阅通知。"""
+        """注册订阅进度检查、候选扫描和每日待确认订阅通知。"""
         if not self._enabled:
             return []
         services = [{
@@ -3206,8 +3182,8 @@ class SubscribeOverwatcher(_PluginBase):
             "trigger": "interval", "func": self.refresh_candidates,
             "kwargs": {"hours": 4},
         }, {
-            "id": "library_completion_check", "name": "复核待确认剧集媒体库",
-            "trigger": "interval", "func": self.approve_library_complete,
+            "id": "subscription_progress_check", "name": "检查待确认剧集进度",
+            "trigger": "interval", "func": self.approve_progress_complete,
             "kwargs": {"minutes": 15},
         }]
         if self._daily_notice:
@@ -3220,7 +3196,7 @@ class SubscribeOverwatcher(_PluginBase):
 
     def stop_service(self) -> None:
         """
-        停止插件的一次性齐集检查、候选扫描和确认后补搜任务。
+        停止插件的一次性进度检查、候选扫描和确认后补搜任务。
         """
         with self._lock:
             self._search_stop.set()
@@ -3229,10 +3205,10 @@ class SubscribeOverwatcher(_PluginBase):
             self._preview_search_cache.clear()
             self._search_cache_loaded = False
             self._queued_scan_ids.clear()
-            self._queued_library_ids.clear()
+            self._queued_progress_ids.clear()
         try:
             remove_plugin_once_job(self.__class__.__name__, "collect")
-            remove_plugin_once_job(self.__class__.__name__, "library-check")
+            remove_plugin_once_job(self.__class__.__name__, "progress-check")
         except RuntimeError:
             return
         with self._lock:
