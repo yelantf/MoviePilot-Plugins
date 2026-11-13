@@ -146,7 +146,7 @@
               <div>站点：{{ selectedCandidateSite }} · 大小：{{ selectedCandidate.size_label || '未知' }}</div>
               <div>识别范围：{{ selectedCandidate.coverage || '请在站点详情中核对' }}。跨季合集也会下载所有季。</div>
               <div>下载目录：{{ selectedDownloadDirectory?.title || '订阅原目录或 MoviePilot 默认目录' }}</div>
-              <div>本次不会应用规则草稿，也不会批准或恢复订阅。将使用扫描留在内存的种子链接；重启后如未重新扫描，请先扫描所选剧集。</div>
+              <div>本次不会应用规则草稿，也不会立即批准订阅；目标集入库齐全后会保留原规则自动恢复。将使用扫描留在内存的种子链接；重启后如未重新扫描，请先扫描所选剧集。</div>
               <a :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
                 class="text-primary text-decoration-underline">打开站点详情核对种子</a>
               <div class="d-flex flex-wrap ga-2 mt-3">

@@ -38,6 +38,8 @@ def plugin_host(monkeypatch, tmp_path):
     directory_calls = []
     group_filter_calls = []
     logs = []
+    library_episodes = {}
+    recognized_episodes = {}
     system_values = {"IndexerSites": []}
     indexers = [
         {"id": 5, "name": "样例站", "is_active": True},
@@ -45,7 +47,8 @@ def plugin_host(monkeypatch, tmp_path):
         {"id": 9, "name": "已停用站", "is_active": False},
     ]
 
-    for name in ("app", "app.application", "app.application.torrent", "app.application.site", "app.chain",
+    for name in ("app", "app.application", "app.application.torrent", "app.application.site",
+                 "app.application.subscription", "app.chain",
                  "app.db", "app.db.oper", "app.schemas", "app.sdk"):
         package = ModuleType(name)
         package.__path__ = []
@@ -137,10 +140,12 @@ def plugin_host(monkeypatch, tmp_path):
     class MediaChain:
         """返回与订阅身份对应的媒体信息。"""
 
-        def recognize_media(self, *, media_source, media_id, mtype):
+        def recognize_media(self, *, media_source, media_id, mtype, episode_group=None, **_kwargs):
             """模拟宿主按媒体 ID 识别目标剧集。"""
             return SimpleNamespace(media_source=media_source, media_id=media_id,
-                                   type=mtype, season=None)
+                                   type=mtype, season=None, episode_group=episode_group,
+                                   seasons={1: recognized_episodes.get((media_source, media_id, 1),
+                                                                       list(range(1, 9)))})
 
     class NotExistMediaInfo:
         """记录按目标季搜索所需的缺集占位信息。"""
@@ -216,6 +221,19 @@ def plugin_host(monkeypatch, tmp_path):
             """
             downloads.append((context, kwargs))
             return ("fake-hash", None)
+
+        def get_no_exists_info(self, *, meta, mediainfo, totals=None):
+            """只按媒体库事实返回缺集，忽略订阅页面进度。"""
+            season = meta.begin_season
+            listed = mediainfo.seasons.get(season) or []
+            if totals and listed:
+                listed = list(range(min(listed), min(listed) + totals[season]))
+            present = library_episodes.get((mediainfo.media_source, mediainfo.media_id, season), set())
+            missing = sorted(set(listed) - set(present))
+            if not missing:
+                return True, {}
+            key = build_media_key(mediainfo.media_source, mediainfo.media_id)
+            return False, {key: {season: NotExistMediaInfo(episodes=missing)}}
 
     class DirectoryHelper:
         """
@@ -344,6 +362,9 @@ def plugin_host(monkeypatch, tmp_path):
         "app.application.configuration": {"get_configured_system_config": lambda: SimpleNamespace(
             get=lambda key: system_values.get(key),
         )},
+        "app.application.subscription.contract": {
+            "build_subscribe_meta": lambda subscribe: SimpleNamespace(begin_season=subscribe.season),
+        },
         "app.chain.download": {"DownloadChain": DownloadChain},
         "app.chain.media": {"MediaChain": MediaChain},
         "app.chain.search": {"SearchChain": SearchChain},
@@ -359,7 +380,7 @@ def plugin_host(monkeypatch, tmp_path):
         "app.schemas.mediaserver": {"NotExistMediaInfo": NotExistMediaInfo},
         "app.schemas.types": {
             "ChainEventType": SimpleNamespace(ResourceDownload="resource.download"),
-            "EventType": SimpleNamespace(SubscribeAdded="subscribe.added"),
+            "EventType": SimpleNamespace(SubscribeAdded="subscribe.added", TransferComplete="transfer.complete"),
             "MediaSource": lambda value: value,
             "MediaType": SimpleNamespace(TV=SimpleNamespace(value="电视剧")),
             "MessageType": SimpleNamespace(Plugin="plugin"),
@@ -404,6 +425,7 @@ def plugin_host(monkeypatch, tmp_path):
     return SimpleNamespace(
         module=module, subscriptions=subscriptions, storage=storage, jobs=jobs,
         search_results=search_results, search_calls=search_calls, downloads=downloads,
+        library_episodes=library_episodes, recognized_episodes=recognized_episodes,
         messages=messages,
         directories=directories, directory_calls=directory_calls,
         directory_module=directory_module,
@@ -1287,7 +1309,9 @@ def test_daily_notice_reports_zero_and_respects_switch(plugin_host):
     assert plugin_host.messages[0]["text"] == "当前有 0 条待确认订阅。\n暂无待确认的剧集订阅。"
 
     plugin.init_plugin({"enabled": True, "daily_notice": False})
-    assert {item["id"] for item in plugin.get_service()} == {"candidate_refresh"}
+    assert {item["id"] for item in plugin.get_service()} == {
+        "candidate_refresh", "library_completion_check",
+    }
     plugin.notify_pending_subscriptions()
     assert len(plugin_host.messages) == 1
 
@@ -1458,6 +1482,120 @@ def test_direct_approval_preserves_rules_and_can_be_revoked(plugin_host):
     after_reload = _download_event(2)
     reloaded.intercept_download(after_reload)
     assert after_reload.event_data.cancel is True
+
+
+def test_library_complete_auto_approval_waits_for_real_inventory_and_keeps_rules(plugin_host):
+    """页面显示齐集仍须查媒体库；真正入库后批准并跳过候选搜索。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.quality = "WEB-DL"
+    subscribe.sites = [7]
+    subscribe.lack_episode = 0  # 页面此时会显示 8/8，下载文件尚未入库。
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+
+    host.library_episodes[("themoviedb", "123", 1)] = set(range(1, 8))
+    assert plugin.approve_library_complete() == 0
+    assert subscribe.state == "S"
+    assert plugin._state["entries"]["2"]["status"] == "pending"
+
+    host.library_episodes[("themoviedb", "123", 1)].add(8)
+    assert plugin.refresh_candidates() is True
+    assert plugin._state["entries"]["2"]["status"] == "approved"
+    assert subscribe.state == "R"
+    assert subscribe.quality == "WEB-DL"
+    assert subscribe.sites == [7]
+    assert not any("candidate_filter" in call for call in host.search_calls)
+    assert any("subscription_search" in call for call in host.search_calls)
+
+
+def test_auto_approval_checks_target_range_when_metadata_lists_fewer_episodes(plugin_host):
+    """订阅从 E05 开始且 TMDB 暂未列出 E07/08 时，仍按 E05–E08 的库内事实判断。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    subscribe.start_episode = 5
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.recognized_episodes[("themoviedb", "123", 1)] = list(range(1, 7))
+    host.library_episodes[("themoviedb", "123", 1)] = {5, 6, 7}
+    assert plugin.approve_library_complete() == 0
+
+    host.library_episodes[("themoviedb", "123", 1)].add(8)
+    assert plugin.approve_library_complete() == 1
+    assert subscribe.state == "R"
+
+
+def test_auto_approval_waits_when_target_total_has_fallen_behind_metadata(plugin_host):
+    """主程序尚未扩展订阅总集数时，不按旧目标提前批准。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.recognized_episodes[("themoviedb", "123", 1)] = list(range(1, 10))
+    host.library_episodes[("themoviedb", "123", 1)] = set(range(1, 10))
+    assert plugin.approve_library_complete() == 0
+    assert subscribe.state == "S"
+
+    subscribe.total_episode = 9
+    assert plugin.approve_library_complete() == 1
+    assert subscribe.state == "R"
+
+
+def test_transfer_event_checks_only_matching_media_after_import(plugin_host):
+    """手动整包下载的整理事件可触发快速复核，提交下载本身不批准。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.jobs.pop("library-check", None)
+    plugin.on_transfer_complete(SimpleNamespace(event_data={
+        "mediainfo": SimpleNamespace(media_source="themoviedb", media_id="999"),
+        "meta": SimpleNamespace(begin_season=1),
+    }))
+    assert "library-check" not in host.jobs
+
+    host.library_episodes[("themoviedb", "123", 1)] = set(range(1, 9))
+    plugin.on_transfer_complete(SimpleNamespace(event_data={
+        "mediainfo": SimpleNamespace(media_source="themoviedb", media_id="123"),
+        "meta": SimpleNamespace(begin_season=1),
+    }))
+    job, delay, kwargs = host.jobs["library-check"]
+    assert delay == 10
+    job(**kwargs)
+    assert plugin._state["entries"]["2"]["status"] == "approved"
+    assert subscribe.state == "R"
+
+
+def test_auto_approval_preserves_external_pause_and_pending_guard(plugin_host):
+    """齐集检查不能覆盖用户暂停、增强版待定或显式撤销。"""
+    host = plugin_host
+    historical = _subscribe(1)
+    historical.state = "S"
+    host.subscriptions[1] = historical
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    assert plugin.adopt_subscription(1)[0] is True
+    host.library_episodes[("themoviedb", "123", 1)] = set(range(1, 9))
+    assert plugin.approve_library_complete() == 0
+    assert plugin._state["entries"]["1"]["status"] == "pending"
+
+    subscribe = _subscribe(2)
+    host.subscriptions[2] = subscribe
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    subscribe.state = "P"
+    assert plugin.approve_library_complete() == 0
+    subscribe.state = "S"
+    plugin._state["entries"]["2"]["revoked"] = True
+    assert plugin.approve_library_complete() == 0
+    assert subscribe.state == "S"
 
 
 def test_candidate_approval_can_be_revoked_without_overwriting_manual_edits(plugin_host):
