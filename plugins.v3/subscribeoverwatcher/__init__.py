@@ -537,7 +537,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.24"
+    plugin_version = "1.9.25"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1236,7 +1236,7 @@ class SubscribeOverwatcher(_PluginBase):
                                 break
                     if not found_now:
                         message += ("；所选版本本轮未再次找到，列表中显示的是历史候选；"
-                                    "确认下载时会先尝试内存中的真实链接，缺少链接才重查所选站点")
+                                    "确认下载只使用内存中的真实链接，缺少时请手动重新扫描此剧集")
                 failures = (entry.get("search_diagnostics") or {}).get("site_failures") or []
                 if failures:
                     message += "；结果可能不完整：" + "；".join(
@@ -2387,7 +2387,7 @@ class SubscribeOverwatcher(_PluginBase):
             return self._approve(sid, entry, payload, candidate_id)
 
     def download_candidate_once(self, choice: str, download_directory: str = "") -> tuple[bool, str]:
-        """用实时种子链接整包提交；缺少链接时仅重查所选站点并核对同一资源。"""
+        """只用内存中所选种子的真实下载链接整包提交，不在下载时搜索。"""
         try:
             sid_text, candidate_id = choice.split(":", 1)
             sid = int(sid_text)
@@ -2446,21 +2446,12 @@ class SubscribeOverwatcher(_PluginBase):
             return list(matches.values())
 
         matches = matching_contexts(contexts)
-        if len(matches) != 1 or not _has_download_link(matches[0]):
-            # 持久候选和详情链接可跨重启保留；种子下载地址只允许从实时站点结果取得。
-            try:
-                contexts = self._search_unfiltered(subscribe, sites=[site_id])
-            except Exception:
-                logger.exception(f"订阅 {sid} 所选候选的单站实时链接重查失败")
-                return False, "所选站点的实时下载链接重查失败，请稍后重试或手动扫描此剧集"
-            matches = matching_contexts(contexts)
-            if not matches:
-                return False, ("已重查所选站点，仍未找到同一候选；列表中保留的是历史详情链接，"
-                               "请点击“重新扫描此剧集”更新候选后再选择版本")
-            if len(matches) > 1:
-                return False, "所选站点重查后仍有多个匹配种子，无法安全确定下载目标"
-            if not _has_download_link(matches[0]):
-                return False, "所选站点重查后仍未提供种子下载链接；详情链接不能直接交给下载器"
+        if len(matches) != 1:
+            return False, ("内存中没有唯一匹配的所选种子；请点击“重新扫描此剧集”手动扫描，"
+                           "完成后重新核对版本再下载")
+        if not _has_download_link(matches[0]):
+            return False, ("内存中的所选种子没有真实下载链接；请点击“重新扫描此剧集”手动扫描，"
+                           "完成后重新核对版本再下载。站点详情链接不能直接用于下载")
         context = matches[0]
         media = getattr(context, "media_info", None)
         if media is None:
@@ -3179,7 +3170,7 @@ class SubscribeOverwatcher(_PluginBase):
             ),
             row(col(info(
                 "一次性下载会提交所选种子的全部文件，包括跨季合集的所有季；不应用规则草稿，"
-                "不批准或恢复订阅。优先使用内存中的种子下载链接；缺少链接时只重查所选站点并核对同一资源。"
+                "不批准或恢复订阅。只使用内存中的种子下载链接；缺少时请手动点击“重新扫描此剧集”，确认下载不会自动搜索。"
             ))),
             divider,
             row(

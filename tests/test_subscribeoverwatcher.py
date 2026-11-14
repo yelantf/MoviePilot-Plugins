@@ -2325,16 +2325,18 @@ def test_one_time_download_uses_cached_link_and_checks_selected_resource(plugin_
     assert host.downloads == []
     context.media_info.media_id = "123"
     context.torrent_info.enclosure = None
-    host.search_results.append(context)
-    assert "下载链接" in plugin.download_candidate_once(choice)[1]
+    available_online = copy.deepcopy(context)
+    available_online.torrent_info.enclosure = "https://secret.example/torrent"
+    host.search_results.append(available_online)
+    success, message = plugin.download_candidate_once(choice)
+    assert success is False and "重新扫描此剧集" in message
     assert host.downloads == []
     host.search_results.clear()
     context.torrent_info.enclosure = "https://secret.example/torrent"
     candidate["page_url"] = None
     assert "详情链接" in plugin.download_candidate_once(choice)[1]
     assert host.downloads == []
-    assert len(host.search_calls) > searches_after_scan
-    assert all(call.get("sites") == [5] for call in host.search_calls[searches_after_scan:])
+    assert len(host.search_calls) == searches_after_scan
 
 
 def test_historical_candidate_keeps_memory_link_after_empty_scan(plugin_host):
@@ -2422,11 +2424,17 @@ def test_historical_search_cache_restores_without_credentials_and_previews_separ
     assert preview["matched_count"] == preview["rejected_count"] == 0
     assert preview["historical_candidates"][0]["id"] == candidate["id"]
     searches_before_download = len(host.search_calls)
-    assert restarted.download_candidate_once(choice)[0] is False
-    assert len(host.search_calls) > searches_before_download
+    success, message = restarted.download_candidate_once(choice)
+    assert success is False and "重新扫描此剧集" in message
+    assert len(host.search_calls) == searches_before_download
     assert host.downloads == []
     host.search_results.append(context)
+    assert restarted.download_candidate_once(choice)[0] is False
+    assert len(host.search_calls) == searches_before_download
+    assert restarted.scan_subscription("2")[0] is True
+    searches_after_manual_scan = len(host.search_calls)
     assert restarted.download_candidate_once(choice)[0] is True
+    assert len(host.search_calls) == searches_after_manual_scan
     assert host.downloads[-1][0].torrent_info.enclosure == context.torrent_info.enclosure
     saved["historical_contexts"][0]["torrent_info"]["enclosure"] = context.torrent_info.enclosure
     cache_file.write_text(json.dumps(saved))
@@ -2452,8 +2460,8 @@ def test_historical_download_link_survives_newer_empty_single_site_cache(plugin_
     assert host.downloads[-1][0] is context
 
 
-def test_one_time_download_refreshes_selected_site_after_restart_without_persisting_credentials(plugin_host):
-    """重启后仅按所选站点和资源身份重查；持久缓存仍不得保存下载凭据。"""
+def test_one_time_download_requires_manual_scan_after_restart_without_persisting_credentials(plugin_host):
+    """重启后没有内存下载链接，须手动扫描；持久缓存不得保存下载凭据。"""
     host = plugin_host
     host.subscriptions[1] = _subscribe(1)
     plugin = host.module.SubscribeOverwatcher()
@@ -2481,11 +2489,16 @@ def test_one_time_download_refreshes_selected_site_after_restart_without_persist
     visible = json.dumps((restarted.get_form(), restarted.get_page()))
     assert "cookie-secret" not in visible and "passkey=private" not in visible
     host.search_results.clear()
-    assert restarted.download_candidate_once(choice)[0] is False
+    success, message = restarted.download_candidate_once(choice)
+    assert success is False and "重新扫描此剧集" in message
     assert host.downloads == []
     host.search_results.append(context)
+    assert restarted.download_candidate_once(choice)[0] is False
+    assert len(host.search_calls) == searches_after_scan
+    assert restarted.scan_subscription("2")[0] is True
+    searches_after_manual_scan = len(host.search_calls)
     assert restarted.download_candidate_once(choice)[0] is True
-    assert len(host.search_calls) > searches_after_scan
+    assert len(host.search_calls) == searches_after_manual_scan
     assert len(host.downloads) == 1
 
     # 如果磁盘上残留过渡版本写入的凭据缓存，启动时删除整个文件。
@@ -2496,6 +2509,8 @@ def test_one_time_download_refreshes_selected_site_after_restart_without_persist
     legacy = host.module.SubscribeOverwatcher()
     legacy.init_plugin({"enabled": True})
     assert not cache_file.exists()
+    assert legacy.download_candidate_once(choice)[0] is False
+    assert legacy.scan_subscription("2")[0] is True
     assert legacy.download_candidate_once(choice)[0] is True
     assert len(host.downloads) == 2
     assert host.downloads[-1][0].torrent_info.enclosure == context.torrent_info.enclosure

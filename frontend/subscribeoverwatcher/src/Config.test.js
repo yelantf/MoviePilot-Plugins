@@ -113,7 +113,8 @@ describe('custom configuration actions', () => {
     expect(applyCalls(api)).toHaveLength(0)
     expect(wrapper.text()).toContain('跨季合集也会下载所有季')
     expect(wrapper.text()).toContain('133.90 GiB')
-    expect(wrapper.text()).toContain('若链接已清理，确认时会只重查所选站点')
+    expect(wrapper.text()).toContain('确认下载只使用内存中的真实种子下载链接，不会自动搜索')
+    expect(wrapper.text()).toContain('若链接已清理，请点击“重新扫描此剧集”手动扫描后再下载')
     expect(wrapper.findAll('a').some(item => item.text() === '打开站点详情核对种子')).toBe(true)
 
     await wrapper.findAll('button').find(item => item.text() === '确认整包下载').trigger('click')
