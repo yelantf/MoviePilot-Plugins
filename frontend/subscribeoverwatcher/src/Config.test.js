@@ -113,7 +113,7 @@ describe('custom configuration actions', () => {
     expect(applyCalls(api)).toHaveLength(0)
     expect(wrapper.text()).toContain('跨季合集也会下载所有季')
     expect(wrapper.text()).toContain('133.90 GiB')
-    expect(wrapper.text()).toContain('使用扫描留在内存的种子链接')
+    expect(wrapper.text()).toContain('若链接已清理，确认时会只重查所选站点')
     expect(wrapper.findAll('a').some(item => item.text() === '打开站点详情核对种子')).toBe(true)
 
     await wrapper.findAll('button').find(item => item.text() === '确认整包下载').trigger('click')
@@ -121,6 +121,32 @@ describe('custom configuration actions', () => {
     expect(applyCalls(api)).toHaveLength(1)
     expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'download_candidate', candidate: '2:a' })
     expect(wrapper.text()).toContain('已提交整包下载；订阅仍待确认')
+    wrapper.unmount()
+  })
+
+  it('rescans the selected candidate show from the download area and requires a fresh confirmation', async () => {
+    const data = candidateSnapshot()
+    data.conf[0].content.find(item => item.props?.model === 'candidate').props.items[0].page_url =
+      'https://tracker.example/details.php?id=42'
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(async (_url, submitted) => {
+        data.model._last_confirmation = { request_id: submitted.operation_request_id, success: true }
+        return { success: true, message: '扫描完成，本轮仍找到所选版本' }
+      }),
+    }
+    const wrapper = mount(Config, { props: { api }, global: { components: { ...components, VSelect: Select } } })
+    await flushPromises()
+    await wrapper.findAll('button').find(item => item.text() === '一次性下载整个种子').trigger('click')
+    expect(wrapper.text()).toContain('确认整包下载')
+
+    await wrapper.findAll('button').find(item => item.text() === '重新扫描此剧集').trigger('click')
+    await flushPromises()
+    expect(applyCalls(api)).toHaveLength(1)
+    expect(applyCalls(api)[0][1]).toMatchObject({ operation: 'scan', scan_subscription: '2', candidate: '2:a' })
+    expect(wrapper.text()).toContain('扫描完成，本轮仍找到所选版本')
+    expect(wrapper.text()).not.toContain('确认整包下载')
+    expect(wrapper.find('select[aria-label="选择该剧集版本（全集优先）"]').element.value).toBe('2:a')
     wrapper.unmount()
   })
 

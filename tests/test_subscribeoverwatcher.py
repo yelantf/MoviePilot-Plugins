@@ -2288,7 +2288,7 @@ def test_pending_candidate_can_be_downloaded_once_as_full_torrent_without_rule_a
 
 
 def test_one_time_download_uses_cached_link_and_checks_selected_resource(plugin_host):
-    """清空站点结果不触发重搜，内存资源链接或媒体身份变化时拒绝提交。"""
+    """有效内存链接直接提交；链接缺失时重查，媒体身份或详情变化时拒绝。"""
     host = plugin_host
     host.subscriptions[1] = _subscribe(1)
     plugin = host.module.SubscribeOverwatcher()
@@ -2320,17 +2320,54 @@ def test_one_time_download_uses_cached_link_and_checks_selected_resource(plugin_
     assert host.downloads == []
     context.media_info.media_id = "123"
     context.torrent_info.enclosure = None
+    host.search_results.append(context)
     assert "下载链接" in plugin.download_candidate_once(choice)[1]
     assert host.downloads == []
+    host.search_results.clear()
     context.torrent_info.enclosure = "https://secret.example/torrent"
     candidate["page_url"] = None
     assert "详情链接" in plugin.download_candidate_once(choice)[1]
     assert host.downloads == []
-    assert len(host.search_calls) == searches_after_scan
+    assert len(host.search_calls) > searches_after_scan
+    assert all(call.get("sites") == [5] for call in host.search_calls[searches_after_scan:])
 
 
-def test_one_time_download_requires_rescan_after_restart_and_purges_credential_cache(plugin_host):
-    """下载凭据只留在内存；重启后不暗中搜索，旧凭据缓存直接删除。"""
+def test_historical_candidate_requeries_only_selected_site_before_whole_torrent_download(plugin_host):
+    """历史详情链接不能直接提交；下载时单站重查同一资源，未命中则拒绝。"""
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    host.directories.append(_directory("默认盘", "/downloads"))
+    context = _context("Show.S01.Complete.1080p", episodes=tuple(range(1, 9)),
+                       page_url="https://tracker.example/details.php?id=42")
+    context.media_info = SimpleNamespace(media_source="themoviedb", media_id="123", type="电视剧")
+    host.search_results.append(context)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    assert plugin.refresh_candidates() is True
+    candidate = plugin._state["entries"]["2"]["candidates"][0]
+    choice = f"2:{candidate['id']}"
+
+    host.search_results.clear()
+    success, message = plugin.scan_subscription("2", selected_candidate=choice)
+    assert success and "所选版本本轮未再次找到" in message
+    assert plugin._state["entries"]["2"]["candidates"][0]["page_url"] == candidate["page_url"]
+    searches_before_download = len(host.search_calls)
+    success, message = plugin.download_candidate_once(choice)
+    assert success is False
+    assert "历史详情链接" in message and "仍未找到同一候选" in message
+    assert len(host.search_calls) > searches_before_download
+    assert host.downloads == []
+
+    host.search_results.append(context)
+    assert plugin.download_candidate_once(choice)[0] is True
+    assert len(host.downloads) == 1
+    success, message = plugin.scan_subscription("2", selected_candidate=choice)
+    assert success and "所选版本本轮未再次找到" not in message
+
+
+def test_one_time_download_refreshes_selected_site_after_restart_without_persisting_credentials(plugin_host):
+    """重启后仅按所选站点和资源身份重查；持久缓存仍不得保存下载凭据。"""
     host = plugin_host
     host.subscriptions[1] = _subscribe(1)
     plugin = host.module.SubscribeOverwatcher()
@@ -2357,9 +2394,13 @@ def test_one_time_download_requires_rescan_after_restart_and_purges_credential_c
     assert "secret.example" not in json.dumps(host.storage)
     visible = json.dumps((restarted.get_form(), restarted.get_page()))
     assert "cookie-secret" not in visible and "passkey=private" not in visible
-    assert "下载链接" in restarted.download_candidate_once(choice)[1]
-    assert len(host.search_calls) == searches_after_scan
+    host.search_results.clear()
+    assert restarted.download_candidate_once(choice)[0] is False
     assert host.downloads == []
+    host.search_results.append(context)
+    assert restarted.download_candidate_once(choice)[0] is True
+    assert len(host.search_calls) > searches_after_scan
+    assert len(host.downloads) == 1
 
     # 如果磁盘上残留过渡版本写入的凭据缓存，启动时删除整个文件。
     cached = json.loads(cache_text)
@@ -2369,15 +2410,10 @@ def test_one_time_download_requires_rescan_after_restart_and_purges_credential_c
     legacy = host.module.SubscribeOverwatcher()
     legacy.init_plugin({"enabled": True})
     assert not cache_file.exists()
-    assert legacy.download_candidate_once(choice)[0] is False
-    assert len(host.search_calls) == searches_after_scan
-    assert legacy.scan_subscription("2")[0] is True
-    searches_after_rescan = len(host.search_calls)
     assert legacy.download_candidate_once(choice)[0] is True
-    assert len(host.search_calls) == searches_after_rescan
-    assert len(host.downloads) == 1
-    assert host.downloads[0][0].torrent_info.enclosure == context.torrent_info.enclosure
-    assert host.downloads[0][0].torrent_info.site_cookie == context.torrent_info.site_cookie
+    assert len(host.downloads) == 2
+    assert host.downloads[-1][0].torrent_info.enclosure == context.torrent_info.enclosure
+    assert host.downloads[-1][0].torrent_info.site_cookie == context.torrent_info.site_cookie
 
 
 def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):

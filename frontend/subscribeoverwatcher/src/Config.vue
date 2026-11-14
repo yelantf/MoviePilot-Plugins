@@ -84,7 +84,12 @@
         </v-card>
 
         <v-card ref="candidateCard" variant="outlined" class="mb-4">
-          <v-card-title class="text-subtitle-1">候选规则确认</v-card-title>
+          <v-card-title class="text-subtitle-1 d-flex align-center ga-2">
+            <span>候选规则确认</span>
+            <v-spacer />
+            <v-btn v-if="selectedCandidate" size="small" color="info" variant="tonal"
+              :loading="busy === 'scan'" :disabled="!!busy" @click="scanCurrentCandidate">重新扫描此剧集</v-btn>
+          </v-card-title>
           <v-card-text>
             <v-alert v-if="handoffNotice" type="info" variant="tonal" density="compact" class="mb-4">
               {{ handoffNotice }}
@@ -139,6 +144,12 @@
               variant="tonal" density="compact" class="mb-4">所选下载目录已不在当前配置中，请重新选择并预览。</v-alert>
             <v-alert v-if="selectedCandidate && !selectedCandidateUrl" type="info" variant="tonal"
               density="compact" class="mb-4">这条候选没有可核对的站点详情链接，不能一次性下载。</v-alert>
+            <v-alert v-if="busy === 'scan' && selectedCandidate" type="info" variant="tonal"
+              density="compact" class="mb-4" role="status" aria-live="polite">
+              正在重新扫描所选剧集，扫描完成后请重新核对候选并确认下载。
+            </v-alert>
+            <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
+              density="compact" class="mb-4">{{ feedback.text }}</v-alert>
             <v-alert v-if="directDownloadChoice === form.candidate && selectedCandidate" type="warning"
               variant="tonal" class="mb-4">
               <div class="font-weight-bold">即将一次性下载所选种子的全部文件</div>
@@ -146,7 +157,7 @@
               <div>站点：{{ selectedCandidateSite }} · 大小：{{ selectedCandidate.size_label || '未知' }}</div>
               <div>识别范围：{{ selectedCandidate.coverage || '请在站点详情中核对' }}。跨季合集也会下载所有季。</div>
               <div>下载目录：{{ selectedDownloadDirectory?.title || '订阅原目录或 MoviePilot 默认目录' }}</div>
-              <div>本次不会应用规则草稿，也不会立即批准订阅；订阅进度满后会保留原规则自动恢复。将使用扫描留在内存的种子链接；重启后如未重新扫描，请先扫描所选剧集。</div>
+              <div>本次不会应用规则草稿，也不会立即批准订阅；订阅进度满后会保留原规则自动恢复。优先使用内存中的种子下载链接；若链接已清理，确认时会只重查所选站点并核对同一资源。站点详情链接不能直接用于下载。</div>
               <a :href="selectedCandidateUrl" target="_blank" rel="noopener noreferrer"
                 class="text-primary text-decoration-underline">打开站点详情核对种子</a>
               <div class="d-flex flex-wrap ga-2 mt-3">
@@ -166,8 +177,6 @@
               确认后的候选和确认预览保留 24 小时，期满后定期清理。
               默认预览应用原订阅或系统默认规则组；结果不符合预期时可选择“不使用规则组”。
             </p>
-            <v-alert v-if="feedback.section === 'candidate'" :type="feedback.type" variant="tonal"
-              density="compact" class="mt-3">{{ feedback.text }}</v-alert>
             <v-alert v-if="busy === 'preview'" type="info" variant="tonal" density="compact"
               class="mt-3" role="status" aria-live="polite">{{ previewProgress }}</v-alert>
           </v-card-text>
@@ -394,6 +403,13 @@ function armCandidateDownload() {
   }
 }
 
+async function scanCurrentCandidate() {
+  if (busy.value || !selectedCandidate.value) return
+  form.scan_subscription = candidateSubscriptionId(selectedCandidate.value)
+  directDownloadChoice.value = ''
+  await submit('scan', false, 'candidate')
+}
+
 function selectCandidateSubscription(subscription) {
   form.candidate_subscription = subscription || ''
   form.candidate = ''
@@ -582,7 +598,7 @@ async function showSearchProgress(submitted) {
   }
 }
 
-async function submit(action, refreshSearch = false) {
+async function submit(action, refreshSearch = false, feedbackSection = '') {
   if (busy.value) return
   if (action === 'download_candidate' && directDownloadChoice.value !== form.candidate) return
   busy.value = action
@@ -614,7 +630,7 @@ async function submit(action, refreshSearch = false) {
       && options.candidate_subscription.some(item => String(item.value) === String(submitted.scan_subscription))) {
       form.candidate_subscription = String(submitted.scan_subscription)
     }
-    feedback.section = sections[action] || 'settings'
+    feedback.section = feedbackSection || sections[action] || 'settings'
     if (action !== 'save' && !response?.preview && !refreshFailed && result?.request_id !== requestId) {
       feedback.type = 'error'
       feedback.text = '操作已提交，但未能确认结果，请查看插件详情页'
@@ -628,7 +644,7 @@ async function submit(action, refreshSearch = false) {
       previewCard.value?.$el?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
     }
   } catch (error) {
-    feedback.section = sections[action] || 'settings'
+    feedback.section = feedbackSection || sections[action] || 'settings'
     feedback.type = 'error'
     feedback.text = error?.message || '操作失败，请稍后重试'
     try { await refreshForm() } catch { /* 保留当前输入供重试 */ }

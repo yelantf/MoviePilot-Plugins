@@ -510,7 +510,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.22"
+    plugin_version = "1.9.23"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -653,7 +653,9 @@ class SubscribeOverwatcher(_PluginBase):
             elif actions[0] == "adopt":
                 success, message = self.adopt_subscriptions(config.get("historical_subscription") or [])
             elif actions[0] == "scan":
-                success, message = self.scan_subscription(config.get("scan_subscription"))
+                success, message = self.scan_subscription(
+                    config.get("scan_subscription"), selected_candidate=config.get("candidate"),
+                )
             elif actions[0] == "preview":
                 try:
                     draft_json = _configured_draft_json(config)
@@ -1145,7 +1147,7 @@ class SubscribeOverwatcher(_PluginBase):
                 logger.warning(f"剧集守门员：订阅 {sid} 进度已满但自动批准失败：{message}")
         return approved
 
-    def scan_subscription(self, sid_value: Any) -> tuple[bool, str]:
+    def scan_subscription(self, sid_value: Any, *, selected_candidate: Any = None) -> tuple[bool, str]:
         """手动重新搜索指定的已纳入待确认剧集，不触发其他订阅或下载补搜。"""
         try:
             if isinstance(sid_value, bool):
@@ -1186,6 +1188,27 @@ class SubscribeOverwatcher(_PluginBase):
                 self._save_state()
                 count = entry.get("last_scan_count", 0)
                 message = f"订阅 #{sid} 扫描完成，本轮发现候选 {count} 条，累计保留 {len(entry.get('candidates') or [])} 条"
+                if isinstance(selected_candidate, str) and selected_candidate.startswith(f"{sid}:"):
+                    candidate_id = selected_candidate.split(":", 1)[1]
+                    selected = next((item for item in entry.get("candidates") or []
+                                     if item.get("id") == candidate_id), None)
+                    latest = self._preview_search_cache.get((_identity(subscribe), ())) or {}
+                    found_now = False
+                    if selected and selected.get("site_id") in (latest.get("covered_sites") or []):
+                        for context in latest.get("contexts") or []:
+                            try:
+                                item = resource_candidate(
+                                    context, subscribe.season or 1, entry["last_scan"], subscribe.total_episode,
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                continue
+                            if (item and item.get("id") == candidate_id
+                                    and item.get("site_id") == selected.get("site_id")
+                                    and public_page_url(item.get("page_url")) == public_page_url(selected.get("page_url"))):
+                                found_now = True
+                                break
+                    if not found_now:
+                        message += "；所选版本本轮未再次找到，列表中显示的是历史候选，请选择本轮找到的版本再下载"
                 failures = (entry.get("search_diagnostics") or {}).get("site_failures") or []
                 if failures:
                     message += "；结果可能不完整：" + "；".join(
@@ -2319,7 +2342,7 @@ class SubscribeOverwatcher(_PluginBase):
             return self._approve(sid, entry, payload, candidate_id)
 
     def download_candidate_once(self, choice: str, download_directory: str = "") -> tuple[bool, str]:
-        """使用本次扫描留在内存的种子链接整包提交，不改变订阅规则或批准状态。"""
+        """用实时种子链接整包提交；缺少链接时仅重查所选站点并核对同一资源。"""
         try:
             sid_text, candidate_id = choice.split(":", 1)
             sid = int(sid_text)
@@ -2347,21 +2370,39 @@ class SubscribeOverwatcher(_PluginBase):
             parts, _missing = self._cache_parts(subscribe, [site_id])
             selected_cache = parts[0]["entry"] if parts else None
             contexts = selected_cache["contexts"] if selected_cache else []
-        matches = []
-        for context in contexts:
+            target_scope = (subscribe.season, subscribe.total_episode, subscribe.start_episode)
+
+        def matching_contexts(results: list[Any]) -> list[Any]:
+            matches = []
+            for result in results:
+                try:
+                    item = preview_resource(result, subscribe.season or 1, subscribe.total_episode, _utc_now())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (item and item["id"] == candidate_id and item.get("site_id") == site_id
+                        and item.get("page_url") == page_url):
+                    matches.append(result)
+            return matches
+
+        matches = matching_contexts(contexts)
+        enclosure = getattr(getattr(matches[0], "torrent_info", None), "enclosure", None) if len(matches) == 1 else None
+        if len(matches) != 1 or not isinstance(enclosure, str) or not enclosure.strip():
+            # 持久候选和详情链接可跨重启保留；种子下载地址只允许从实时站点结果取得。
             try:
-                item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if (item and item["id"] == candidate_id and item.get("site_id") == site_id
-                    and item.get("page_url") == page_url):
-                matches.append(context)
-        if len(matches) != 1:
-            return False, "当前内存搜索结果没有唯一匹配的所选种子，请扫描所选剧集后再下载"
+                contexts = self._search_unfiltered(subscribe, sites=[site_id])
+            except Exception:
+                logger.exception(f"订阅 {sid} 所选候选的单站实时链接重查失败")
+                return False, "所选站点的实时下载链接重查失败，请稍后重试或手动扫描此剧集"
+            matches = matching_contexts(contexts)
+            if not matches:
+                return False, ("已重查所选站点，仍未找到同一候选；列表中保留的是历史详情链接，"
+                               "请点击“重新扫描此剧集”更新候选后再选择版本")
+            if len(matches) > 1:
+                return False, "所选站点重查后仍有多个匹配种子，无法安全确定下载目标"
+            enclosure = getattr(getattr(matches[0], "torrent_info", None), "enclosure", None)
+            if not isinstance(enclosure, str) or not enclosure.strip():
+                return False, "所选站点重查后仍未提供种子下载链接；详情链接不能直接交给下载器"
         context = matches[0]
-        enclosure = getattr(getattr(context, "torrent_info", None), "enclosure", None)
-        if not isinstance(enclosure, str) or not enclosure.strip():
-            return False, "当前内存搜索结果不含种子下载链接，请扫描所选剧集后再下载"
         media = getattr(context, "media_info", None)
         if media is None:
             return False, "资源缺少媒体信息，未提交下载"
@@ -2382,10 +2423,12 @@ class SubscribeOverwatcher(_PluginBase):
             if (not self._enabled or not current or current.type != MediaType.TV.value
                     or entry.get("status") != "pending" or entry.get("identity") != _identity(current)
                     or not selected or public_page_url(selected.get("page_url")) != page_url
+                    or (current.season, current.total_episode, current.start_episode) != target_scope
                     or (not download_directory and (getattr(current, "save_path", None) or None) != save_path)):
                 return False, "提交前订阅或候选已变化，未提交下载"
             latest_parts, _missing = self._cache_parts(current, [site_id])
-            if not latest_parts or latest_parts[0]["entry"] is not selected_cache:
+            latest_cache = latest_parts[0]["entry"] if latest_parts else None
+            if latest_cache is not selected_cache:
                 return False, "提交前所选站点的搜索结果已变化，请重新选择后下载"
             if download_directory:
                 try:
@@ -3073,7 +3116,7 @@ class SubscribeOverwatcher(_PluginBase):
             ),
             row(col(info(
                 "一次性下载会提交所选种子的全部文件，包括跨季合集的所有季；不应用规则草稿，"
-                "不批准或恢复订阅。使用扫描留在内存的种子链接；重启后如未重新扫描，请先扫描所选剧集。"
+                "不批准或恢复订阅。优先使用内存中的种子下载链接；缺少链接时只重查所选站点并核对同一资源。"
             ))),
             divider,
             row(
