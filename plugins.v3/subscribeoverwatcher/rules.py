@@ -399,15 +399,14 @@ def resource_candidate(
 
 
 def merge_candidates(
-    old: list[dict[str, Any]], fresh: list[dict[str, Any]], limit: int = 80,
+    old: list[dict[str, Any]], fresh: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     合并扫描记录，保留已消失版本的首次与最后发现时间。
 
     :param old: 先前保存的候选
     :param fresh: 本轮找到的候选
-    :param limit: 每条订阅最多保存的候选数
-    :return: 按最近发现时间排序的候选
+    :return: 按最近发现时间排序的全部候选
     """
     merged: dict[str, dict[str, Any]] = {}
     page_ids: dict[tuple[int, str], str] = {}
@@ -440,7 +439,7 @@ def merge_candidates(
         merged.values(),
         key=lambda item: (kind_order.get(item.get("kind"), 0), item.get("last_seen") or ""),
         reverse=True,
-    )[:limit]
+    )
 
 
 def is_complete_season_download(event_data: Any, subscribe: Any) -> bool:

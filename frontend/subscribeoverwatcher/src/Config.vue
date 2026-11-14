@@ -589,7 +589,7 @@ async function showSearchProgress(submitted) {
         : `当前站点范围没有可复用缓存，已触发搜索；缺失站点：${missing || '当前范围'}。正在等待站点响应和资源解析。`,
       partial_cache: `已有缓存：${reused}；缺失站点：${missing}。本次只搜索缺失站点，正在等待站点响应和资源解析。`,
       cached: '正在复用搜索缓存并按当前规则筛选，无需重新搜索站点。',
-      cached_empty: '当前站点范围的搜索缓存为空，本次将复用空结果；建议手动重新搜索。',
+      cached_empty: '当前站点范围的最新搜索结果为空，历史候选仍保留；建议手动重新搜索。',
     }
     previewProgress.value = status?.success && messages[status.status] ||
       '正在执行预览；缓存状态暂无法确认，若需要搜索，需等待站点响应和资源解析。'

@@ -155,7 +155,9 @@ class SearchCacheStore:
                        "covered_sites": entry.get("covered_sites"),
                        "site_sources": {site_id: {key: value for key, value in source.items() if key != "at"}
                                         for site_id, source in (entry.get("site_sources") or {}).items()},
-                       "contexts": [context_snapshot(context) for context in entry["contexts"]]}
+                       "contexts": [context_snapshot(context) for context in entry["contexts"]],
+                       "historical_contexts": [context_snapshot(context)
+                                               for context in entry.get("historical_contexts") or []]}
             data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
             if len(data) > self.max_bytes:
                 self.delete(key)
@@ -199,14 +201,16 @@ class SearchCacheStore:
                         or (sites and covered is not None and set(covered) != set(sites)) \
                         or type(oldest_stamp) not in (float, int) or not math.isfinite(oldest_stamp) \
                         or not isinstance(raw_sources, dict) \
-                        or not isinstance(values["contexts"], list) or type(values["sequence"]) is not int:
+                        or not isinstance(values["contexts"], list) \
+                        or not isinstance(values.get("historical_contexts", []), list) \
+                        or type(values["sequence"]) is not int:
                     raise ValueError("缓存格式或订阅身份已变化")
                 # 曾经写入下载上下文的缓存不能继续留在磁盘或恢复到内存。
                 allowed_torrent_fields = set(_TORRENT_FIELDS) | {"page_url"}
                 if any(not isinstance(context, dict) or
                        not isinstance(context.get("torrent_info"), dict) or
                        set(context["torrent_info"]) - allowed_torrent_fields
-                       for context in values["contexts"]):
+                       for context in [*values["contexts"], *values.get("historical_contexts", [])]):
                     raise ValueError("搜索缓存含下载上下文字段")
                 sources = {}
                 for raw_id, source in raw_sources.items():
@@ -234,6 +238,8 @@ class SearchCacheStore:
                     "covered_sites": values.get("covered_sites"),
                     "site_sources": sources,
                     "contexts": [restore_context(context) for context in values["contexts"]],
+                    "historical_contexts": [restore_context(context)
+                                            for context in values.get("historical_contexts", [])],
                 }
             except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError, RecursionError):
                 file.unlink(missing_ok=True)

@@ -157,6 +157,25 @@ def _distinct_contexts(contexts: list[Any]) -> list[Any]:
     return unique
 
 
+def _has_download_link(context: Any) -> bool:
+    enclosure = getattr(getattr(context, "torrent_info", None), "enclosure", None)
+    return isinstance(enclosure, str) and bool(enclosure.strip())
+
+
+def _merge_history_contexts(previous: Optional[dict[str, Any]], current: list[Any]) -> list[Any]:
+    """保留旧搜索资源；同一资源优先保留尚在内存中的真实下载地址。"""
+    historical: dict[tuple[Any, ...], Any] = {}
+    if previous:
+        for context in [*(previous.get("historical_contexts") or []), *(previous.get("contexts") or [])]:
+            key = _resource_key(context)
+            if key not in historical or _has_download_link(context) or not _has_download_link(historical[key]):
+                historical[key] = context
+    for context in current:
+        if _has_download_link(context):
+            historical.pop(_resource_key(context), None)
+    return list(historical.values())
+
+
 def _keyword_selection(choice: str) -> str:
     """搜索方式只有原订阅和本轮验证过的带季词；旧的 auto 视为原订阅。"""
     if choice in ("", "auto", "original"):
@@ -195,6 +214,13 @@ def _candidate_label(candidate: dict[str, Any]) -> str:
     if kind == "episode":
         return "分集"
     return "单集 E01"
+
+
+def _found_latest_scan(candidate: dict[str, Any], entry: dict[str, Any]) -> bool:
+    marker = candidate.get("found_latest_scan")
+    if isinstance(marker, bool):
+        return marker
+    return bool(entry.get("last_scan") and candidate.get("last_seen") == entry.get("last_scan"))
 
 
 def _candidate_coverage(candidate: dict[str, Any]) -> str:
@@ -485,6 +511,7 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
             "choice", "rule_mode", "download_directory", "draft_json", "searched_at", "searched_ts",
             "matched_count", "rejected_count", "search_cached", "search_age_seconds", "timings",
             "search_result_count", "search_trigger", "rule_groups_disabled",
+            "historical_candidates",
             "search_reused_sites", "search_searched_sites", "search_reused_site_labels",
             "search_searched_site_labels", "search_site_sources",
             "rule_groups_checked", "rule_groups_auto_disabled", "rule_group_notice", "rule_group_comparison",
@@ -510,7 +537,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.23"
+    plugin_version = "1.9.24"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1183,7 +1210,7 @@ class SubscribeOverwatcher(_PluginBase):
                     return False, entry["last_error"]
                 if not completed:
                     return False, "扫描未完成，请检查插件状态并刷新列表"
-                # 新扫描替换了完整搜索缓存，旧规则预览不能继续作为确认依据。
+                # 新扫描更新了本轮搜索结果，旧规则预览不能继续作为确认依据。
                 entry.pop("preview", None)
                 self._save_state()
                 count = entry.get("last_scan_count", 0)
@@ -1208,7 +1235,8 @@ class SubscribeOverwatcher(_PluginBase):
                                 found_now = True
                                 break
                     if not found_now:
-                        message += "；所选版本本轮未再次找到，列表中显示的是历史候选，请选择本轮找到的版本再下载"
+                        message += ("；所选版本本轮未再次找到，列表中显示的是历史候选；"
+                                    "确认下载时会先尝试内存中的真实链接，缺少链接才重查所选站点")
                 failures = (entry.get("search_diagnostics") or {}).get("site_failures") or []
                 if failures:
                     message += "；结果可能不完整：" + "；".join(
@@ -1470,6 +1498,9 @@ class SubscribeOverwatcher(_PluginBase):
                 entry = self._state["entries"].get(str(sid))
                 if entry and entry.get("status") == "pending" and entry.get("identity") == _identity(subscribe):
                     entry["candidates"] = merge_candidates(entry.get("candidates") or [], fresh)
+                    fresh_ids = {item["id"] for item in fresh}
+                    for candidate in entry["candidates"]:
+                        candidate["found_latest_scan"] = candidate["id"] in fresh_ids
                     entry["last_scan"] = now
                     entry["last_scan_count"] = len(fresh)
                     entry["search_diagnostics"] = _search_diagnostics_snapshot(diagnostics)
@@ -1660,10 +1691,11 @@ class SubscribeOverwatcher(_PluginBase):
         *, covered_sites: Optional[list[int]] = None, site_sources: Optional[dict[int, dict[str, Any]]] = None,
         oldest_at: Optional[float] = None,
     ) -> None:
-        """每个媒体和站点范围只保留一组结果，并记录实际覆盖的站点。"""
+        """每个媒体和站点范围保留本轮结果及去重的历史资源。"""
         with self._lock:
             key = (_identity(subscribe), tuple(sorted(set(sites))))
             coverage = sorted(set(covered_sites if covered_sites is not None else _search_site_scope(sites)[0]))
+            historical_contexts = _merge_history_contexts(self._preview_search_cache.get(key), contexts)
             if key not in self._preview_search_cache and len(self._preview_search_cache) >= MAX_CACHE_ENTRIES:
                 oldest = min(self._preview_search_cache, key=lambda item: self._preview_search_cache[item]["at"])
                 self._forget_search_cache(lambda item: item == oldest, reason="超过内存缓存组数上限")
@@ -1678,6 +1710,7 @@ class SubscribeOverwatcher(_PluginBase):
             oldest_stamp = min((item.get("searched_ts", stamp) for item in sources.values()), default=stamp)
             self._preview_search_cache[key] = {
                 "at": monotonic_stamp, "contexts": contexts, "source": source, "searched_at": searched_at,
+                "historical_contexts": historical_contexts,
                 "sequence": self._search_cache_sequence,
                 "searched_ts": stamp,
                 "oldest_searched_ts": oldest_stamp,
@@ -1726,7 +1759,7 @@ class SubscribeOverwatcher(_PluginBase):
             logger.info(f"已恢复 {len(restored)} 组持久搜索缓存，预览无需重新搜索对应站点范围")
 
     def _forget_search_cache(self, predicate: Any, *, extra_keys: tuple = (), reason: str = "主动清理") -> None:
-        """容量淘汰、批准、删除订阅和主动刷新同时移除内存与磁盘结果。"""
+        """容量淘汰、批准、停用和删除订阅时同步移除内存与磁盘结果。"""
         store = self._disk_search_cache()
         for key in set(self._preview_search_cache).union(extra_keys):
             if predicate(key):
@@ -1868,27 +1901,15 @@ class SubscribeOverwatcher(_PluginBase):
         logger.info(f"订阅 {subscribe.id} 预览缓存覆盖：复用 {_site_labels(reused, names) or '无'}；"
                     f"{'手动刷新' if refresh_search else '缺失'} {_site_labels(required if refresh_search else missing, names) or '默认范围'}；"
                     f"本轮只搜索 {_site_labels(required if refresh_search else missing, names) or '默认范围'}")
-        key = (_identity(subscribe), tuple(sorted(set(sites))))
         diagnostics: dict[str, Any] = {}
         try:
             fresh_contexts = self._search_unfiltered(subscribe, timings, sites=query_sites,
                                                      diagnostics=diagnostics)
         except Exception:
-            if refresh_search:
-                with self._lock:
-                    # 主动刷新失败后，旧的覆盖缓存不能伪装成本轮搜索结果。
-                    def affected(item: tuple) -> bool:
-                        if item[0] != key[0]:
-                            return False
-                        if not sites:
-                            return True
-                        entry = self._preview_search_cache.get(item) or {}
-                        covered = entry.get("covered_sites")
-                        old_scope = set(covered) if isinstance(covered, list) else set(item[1] or required)
-                        return bool(set(required) & old_scope)
-
-                    self._forget_search_cache(affected, extra_keys=(key,),
-                                              reason="主动重新搜索失败")
+            if refresh_search and self._enabled and not self._search_stop.is_set():
+                # 本轮没有可确认的实时结果，旧资源仍留作历史供用户选择。
+                self._remember_search(subscribe, [], sites, "主动重新搜索失败", _utc_now(),
+                                      covered_sites=required)
             raise
         searched_at = _utc_now()
         stamp = time.time()
@@ -2003,6 +2024,29 @@ class SubscribeOverwatcher(_PluginBase):
                 if resource_id and canonical_id:
                     id_aliases[resource_id] = canonical_id
         contexts = distinct
+        current_candidates = set()
+        for context in contexts:
+            try:
+                item = preview_resource(context, subscribe.season or 1, subscribe.total_episode, _utc_now())
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if item:
+                current_candidates.add((item["id"], item.get("site_id"), item.get("page_url")))
+        with self._lock:
+            saved_candidates = list((self._state["entries"].get(str(subscribe.id)) or {}).get("candidates") or [])
+        historical_candidates = [
+            {
+                "id": item["id"], "title": item.get("title") or "",
+                "site_name": item.get("site_name") or str(item.get("site_id") or "未知站点"),
+                "size_label": _size_label(item.get("size_bytes"), exact=True),
+                "last_seen": item.get("last_seen") or "",
+                "page_url": public_page_url(item.get("page_url")),
+            }
+            for item in saved_candidates
+            if (not actual_search_sites or item.get("site_id") in actual_search_sites)
+            and (item.get("id"), item.get("site_id"), public_page_url(item.get("page_url")))
+            not in current_candidates
+        ]
         resource_keywords = {}
         for resource_id, words in ((diagnostics or {}).get("resource_keywords") or {}).items():
             target_id = id_aliases.get(resource_id, resource_id)
@@ -2166,6 +2210,7 @@ class SubscribeOverwatcher(_PluginBase):
             "searched_at": now, "searched_ts": datetime.now(timezone.utc).timestamp(),
             "search_cached": cached, "search_age_seconds": round(cache_age, 1),
             "search_result_count": len(contexts),
+            "historical_candidates": historical_candidates,
             "search_trigger": "cache" if cached else "manual" if refresh_search else
                               "partial_cache" if cache_coverage["reused_sites"] else "cache_miss",
             "search_reused_sites": cache_coverage["reused_sites"],
@@ -2369,11 +2414,25 @@ class SubscribeOverwatcher(_PluginBase):
                 return False, str(error)
             parts, _missing = self._cache_parts(subscribe, [site_id])
             selected_cache = parts[0]["entry"] if parts else None
-            contexts = selected_cache["contexts"] if selected_cache else []
+            identity = _identity(subscribe)
+            relevant_caches = sorted(
+                ((key, cached) for key, cached in self._preview_search_cache.items()
+                 if key[0] == identity and (
+                     site_id in (cached.get("covered_sites") if isinstance(cached.get("covered_sites"), list)
+                                 else key[1])
+                     or any(getattr(getattr(context, "torrent_info", None), "site", None) == site_id
+                            for context in cached.get("historical_contexts") or [])
+                 )),
+                key=lambda pair: (pair[1]["searched_ts"], pair[1]["at"], pair[1]["sequence"]),
+                reverse=True,
+            )
+            contexts = [context for _key, cached in relevant_caches
+                        for context in [*(cached.get("contexts") or []),
+                                        *(cached.get("historical_contexts") or [])]]
             target_scope = (subscribe.season, subscribe.total_episode, subscribe.start_episode)
 
         def matching_contexts(results: list[Any]) -> list[Any]:
-            matches = []
+            matches: dict[tuple[Any, ...], Any] = {}
             for result in results:
                 try:
                     item = preview_resource(result, subscribe.season or 1, subscribe.total_episode, _utc_now())
@@ -2381,12 +2440,13 @@ class SubscribeOverwatcher(_PluginBase):
                     continue
                 if (item and item["id"] == candidate_id and item.get("site_id") == site_id
                         and item.get("page_url") == page_url):
-                    matches.append(result)
-            return matches
+                    key = _resource_key(result)
+                    if key not in matches or (_has_download_link(result) and not _has_download_link(matches[key])):
+                        matches[key] = result
+            return list(matches.values())
 
         matches = matching_contexts(contexts)
-        enclosure = getattr(getattr(matches[0], "torrent_info", None), "enclosure", None) if len(matches) == 1 else None
-        if len(matches) != 1 or not isinstance(enclosure, str) or not enclosure.strip():
+        if len(matches) != 1 or not _has_download_link(matches[0]):
             # 持久候选和详情链接可跨重启保留；种子下载地址只允许从实时站点结果取得。
             try:
                 contexts = self._search_unfiltered(subscribe, sites=[site_id])
@@ -2399,8 +2459,7 @@ class SubscribeOverwatcher(_PluginBase):
                                "请点击“重新扫描此剧集”更新候选后再选择版本")
             if len(matches) > 1:
                 return False, "所选站点重查后仍有多个匹配种子，无法安全确定下载目标"
-            enclosure = getattr(getattr(matches[0], "torrent_info", None), "enclosure", None)
-            if not isinstance(enclosure, str) or not enclosure.strip():
+            if not _has_download_link(matches[0]):
                 return False, "所选站点重查后仍未提供种子下载链接；详情链接不能直接交给下载器"
         context = matches[0]
         media = getattr(context, "media_info", None)
@@ -2420,7 +2479,7 @@ class SubscribeOverwatcher(_PluginBase):
             entry = self._state["entries"].get(str(sid)) or {}
             selected = next((item for item in entry.get("candidates") or []
                              if item.get("id") == candidate_id), None)
-            if (not self._enabled or not current or current.type != MediaType.TV.value
+            if (not self._enabled or self._search_stop.is_set() or not current or current.type != MediaType.TV.value
                     or entry.get("status") != "pending" or entry.get("identity") != _identity(current)
                     or not selected or public_page_url(selected.get("page_url")) != page_url
                     or (current.season, current.total_episode, current.start_episode) != target_scope
@@ -2428,7 +2487,9 @@ class SubscribeOverwatcher(_PluginBase):
                 return False, "提交前订阅或候选已变化，未提交下载"
             latest_parts, _missing = self._cache_parts(current, [site_id])
             latest_cache = latest_parts[0]["entry"] if latest_parts else None
-            if latest_cache is not selected_cache:
+            if latest_cache is not selected_cache or any(
+                self._preview_search_cache.get(key) is not cached for key, cached in relevant_caches
+            ):
                 return False, "提交前所选站点的搜索结果已变化，请重新选择后下载"
             if download_directory:
                 try:
@@ -2964,6 +3025,7 @@ class SubscribeOverwatcher(_PluginBase):
             choices = [
                 {
                     "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
+                             f"{'本轮发现' if _found_latest_scan(item, entry) else '历史保留'} · "
                              f"{_candidate_label(item)} {_candidate_coverage(item)} · "
                              f"{item.get('site_name') or item.get('site_id') or '未知站点'} · "
                              f"{_size_label(item.get('size_bytes'), exact=True)} · "
@@ -2976,6 +3038,7 @@ class SubscribeOverwatcher(_PluginBase):
                     "coverage": _candidate_coverage(item),
                     "size_label": _size_label(item.get("size_bytes"), exact=True),
                     "resource_title": item.get("title") or "",
+                    "found_latest_scan": _found_latest_scan(item, entry),
                     "rule_names": candidate_rule_names(item),
                     "rule_patterns": item.get("rules") or {},
                     "rules": display_draft_rules(item, {
@@ -3246,7 +3309,12 @@ class SubscribeOverwatcher(_PluginBase):
                     {"component": "td", "text": item.get("resolution") or "?"},
                     {"component": "td", "text": item.get("effect") or "?"},
                     {"component": "td", "text": item.get("team") or "?"},
-                    {"component": "td", "text": max((member.get("last_seen") or "" for member in group), default="")},
+                    {"component": "td", "text": (
+                        max((member.get("last_seen") or "" for member in group), default="") + " · "
+                        + ("本轮发现" if all(_found_latest_scan(member, entry) for member in group)
+                           else "历史保留" if all(not _found_latest_scan(member, entry) for member in group)
+                           else "本轮及历史")
+                    )},
                     _candidate_action_cell(sid, group),
                 ]}
                 for group in groups
@@ -3255,7 +3323,7 @@ class SubscribeOverwatcher(_PluginBase):
             page.append({"component": "VTable", "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现", "操作")
+                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现/扫描状态", "操作")
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})

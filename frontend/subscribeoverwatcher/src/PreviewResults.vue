@@ -31,7 +31,7 @@
     </v-alert>
     <v-alert v-else-if="preview.search_cached && preview.search_result_count === 0" type="warning"
       variant="tonal" density="compact" class="mb-3">
-      当前站点范围的搜索缓存中没有资源；本次复用了空结果，建议手动重新搜索以获取最新资源。
+      当前站点范围的最新搜索结果为空；历史候选另行保留。建议手动重新搜索以获取最新资源。
       <v-btn variant="text" size="small" :disabled="disabled" @click="emit('refresh-search')">{{ refreshLabel }}</v-btn>
     </v-alert>
     <v-alert v-else-if="preview.search_result_count === 0" type="info"
@@ -58,6 +58,15 @@
       {{ preview.search_sites?.length ? `覆盖站点：${preview.search_sites.join('、')}` : '当前默认站点范围' }}。
       已缓存站点可能来自不同搜索轮次；历史候选仍保留展示，资源是否仍存在以重新搜索为准。
     </p>
+    <details v-if="preview.historical_candidates?.length" class="mb-3">
+      <summary>历史保留候选 {{ preview.historical_candidates.length }} 条（不计入本轮通过与排除统计）</summary>
+      <ul class="ms-5 mt-2">
+        <li v-for="item in preview.historical_candidates" :key="`${item.id}:${item.page_url || ''}`">
+          {{ item.site_name }} · {{ item.title }} · {{ item.size_label }} · 最后发现 {{ item.last_seen || '未知' }}
+          <a v-if="item.page_url" :href="item.page_url" target="_blank" rel="noopener noreferrer">站点详情</a>
+        </li>
+      </ul>
+    </details>
     <p v-if="preview.timings" class="text-body-2 mb-3">
       总耗时 {{ seconds(preview.timings.total_seconds) }} 秒：媒体识别 {{ seconds(preview.timings.recognition_seconds) }} 秒，
       站点搜索与资源解析 {{ seconds(preview.timings.search_seconds) }} 秒，

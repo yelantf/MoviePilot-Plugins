@@ -935,6 +935,10 @@ def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host
     assert merged[0]["last_seen"] == "2026-11-02T02:00:00+00:00"
     assert merged[0]["page_url"] == first["page_url"]
     assert rules.merge_candidates(merged, []) == merged
+    many = [{**first, "id": f"candidate-{number}", "title": f"Show.S01E01.{number}",
+             "page_url": f"https://tracker.example/details.php?id={number}"}
+            for number in range(101)]
+    assert len(rules.merge_candidates([], many)) == 101
 
 
 def test_subtitle_first_episode_bundle_is_scanned_and_previewed_without_full_season_bypass(plugin_host):
@@ -2306,7 +2310,8 @@ def test_one_time_download_uses_cached_link_and_checks_selected_resource(plugin_
     searches_after_scan = len(host.search_calls)
 
     host.search_results.clear()
-    assert plugin.download_candidate_once(choice)[0] is True
+    success, message = plugin.download_candidate_once(choice)
+    assert success is True, message
     assert len(host.search_calls) == searches_after_scan
     assert host.downloads[0][0].torrent_info.enclosure == context.torrent_info.enclosure
     host.downloads.clear()
@@ -2332,8 +2337,8 @@ def test_one_time_download_uses_cached_link_and_checks_selected_resource(plugin_
     assert all(call.get("sites") == [5] for call in host.search_calls[searches_after_scan:])
 
 
-def test_historical_candidate_requeries_only_selected_site_before_whole_torrent_download(plugin_host):
-    """历史详情链接不能直接提交；下载时单站重查同一资源，未命中则拒绝。"""
+def test_historical_candidate_keeps_memory_link_after_empty_scan(plugin_host):
+    """旧种子不在本轮结果里时，仍可使用内存历史资源的真实下载地址。"""
     host = plugin_host
     plugin = host.module.SubscribeOverwatcher()
     plugin.init_plugin({"enabled": True})
@@ -2352,18 +2357,99 @@ def test_historical_candidate_requeries_only_selected_site_before_whole_torrent_
     success, message = plugin.scan_subscription("2", selected_candidate=choice)
     assert success and "所选版本本轮未再次找到" in message
     assert plugin._state["entries"]["2"]["candidates"][0]["page_url"] == candidate["page_url"]
+    assert "历史保留" in _form_items(plugin, "candidate")[0]["title"]
+    assert "历史保留" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    cached = next(iter(plugin._preview_search_cache.values()))
+    assert cached["contexts"] == [] and cached["historical_contexts"] == [context]
     searches_before_download = len(host.search_calls)
     success, message = plugin.download_candidate_once(choice)
-    assert success is False
-    assert "历史详情链接" in message and "仍未找到同一候选" in message
-    assert len(host.search_calls) > searches_before_download
-    assert host.downloads == []
+    assert success is True
+    assert len(host.search_calls) == searches_before_download
+    assert host.downloads[0][0] is context
+
+    host.system_values["IndexerSites"] = [7]
+    assert plugin.scan_subscription("2")[0] is True
+    assert next(iter(plugin._preview_search_cache.values()))["covered_sites"] == [7]
+    searches_before_download = len(host.search_calls)
+    assert plugin.download_candidate_once(choice)[0] is True
+    assert len(host.search_calls) == searches_before_download
+    host.system_values["IndexerSites"] = []
 
     host.search_results.append(context)
-    assert plugin.download_candidate_once(choice)[0] is True
-    assert len(host.downloads) == 1
     success, message = plugin.scan_subscription("2", selected_candidate=choice)
     assert success and "所选版本本轮未再次找到" not in message
+    assert next(iter(plugin._preview_search_cache.values()))["historical_contexts"] == []
+    current_without_link = copy.deepcopy(context)
+    current_without_link.torrent_info.enclosure = None
+    host.search_results[:] = [current_without_link]
+    assert plugin.scan_subscription("2")[0] is True
+    cached = next(iter(plugin._preview_search_cache.values()))
+    assert cached["contexts"] == [current_without_link]
+    assert cached["historical_contexts"] == [context]
+    searches_before_download = len(host.search_calls)
+    assert plugin.download_candidate_once(choice)[0] is True
+    assert len(host.search_calls) == searches_before_download
+    assert host.downloads[-1][0] is context
+
+
+def test_historical_search_cache_restores_without_credentials_and_previews_separately(plugin_host):
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.directories.append(_directory("默认盘", "/downloads"))
+    context = _context("Show.S01.Complete.1080p", episodes=tuple(range(1, 9)),
+                       page_url="https://tracker.example/details.php?id=42")
+    context.media_info = SimpleNamespace(media_source="themoviedb", media_id="123", type="电视剧")
+    context.torrent_info.enclosure = "https://secret.example/torrent?passkey=private"
+    host.search_results.append(context)
+    assert plugin.refresh_candidates() is True
+    candidate = plugin._state["entries"]["2"]["candidates"][0]
+    choice = f"2:{candidate['id']}"
+    host.search_results.clear()
+    assert plugin.scan_subscription("2")[0] is True
+    cache_file = next((plugin.get_data_path() / "search-cache").glob("*.json"))
+    saved = json.loads(cache_file.read_text())
+    assert saved["contexts"] == [] and len(saved["historical_contexts"]) == 1
+    assert "enclosure" not in json.dumps(saved) and "passkey=private" not in json.dumps(saved)
+
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    assert restarted.preview_candidate(choice)[0] is True
+    preview = restarted._state["entries"]["2"]["preview"]
+    assert preview["matched_count"] == preview["rejected_count"] == 0
+    assert preview["historical_candidates"][0]["id"] == candidate["id"]
+    searches_before_download = len(host.search_calls)
+    assert restarted.download_candidate_once(choice)[0] is False
+    assert len(host.search_calls) > searches_before_download
+    assert host.downloads == []
+    host.search_results.append(context)
+    assert restarted.download_candidate_once(choice)[0] is True
+    assert host.downloads[-1][0].torrent_info.enclosure == context.torrent_info.enclosure
+    saved["historical_contexts"][0]["torrent_info"]["enclosure"] = context.torrent_info.enclosure
+    cache_file.write_text(json.dumps(saved))
+    legacy = host.module.SubscribeOverwatcher()
+    legacy.init_plugin({"enabled": True})
+    assert not cache_file.exists()
+
+
+def test_historical_download_link_survives_newer_empty_single_site_cache(plugin_host):
+    host = plugin_host
+    plugin, choice, context = _prepare_directory_confirmation(host)
+    page_url = "https://tracker.example/details.php?id=42"
+    context.torrent_info.page_url = page_url
+    context.media_info = SimpleNamespace(media_source="themoviedb", media_id="123", type="电视剧")
+    plugin._state["entries"]["2"]["candidates"][0]["page_url"] = page_url
+    host.directories.append(_directory("默认盘", "/downloads"))
+    plugin._remember_search(host.subscriptions[2], [], [5], "规则预览搜索", "空搜索")
+    assert plugin._cache_parts(host.subscriptions[2], [5])[0][0]["entry"]["contexts"] == []
+    searches_before_download = len(host.search_calls)
+    success, message = plugin.download_candidate_once(choice, download_directory="/downloads")
+    assert success is True, message
+    assert len(host.search_calls) == searches_before_download
+    assert host.downloads[-1][0] is context
 
 
 def test_one_time_download_refreshes_selected_site_after_restart_without_persisting_credentials(plugin_host):
@@ -4896,7 +4982,7 @@ def test_cache_entry_and_disk_byte_limits_remove_oldest_results_from_memory_and_
     assert any("超过" in message and "总容量" in message for _level, message in host.logs)
 
 
-def test_failed_manual_refresh_does_not_restore_old_covering_cache_after_restart(plugin_host, monkeypatch):
+def test_failed_manual_refresh_keeps_old_resource_only_as_history_after_restart(plugin_host, monkeypatch):
     host = plugin_host
     plugin, choice, _chosen = _prepare_directory_confirmation(host)
 
@@ -4905,11 +4991,16 @@ def test_failed_manual_refresh_does_not_restore_old_covering_cache_after_restart
 
     monkeypatch.setattr(plugin, "_search_unfiltered", fail)
     assert plugin.preview_candidate(choice, refresh_search=True)[0] is False
-    assert plugin._preview_search_cache == {}
-    assert list(plugin.get_data_path().joinpath("search-cache").glob("*.json")) == []
+    selected = plugin._cache_parts(host.subscriptions[2], [5])[0][0]["entry"]
+    assert selected["contexts"] == []
+    assert any(entry["contexts"] for entry in plugin._preview_search_cache.values())
+    cache_files = list(plugin.get_data_path().joinpath("search-cache").glob("*.json"))
+    assert all("enclosure" not in file.read_text() for file in cache_files)
     restarted = host.module.SubscribeOverwatcher()
     restarted.init_plugin({"enabled": True})
-    assert restarted.preview_search_status({"operation": "preview", "candidate": choice})["status"] == "cache_miss"
+    assert restarted.preview_search_status({"operation": "preview", "candidate": choice})["status"] == "cached_empty"
+    assert restarted.preview_candidate(choice)[0] is True
+    assert restarted._state["entries"]["2"]["preview"]["historical_candidates"]
 
 
 def test_disk_write_failure_keeps_new_memory_result_without_restoring_old_disk_result(plugin_host, monkeypatch):

@@ -332,6 +332,18 @@ describe('custom configuration actions', () => {
     wrapper.unmount()
   })
 
+  it('shows retained historical candidates outside current preview counts', () => {
+    const preview = { ...previewSnapshot(''), matched_count: 0, rejected_count: 0,
+      historical_candidates: [{ id: 'old', title: '旧整季种子', site_name: '样例站', size_label: '2 GiB',
+        last_seen: '2026-11-01', page_url: 'https://tracker.example/details.php?id=42' }] }
+    const wrapper = mount(PreviewResults, { props: { preview }, global: { components } })
+    expect(wrapper.text()).toContain('通过 0 条，排除 0 条')
+    expect(wrapper.text()).toContain('历史保留候选 1 条（不计入本轮通过与排除统计）')
+    expect(wrapper.text()).toContain('旧整季种子')
+    expect(wrapper.find('a[href="https://tracker.example/details.php?id=42"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
   it('views and refreshes the data page and returns to the same unsaved settings', async () => {
     const data = candidateSnapshot()
     let resourceTitle = '历史预览资源'
@@ -730,12 +742,12 @@ describe('custom configuration actions', () => {
     await flushPromises()
     await wrapper.findAll('button').find(button => button.text() === label).trigger('click')
     await flushPromises()
-    expect(wrapper.find('[role="status"]').text()).toContain('搜索缓存为空')
+    expect(wrapper.find('[role="status"]').text()).toContain('最新搜索结果为空')
     const emptyPreview = { ...previewSnapshot(data.model.rule_json), search_result_count: 0,
       matched_count: 0, rejected_count: 0, matched_shown: 0, rejected_shown: 0, table: null }
     finishSearch({ success: true, message: '预览完成', preview: emptyPreview })
     await flushPromises()
-    expect(wrapper.find('.preview-results').text()).toContain('搜索缓存中没有资源')
+    expect(wrapper.find('.preview-results').text()).toContain('最新搜索结果为空')
     expect(wrapper.find('.preview-results').text()).toContain('建议手动重新搜索')
     expect(wrapper.find('.preview-results button').text()).toBe(refreshLabel)
     await wrapper.find('.preview-results button').trigger('click')
@@ -746,7 +758,7 @@ describe('custom configuration actions', () => {
     const filteredPreview = { ...emptyPreview, search_result_count: 1, rejected_count: 1, rejected_shown: 1 }
     finishSearch({ success: true, message: '预览完成', preview: filteredPreview })
     await flushPromises()
-    expect(wrapper.find('.preview-results').text()).not.toContain('搜索缓存中没有资源')
+    expect(wrapper.find('.preview-results').text()).not.toContain('最新搜索结果为空')
     expect(wrapper.find('.preview-results button').exists()).toBe(false)
     wrapper.unmount()
   })
