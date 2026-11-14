@@ -470,12 +470,19 @@ def _candidate_row_sort(items: list[dict[str, Any]]) -> dict[str, Any]:
                and not isinstance(value, bool) and value >= 0]
     size = item.get("size_bytes")
     return {
+        "kind": _candidate_label(item),
+        "coverage": _candidate_coverage(item),
         "last_seen": max((member.get("last_seen") or "" for member in items), default=""),
         "seeders": max(seeders) if seeders else None,
         "size_bytes": size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None,
         "title": item.get("title") or "",
         "site": "、".join(sorted(str(member.get("site_name") or member.get("site_id") or "")
                                for member in items)),
+        "promotion": "、".join(sorted(str(member.get("promotion") or "") for member in items)),
+        "quality": item.get("quality") or "",
+        "resolution": item.get("resolution") or "",
+        "effect": item.get("effect") or "",
+        "team": item.get("team") or "",
     }
 
 
@@ -558,7 +565,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.27"
+    plugin_version = "1.9.28"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -3339,11 +3346,18 @@ class SubscribeOverwatcher(_PluginBase):
                 for group in groups
                 for item in group[:1]
             ]
+            sortable_headers = (
+                ("类型", "kind"), ("识别集号/目标总集数", "coverage"), ("站点/详情", "site"),
+                ("资源", "title"), ("大小", "size_bytes"), ("做种人数", "seeders"),
+                ("免费/促销", "promotion"), ("质量", "quality"), ("分辨率", "resolution"),
+                ("特效", "effect"), ("制作组", "team"), ("最后发现/扫描状态", "last_seen"),
+                ("操作", None),
+            )
             section_nodes.append({"component": "VTable", "_candidate_table": True,
                                   "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
-                    {"component": "th", "text": title}
-                    for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现/扫描状态", "操作")
+                    {"component": "th", "text": title, **({"_sort_field": field} if field else {})}
+                    for title, field in sortable_headers
                 ]}]},
                 {"component": "tbody", "content": rows},
             ]})

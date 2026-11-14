@@ -23,20 +23,10 @@
           <span v-if="block.meta.warning" class="text-caption text-warning">扫描有异常</span>
         </button>
         <div v-if="isExpanded(block.key)" class="section-body">
-          <div v-if="block.kind === 'subscription' && hasSortableRows(block)" class="sort-toolbar">
-            <label :for="'sort-' + block.meta.id">排序字段</label>
-            <select :id="'sort-' + block.meta.id" :aria-label="block.meta.title + ' 排序字段'"
-              class="sort-select" :value="sortField(block.meta.id)"
-              @change="setSortField(block.meta.id, $event.target.value)">
-              <option v-for="field in SORT_FIELDS" :key="field.value" :value="field.value">{{ field.title }}</option>
-            </select>
-            <button v-if="sortField(block.meta.id) !== 'original'" type="button" class="sort-direction"
-              :aria-label="block.meta.title + ' 排序方向'" @click="toggleSortDirection(block.meta.id)">
-              {{ sortDescending(block.meta.id) ? '降序' : '升序' }}
-            </button>
-          </div>
           <div v-for="(node, index) in block.nodes" :key="index" class="mb-3 overflow-x-auto">
-            <schema-node :node="sortedNode(node, block.meta.id)" :on-select-candidate="selectCandidate" />
+            <schema-node :node="sortedNode(node, block.meta.id)" :on-select-candidate="selectCandidate"
+              :on-sort-header="node._candidate_table ? field => clickSortHeader(block.meta.id, field) : undefined"
+              :sort-field="sortField(block.meta.id)" :sort-descending="sortDescending(block.meta.id)" />
           </div>
         </div>
       </div>
@@ -50,14 +40,6 @@ import { CANDIDATE_SELECTION_EVENT, queueCandidateSelection } from './candidateS
 import SchemaNode from './schemaNode'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
-const SORT_FIELDS = [
-  { value: 'original', title: '原顺序（全集优先）' },
-  { value: 'last_seen', title: '最后发现时间' },
-  { value: 'seeders', title: '做种人数' },
-  { value: 'size_bytes', title: '资源大小' },
-  { value: 'title', title: '资源名称' },
-  { value: 'site', title: '站点' },
-]
 const props = defineProps({
   api: { type: [Object, Function], required: true },
   embedded: { type: Boolean, default: false },
@@ -97,11 +79,6 @@ function toggleSection(key) {
   expanded.value = next
 }
 
-function hasSortableRows(block) {
-  return block.nodes.some(node => node._candidate_table &&
-    node.content?.some(part => part.component === 'tbody' && part.content?.length > 1))
-}
-
 function sortField(id) {
   return sortSettings.value[id]?.field || 'original'
 }
@@ -110,14 +87,14 @@ function sortDescending(id) {
   return sortSettings.value[id]?.descending ?? true
 }
 
-function setSortField(id, field) {
-  sortSettings.value = { ...sortSettings.value,
-    [id]: { field, descending: field !== 'title' && field !== 'site' } }
-}
-
-function toggleSortDirection(id) {
-  sortSettings.value = { ...sortSettings.value,
-    [id]: { field: sortField(id), descending: !sortDescending(id) } }
+function clickSortHeader(id, field) {
+  const current = sortSettings.value[id]
+  const defaultDescending = ['last_seen', 'seeders', 'size_bytes'].includes(field)
+  const updated = { ...sortSettings.value }
+  if (current?.field !== field) updated[id] = { field, descending: defaultDescending }
+  else if (current.descending === defaultDescending) updated[id] = { field, descending: !defaultDescending }
+  else delete updated[id]
+  sortSettings.value = updated
 }
 
 function sortValue(row, field) {
@@ -217,23 +194,36 @@ onMounted(refreshPage)
   border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 
-.sort-toolbar {
-  display: flex;
+:deep(.candidate-sort-header) {
+  display: inline-flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.sort-select, .sort-direction {
-  padding: 5px 8px;
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-radius: 6px;
+  gap: 4px;
+  padding: 2px 0;
+  border: 0;
   background: transparent;
   color: inherit;
+  font: inherit;
+  font-weight: inherit;
+  white-space: nowrap;
+  cursor: pointer;
 }
 
-.sort-direction {
-  cursor: pointer;
+:deep(.candidate-sort-header:focus-visible) {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: 2px;
+}
+
+:deep(.candidate-sort-indicator) {
+  opacity: 0;
+}
+
+:deep(.candidate-sort-header:hover .candidate-sort-indicator),
+:deep(.candidate-sort-header:focus-visible .candidate-sort-indicator) {
+  opacity: 0.45;
+}
+
+:deep(.candidate-sort-active .candidate-sort-indicator) {
+  color: rgb(var(--v-theme-primary));
+  opacity: 1;
 }
 </style>

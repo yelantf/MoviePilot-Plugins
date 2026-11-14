@@ -2647,6 +2647,10 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     assert other_row["content"][6]["content"][0]["text"] == "未知"
     assert candidate_table["_candidate_table"] is True
     assert candidate_table["_subscription"]["id"] == "2"
+    headers = candidate_table["content"][0]["content"][0]["content"]
+    assert {header["_sort_field"] for header in headers if header.get("_sort_field")} \
+        == set(grouped_row["_sort"])
+    assert headers[-1]["text"] == "操作" and "_sort_field" not in headers[-1]
     assert grouped_row["_sort"]["seeders"] == 19
     assert grouped_row["_sort"]["size_bytes"] == 1024 ** 3
     assert grouped_row["_sort"]["site"] == "另一个站、样例站"

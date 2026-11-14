@@ -22,10 +22,15 @@ function section(id, rows) {
   return [
     { component: 'VAlert', _subscription: meta, props: { text: '最近扫描完成' } },
     { component: 'VTable', _subscription: meta, _candidate_table: true, content: [
-      { component: 'thead', content: [{ component: 'tr', content: [{ component: 'th', text: '资源' }] }] },
+      { component: 'thead', content: [{ component: 'tr', content: [
+        { component: 'th', text: '资源', _sort_field: 'title' },
+        { component: 'th', text: '做种人数', _sort_field: 'seeders' },
+        { component: 'th', text: '最后发现', _sort_field: 'last_seen' },
+      ] }] },
       { component: 'tbody', content: rows.map(({ title, seeders, size, seen, site }) => ({
         component: 'tr', _sort: { title, seeders, size_bytes: size, last_seen: seen, site },
-        content: [{ component: 'td', text: title }],
+        content: [{ component: 'td', text: title }, { component: 'td', text: String(seeders ?? '?') },
+          { component: 'td', text: seen }],
       })) },
     ] },
   ]
@@ -63,14 +68,20 @@ describe('data page subscription sections', () => {
     expect(titles(wrapper, '2')).toEqual([])
     await wrapper.find('[data-subscription-id="2"] .section-control').trigger('click')
     expect(titles(wrapper, '2')).toEqual(['Alpha', 'Beta', 'Unknown'])
-    await wrapper.find('[data-subscription-id="2"] select').setValue('seeders')
+    expect(wrapper.find('[data-subscription-id="2"] select').exists()).toBe(false)
+    await wrapper.find('[data-subscription-id="2"] [data-sort-field="seeders"]').trigger('click')
     expect(titles(wrapper, '2')).toEqual(['Beta', 'Alpha', 'Unknown'])
-    await wrapper.find('[data-subscription-id="2"] .sort-direction').trigger('click')
+    expect(wrapper.find('[data-subscription-id="2"] th[aria-sort="descending"]').text()).toContain('做种人数')
+    await wrapper.find('[data-subscription-id="2"] [data-sort-field="seeders"]').trigger('click')
     expect(titles(wrapper, '2')).toEqual(['Alpha', 'Beta', 'Unknown'])
+    expect(wrapper.find('[data-subscription-id="2"] th[aria-sort="ascending"]').text()).toContain('做种人数')
+    await wrapper.find('[data-subscription-id="2"] [data-sort-field="seeders"]').trigger('click')
+    expect(titles(wrapper, '2')).toEqual(['Alpha', 'Beta', 'Unknown'])
+    expect(wrapper.findAll('[data-subscription-id="2"] th[aria-sort="none"]')).toHaveLength(3)
 
     await wrapper.find('[data-subscription-id="3"] .section-control').trigger('click')
     expect(titles(wrapper, '3')).toEqual(['Other A', 'Other B'])
-    await wrapper.find('[data-subscription-id="2"] select').setValue('last_seen')
+    await wrapper.find('[data-subscription-id="2"] [data-sort-field="last_seen"]').trigger('click')
     expect(titles(wrapper, '2')).toEqual(['Beta', 'Alpha', 'Unknown'])
     expect(titles(wrapper, '3')).toEqual(['Other A', 'Other B'])
 
