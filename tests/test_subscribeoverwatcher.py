@@ -941,6 +941,51 @@ def test_first_episode_candidates_keep_history_without_torrent_links(plugin_host
     assert len(rules.merge_candidates([], many)) == 101
 
 
+def test_form_keeps_historical_candidate_when_its_site_is_no_longer_available(plugin_host):
+    host = plugin_host
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    host.search_results.append(_context("Show.S01E01", page_url="https://tracker.example/details.php?id=42"))
+    assert plugin.refresh_candidates() is True
+    candidate = plugin._state["entries"]["2"]["candidates"][0]
+    host.indexers[:] = [site for site in host.indexers if site["id"] != candidate["site_id"]]
+
+    assert any(item["value"] == f"2:{candidate['id']}" for item in _form_items(plugin, "candidate"))
+
+
+def test_form_converts_saved_preview_site_ids_to_string_keys(plugin_host):
+    host = plugin_host
+    plugin, choice, _context_value = _prepare_directory_confirmation(host)
+    assert plugin.preview_candidate(choice)[0] is True
+    saved_preview = plugin._state["entries"]["2"]["preview"]
+    assert "5" in saved_preview["search_site_sources"]
+    saved_preview["search_site_sources"] = {5: {"source": "候选扫描", "searched_ts": 1.0}}
+
+    panel = plugin.get_form()[1]["_candidate_preview"]
+    assert panel["search_site_sources"] == {"5": {"source": "候选扫描", "searched_ts": 1.0}}
+    assert 5 in saved_preview["search_site_sources"]
+
+
+def test_search_cache_persists_media_season_maps_with_integer_keys(plugin_host):
+    host = plugin_host
+    plugin, _choice, context = _prepare_directory_confirmation(host)
+    context.media_info.seasons = {1: [1, 2]}
+    context.media_info.season_years = {1: "2026"}
+    plugin._remember_search(host.subscriptions[2], [context], [], "候选扫描", "now")
+
+    cache_file = next((plugin.get_data_path() / "search-cache").glob("*.json"))
+    saved = json.loads(cache_file.read_text())
+    assert saved["contexts"][0]["media_info"]["seasons"] == {"1": [1, 2]}
+    assert saved["contexts"][0]["media_info"]["season_years"] == {"1": "2026"}
+    assert "enclosure" not in cache_file.read_text()
+    loaded = plugin._disk_search_cache().load({saved["identity"]})
+    media = next(iter(loaded.values()))["contexts"][0].media_info
+    assert media.seasons == {1: [1, 2]}
+    assert media.season_years == {1: "2026"}
+
+
 def test_subtitle_first_episode_bundle_is_scanned_and_previewed_without_full_season_bypass(plugin_host):
     """宿主从副标题识别第1-3集后，插件展示候选但不当成12集全集。"""
     host = plugin_host

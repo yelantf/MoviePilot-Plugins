@@ -506,7 +506,7 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
     preview = entry.get(field)
     if not preview:
         return None
-    return {
+    snapshot = {
         **{key: preview.get(key) for key in (
             "choice", "rule_mode", "download_directory", "draft_json", "searched_at", "searched_ts",
             "matched_count", "rejected_count", "search_cached", "search_age_seconds", "timings",
@@ -524,6 +524,11 @@ def _config_preview(sid: str, entry: dict[str, Any], field: str) -> Optional[dic
         "matched_shown": len(preview.get("matched") or []),
         "rejected_shown": len(preview.get("rejected") or []),
     }
+    # 旧预览可能把整数站点 ID 用作字典键；宿主表单接口只接受字符串 JSON 键。
+    sources = snapshot.get("search_site_sources")
+    if isinstance(sources, dict):
+        snapshot["search_site_sources"] = {str(site_id): source for site_id, source in sources.items()}
+    return snapshot
 
 
 class SubscribeOverwatcher(_PluginBase):
@@ -537,7 +542,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.25"
+    plugin_version = "1.9.26"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -2217,7 +2222,8 @@ class SubscribeOverwatcher(_PluginBase):
             "search_searched_sites": cache_coverage["searched_sites"],
             "search_reused_site_labels": cache_coverage["reused_site_labels"],
             "search_searched_site_labels": cache_coverage["searched_site_labels"],
-            "search_site_sources": cache_coverage["site_sources"],
+            "search_site_sources": {str(site_id): source
+                                    for site_id, source in cache_coverage["site_sources"].items()},
             "rule_groups_checked": True, "rule_groups_disabled": groups_disabled,
             "rule_groups_auto_disabled": auto_disabled, "rule_group_notice": notice,
             "rule_group_comparison": {
@@ -3007,7 +3013,11 @@ class SubscribeOverwatcher(_PluginBase):
                 for item in entry.get("candidates") or []:
                     site = item.get("site_id")
                     if site not in keywords_by_site:
-                        cached = self._cached_search(subscribe, [site]) if isinstance(site, int) else None
+                        try:
+                            cached = self._cached_search(subscribe, [site]) if isinstance(site, int) else None
+                        except ValueError:
+                            # 历史候选的站点可能已移除；仍需允许配置页展示这条候选。
+                            cached = None
                         keywords_by_site[site] = ((cached or {}).get("diagnostics") or {}).get("resource_keywords") or {}
                     verified_keywords[(sid, item["id"])] = [word for word in
                         keywords_by_site[site].get(item["id"], []) if isinstance(word, str) and word]

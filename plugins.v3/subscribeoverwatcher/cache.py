@@ -43,7 +43,19 @@ def _plain(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, dict):
-        return {key: _plain(item) for key, item in value.items() if not key.startswith("_")}
+        plain = {}
+        for key, item in value.items():
+            if isinstance(key, str):
+                if key.startswith("_"):
+                    continue
+                name = key
+            elif isinstance(key, int) and not isinstance(key, bool):
+                # MoviePilot 的 MediaInfo.seasons 和 season_years 使用整数季号。
+                name = str(key)
+            else:
+                raise ValueError("搜索缓存包含不支持的字段名类型")
+            plain[name] = _plain(item)
+        return plain
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_plain(item) for item in value]
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -83,7 +95,12 @@ def restore_context(values: dict) -> Any:
     media = None
     if values.get("media_info") is not None:
         media = MediaInfo()
-        media.from_dict(values["media_info"])
+        media_values = dict(values["media_info"])
+        for field in ("seasons", "season_years"):
+            season_map = media_values.get(field)
+            if isinstance(season_map, dict):
+                media_values[field] = {int(season): value for season, value in season_map.items()}
+        media.from_dict(media_values)
     context = Context(meta_info=meta, media_info=media, torrent_info=torrent)
     for field in _CONTEXT_FIELDS:
         setattr(context, field, values.get(field))
@@ -171,11 +188,14 @@ class SearchCacheStore:
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path / self.filename(key))
             return self.prune(newest=self.filename(key))
-        except (OSError, TypeError, ValueError, AttributeError, RecursionError):
+        except (OSError, TypeError, ValueError, AttributeError, RecursionError) as error:
             # 不允许重启后恢复上一轮结果，尤其是用户明确要求重新搜索的时候。
             self.delete(key)
+            category = type(error).__name__
+            if isinstance(error, OSError) and error.errno is not None:
+                category += f" errno={error.errno}"
             logger.warning(f"搜索缓存清理：订阅身份 {key[0]}，站点范围 {key[1] or '默认'}；"
-                           "写入失败，旧磁盘记录已移除；本轮仍可在内存中复用，请检查插件数据目录")
+                           f"写入失败（{category}），旧磁盘记录已移除；本轮仍可在内存中复用，请检查插件数据目录")
             return set()
         finally:
             if temporary is not None:
