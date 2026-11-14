@@ -2089,6 +2089,10 @@ def test_detail_shows_current_state_without_repeating_last_operation(plugin_host
     page_text = json.dumps(plugin.get_page(), ensure_ascii=False)
     assert "当前管理 1 条剧集订阅" in page_text
     assert "订阅 1 已纳入管理" not in page_text
+    overview = next(node for node in plugin.get_page() if node.get("_overview"))
+    assert overview["_overview"]["title"] == "管理概览 · 1 条"
+    section_nodes = [node for node in plugin.get_page() if node.get("_subscription")]
+    assert section_nodes and {node["_subscription"]["id"] for node in section_nodes} == {"1"}
 
 
 def test_custom_interface_bundle_is_ready(plugin_host):
@@ -2641,6 +2645,12 @@ def test_cross_site_same_version_is_grouped_only_for_display(plugin_host):
     }
     assert other_row["content"][5]["content"][0]["text"] == "未知"
     assert other_row["content"][6]["content"][0]["text"] == "未知"
+    assert candidate_table["_candidate_table"] is True
+    assert candidate_table["_subscription"]["id"] == "2"
+    assert grouped_row["_sort"]["seeders"] == 19
+    assert grouped_row["_sort"]["size_bytes"] == 1024 ** 3
+    assert grouped_row["_sort"]["site"] == "另一个站、样例站"
+    assert other_row["_sort"]["seeders"] is None
     site_links = [item for item in grouped_row["content"][2]["content"] if item["component"] == "a"]
     assert {item["props"]["href"] for item in site_links} == {
         "https://one.example/details.php?id=11", "https://two.example/details.php?id=22",

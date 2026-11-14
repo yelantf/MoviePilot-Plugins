@@ -463,6 +463,22 @@ def _availability_cell(items: list[dict[str, Any]], field: str) -> dict[str, Any
     return {"component": "td", "content": content}
 
 
+def _candidate_row_sort(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """给数据页的合并候选行提供可比较的展示字段。"""
+    item = items[0]
+    seeders = [value for member in items if isinstance(value := member.get("seeders"), int)
+               and not isinstance(value, bool) and value >= 0]
+    size = item.get("size_bytes")
+    return {
+        "last_seen": max((member.get("last_seen") or "" for member in items), default=""),
+        "seeders": max(seeders) if seeders else None,
+        "size_bytes": size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None,
+        "title": item.get("title") or "",
+        "site": "、".join(sorted(str(member.get("site_name") or member.get("site_id") or "")
+                               for member in items)),
+    }
+
+
 def _full_season_version_count(items: list[dict[str, Any]]) -> int:
     """跨站同版本整季资源在确认和提示中只计一次。"""
     return sum(group[0].get("kind") == "full_season" for group in _display_groups(items))
@@ -542,7 +558,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.26"
+    plugin_version = "1.9.27"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -3264,11 +3280,12 @@ class SubscribeOverwatcher(_PluginBase):
             ]})
         page.append({"component": "VAlert", "props": {
             "type": "info", "variant": "tonal",
-            "text": (f"当前管理 {len(managed_rows)} 条剧集订阅；下表显示当前状态和订阅进度。"
+            "text": (f"当前管理 {len(managed_rows)} 条剧集订阅；展开管理概览可查看状态和订阅进度。"
                      if managed_rows else "当前没有纳入管理的剧集订阅。"),
         }})
         if managed_rows:
-            page.append({"component": "VTable", "props": {"hover": True}, "content": [
+            page.append({"component": "VTable", "_overview": {"title": f"管理概览 · {len(managed_rows)} 条"},
+                         "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
                     for title in ("订阅 ID", "剧集", "接管方式", "确认状态", "订阅进度")
@@ -3281,7 +3298,8 @@ class SubscribeOverwatcher(_PluginBase):
             }})
         for sid, entry in pending:
             groups = _display_groups(entry.get("candidates") or [])
-            page.append({"component": "VAlert", "props": {
+            section_nodes = []
+            section_nodes.append({"component": "VAlert", "props": {
                 "type": "info", "variant": "tonal",
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
                         f"候选 {len(entry.get('candidates') or [])} 条、合并展示 {len(groups)} 行（含历史扫描记录） · "
@@ -3292,13 +3310,13 @@ class SubscribeOverwatcher(_PluginBase):
             }})
             failures = (entry.get("search_diagnostics") or {}).get("site_failures") or []
             if failures:
-                page.append({"component": "VAlert", "props": {
+                section_nodes.append({"component": "VAlert", "props": {
                     "type": "warning", "variant": "tonal",
                     "text": "本条订阅最近扫描有失败或暂缓的站点，仅本轮停止后续查询，结果可能不完整："
                             + "；".join(f"{item['site_name']}：{item['reason']}" for item in failures),
                 }})
             rows = [
-                {"component": "tr", "content": [
+                {"component": "tr", "_sort": _candidate_row_sort(group), "content": [
                     {"component": "td", "text": _candidate_label(item)},
                     {"component": "td", "text": _candidate_coverage(item)},
                     _site_cell(group),
@@ -3321,7 +3339,8 @@ class SubscribeOverwatcher(_PluginBase):
                 for group in groups
                 for item in group[:1]
             ]
-            page.append({"component": "VTable", "props": {"hover": True}, "content": [
+            section_nodes.append({"component": "VTable", "_candidate_table": True,
+                                  "props": {"hover": True}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
                     {"component": "th", "text": title}
                     for title in ("类型", "识别集号/目标总集数", "站点/详情", "资源", "大小", "做种人数", "免费/促销", "质量", "分辨率", "特效", "制作组", "最后发现/扫描状态", "操作")
@@ -3331,12 +3350,16 @@ class SubscribeOverwatcher(_PluginBase):
             direct_history = entry.get("direct_download_history") or []
             if direct_history:
                 latest = direct_history[0]
-                page.append({"component": "VAlert", "props": {
+                section_nodes.append({"component": "VAlert", "props": {
                     "type": "success", "variant": "tonal",
                     "text": f"最近一次性整包下载提交：{latest.get('submitted_at') or '?'} · "
                             f"{latest.get('site_name') or '?'} · {latest.get('title') or '?'} · "
                             f"{_size_label(latest.get('size_bytes'), exact=True)}。订阅仍待确认。",
                 }})
+            section = {"id": sid, "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d}",
+                       "status": "待确认", "candidate_count": len(entry.get("candidates") or []),
+                       "row_count": len(groups), "warning": bool(failures or entry.get("last_error"))}
+            page.extend({**node, "_subscription": section} for node in section_nodes)
         if approved:
             page.append({"component": "VAlert", "props": {
                 "type": "success", "variant": "tonal",
@@ -3344,7 +3367,8 @@ class SubscribeOverwatcher(_PluginBase):
             }})
         for sid, entry in approved:
             mode = "候选规则回填" if entry.get("mode") == "candidate" else "直接批准"
-            page.append({"component": "VAlert", "props": {
+            section_nodes = []
+            section_nodes.append({"component": "VAlert", "props": {
                 "type": "success", "variant": "tonal",
                 "text": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d} · "
                         f"{mode} · 批准于 {entry.get('approved_at') or '?'}",
@@ -3352,7 +3376,7 @@ class SubscribeOverwatcher(_PluginBase):
             direct_history = entry.get("direct_download_history") or []
             if direct_history:
                 latest = direct_history[0]
-                page.append({"component": "VAlert", "props": {
+                section_nodes.append({"component": "VAlert", "props": {
                     "type": "success", "variant": "tonal",
                     "text": f"此前一次性整包下载提交：{latest.get('submitted_at') or '?'} · "
                             f"{latest.get('site_name') or '?'} · {latest.get('title') or '?'}。",
@@ -3360,11 +3384,14 @@ class SubscribeOverwatcher(_PluginBase):
             history = entry.get("replacement_history") or []
             if history:
                 latest = history[0]
-                page.append({"component": "VAlert", "props": {
+                section_nodes.append({"component": "VAlert", "props": {
                     "type": "success", "variant": "tonal",
                     "text": f"最近手动提交：{latest.get('submitted_at') or '?'} · "
                             f"{latest.get('title') or '?'} · 集数 {latest.get('episodes') or []}",
                 }})
+            section = {"id": sid, "title": f"#{sid} {entry.get('name')} S{int(entry.get('season') or 1):02d}",
+                       "status": "已批准", "candidate_count": 0, "row_count": 0, "warning": False}
+            page.extend({**node, "_subscription": section} for node in section_nodes)
         return page
 
     def notify_pending_subscriptions(self) -> None:
