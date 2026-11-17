@@ -17,6 +17,9 @@
                 <v-switch v-model="form.confirm_full_pack" label="全集种子也需确认" density="comfortable" hide-details />
               </v-col>
               <v-col cols="12" sm="6">
+                <v-switch v-model="form.pause_partial_qb_pack" label="qB 部分合集全选并暂停添加" density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="12" sm="6">
                 <v-switch v-model="form.daily_notice" label="每天推送待确认与 qB 部分合集任务汇总" density="comfortable" hide-details />
               </v-col>
               <v-col cols="6" sm="3">
@@ -30,7 +33,8 @@
             </v-row>
             <v-alert type="info" variant="tonal" density="compact" class="mt-3">
               开启全集确认后，新剧集暂停；关闭后仍拦截分集下载，只允许符合原规则的整季资源自动下载。
-              目标季候选每 4 小时更新。部分合集成功暂停添加后会立即按订阅类型通知；每日按上方设置的时间，以插件类型汇总 qB 中仍存在的标记任务。
+              目标季候选每 4 小时更新。关闭 qB 部分合集开关后，已放行的部分合集按 MoviePilot 原流程选文件；已添加的 qB 任务不改变。
+              开关开启且部分合集成功暂停添加后，会立即按订阅类型通知；每日按上方设置的时间，以插件类型汇总 qB 中仍存在的标记任务。
             </v-alert>
           </v-card-text>
           <v-card-actions class="px-4 pb-4">
@@ -299,7 +303,7 @@ import DataPage from './Page.vue'
 
 const PLUGIN_ID = 'SubscribeOverwatcher'
 const fields = [
-  'enabled', 'confirm_full_pack', 'daily_notice', 'notice_hour', 'notice_minute',
+  'enabled', 'confirm_full_pack', 'pause_partial_qb_pack', 'daily_notice', 'notice_hour', 'notice_minute',
   'historical_subscription', 'scan_subscription', 'candidate_subscription', 'candidate', 'rule_mode', 'rule_sites', 'rule_json', 'keyword_choice', 'download_directory',
   'direct_subscription',
   'revoke_subscription', 'replace_subscription', 'replace_resource', 'replace_episodes',
@@ -323,7 +327,7 @@ const props = defineProps({
 const emit = defineEmits(['switch'])
 
 const form = reactive({
-  enabled: false, confirm_full_pack: true, daily_notice: true,
+  enabled: false, confirm_full_pack: true, pause_partial_qb_pack: true, daily_notice: true,
   notice_hour: 9, notice_minute: 0, historical_subscription: [],
   scan_subscription: '',
   candidate_subscription: '', candidate: '', rule_mode: 'candidate', rule_sites: [], rule_json: '', keyword_choice: 'original',

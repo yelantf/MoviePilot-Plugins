@@ -5246,6 +5246,43 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
     assert server.qbc.torrents_add.call_count == 1
 
 
+def test_partial_qb_pause_switch_only_disables_download_extension(plugin_host, monkeypatch):
+    """独立开关关闭后不接管新合集；订阅守门与旧任务日报仍可运行。"""
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    form, model = plugin.get_form()
+    assert model["pause_partial_qb_pack"] is True
+    assert "qB 部分合集全选并暂停添加" in json.dumps(form, ensure_ascii=False)
+    callback = plugin.get_module()["download"]
+    _mark_paused_subscription(plugin, context, {2})
+
+    plugin.init_plugin({"enabled": True, "pause_partial_qb_pack": False})
+    assert plugin.get_state() is True
+    assert plugin.get_module() is None
+    assert "partial_pause_daily_notice" in {item["id"] for item in plugin.get_service()}
+    plugin_host.subscriptions[2] = _subscribe(2)
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    blocked = _download_event(2)
+    plugin.intercept_download(blocked)
+    assert blocked.event_data.cancel is True
+    assert callback(
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    ) is None
+    _mark_paused_subscription(plugin, context, {2})
+    assert plugin._partial_guard.get() is None
+    server.qbc.torrents_add.assert_not_called()
+    assert plugin_host.messages == []
+
+    plugin.init_plugin({"enabled": True, "pause_partial_qb_pack": True})
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[1] == torrent_hash
+    server.qbc.torrents_add.assert_called_once()
+
+
 def test_plugin_module_keeps_existing_qb_task_untouched(plugin_host, monkeypatch):
     """同 Hash 已有任务只返回复用标志，不暂停、改优先级或重新添加。"""
     plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)

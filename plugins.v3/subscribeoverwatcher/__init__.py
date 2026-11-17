@@ -592,9 +592,9 @@ class SubscribeOverwatcher(_PluginBase):
     """
 
     plugin_name = "剧集守门员"
-    plugin_desc = "剧集订阅可预览规则、一次性整包下载；qB 部分合集默认全选并暂停标记。"
+    plugin_desc = "剧集订阅可预览规则、一次性整包下载；可选暂停并标记 qB 部分合集。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.36"
+    plugin_version = "1.9.37"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -618,6 +618,7 @@ class SubscribeOverwatcher(_PluginBase):
         self._search_cache_store: Optional[SearchCacheStore] = None
         self._search_cache_loaded = False
         self._enabled = False
+        self._pause_partial_qb_pack = True
         # 下载前事件与插件模块运行于同一调用上下文；标记只允许消费一次。
         self._partial_guard: ContextVar[Optional[dict[str, Any]]] = ContextVar(
             f"subscribeoverwatcher_partial_guard_{id(self)}", default=None,
@@ -701,6 +702,7 @@ class SubscribeOverwatcher(_PluginBase):
             if self._enabled and not self._search_cache_loaded:
                 self._load_search_cache()
             self._confirm_full_pack = bool(config.get("confirm_full_pack", True))
+            self._pause_partial_qb_pack = bool(config.get("pause_partial_qb_pack", True))
             self._daily_notice = bool(config.get("daily_notice", True))
             self._notice_hour = self._time_part(config.get("notice_hour", 9), 9, 23)
             self._notice_minute = self._time_part(config.get("notice_minute", 0), 0, 59)
@@ -1108,7 +1110,7 @@ class SubscribeOverwatcher(_PluginBase):
         :param event: 带订阅来源及目标集数的下载前事件
         """
         self._partial_guard.set(None)
-        if not self._enabled or event is None or event.event_data is None:
+        if not self._enabled or not self._pause_partial_qb_pack or event is None or event.event_data is None:
             return
         data = event.event_data
         sid = _subscription_id(getattr(data, "origin", None))
@@ -1144,7 +1146,7 @@ class SubscribeOverwatcher(_PluginBase):
         :return: 暂停添加结果、明确的失败结果，或由宿主处理的 None
         """
         marker = self._partial_guard.get()
-        if not self._enabled or marker is None:
+        if not self._enabled or not self._pause_partial_qb_pack or marker is None:
             return None
         with self._lock:
             if marker["claimed"]:
@@ -3013,9 +3015,9 @@ class SubscribeOverwatcher(_PluginBase):
         """
         通过宿主现有模块扩展点，在 qB 自动选集前处理订阅部分合集。
 
-        :return: 插件启用时提供的下载方法；停用时不注册
+        :return: 插件与部分合集接管均启用时提供的下载方法；否则不注册
         """
-        return {"download": self._guarded_download} if self._enabled else None
+        return {"download": self._guarded_download} if self._enabled and self._pause_partial_qb_pack else None
 
     @staticmethod
     def get_render_mode() -> tuple[str, str]:
@@ -3320,6 +3322,7 @@ class SubscribeOverwatcher(_PluginBase):
             row(
                 col(switch("enabled", "接管新增剧集订阅"), sm=6),
                 col(switch("confirm_full_pack", "全集种子也需确认"), sm=6),
+                col(switch("pause_partial_qb_pack", "qB 部分合集全选并暂停添加"), sm=6),
                 col(switch("daily_notice", "每天推送待确认与 qB 部分合集任务汇总"), sm=6),
                 col(select("notice_hour", "每日通知小时", [
                     {"title": f"{hour:02d}", "value": hour} for hour in range(24)
@@ -3333,6 +3336,10 @@ class SubscribeOverwatcher(_PluginBase):
                     "开启全集确认后，新剧集暂停；关闭后，分集下载仍会拦截，"
                     "仅覆盖整季且符合原规则的种子可自动下载。撤销批准后始终暂停。"
                     "目标季候选每 4 小时更新。"
+                ), md=6),
+                col(info(
+                    "关闭 qB 部分合集全选并暂停添加后，已放行的部分合集交由 MoviePilot "
+                    "原流程按缺集选文件；已添加的 qB 任务不改变。"
                 ), md=6),
                 col(info(managed_summary), md=6),
             ),
@@ -3412,7 +3419,8 @@ class SubscribeOverwatcher(_PluginBase):
                 ])),
             ),
         ]}], {
-            "enabled": False, "confirm_full_pack": True, "daily_notice": True,
+            "enabled": False, "confirm_full_pack": True, "pause_partial_qb_pack": True,
+            "daily_notice": True,
             "notice_hour": 9, "notice_minute": 0,
             "historical_subscription": [], "scan_subscription": "", "candidate_subscription": "", "candidate": "",
             "rule_mode": "candidate", "rule_sites": [], "rule_json": "", "keyword_choice": "original",

@@ -87,6 +87,39 @@ function previewSnapshot(draft) {
 }
 
 describe('custom configuration actions', () => {
+  it('saves the qB partial pack switch independently of subscription management', async () => {
+    const data = snapshot({ managed: '已纳入管理 0 条剧集订阅', historical: [] })
+    data.model.pause_partial_qb_pack = true
+    const Switch = defineComponent({
+      props: ['modelValue', 'label'],
+      emits: ['update:modelValue'],
+      template: '<button :aria-label="label" :aria-pressed="String(Boolean(modelValue))" @click="$emit(\'update:modelValue\', !modelValue)">{{ label }}</button>',
+    })
+    const api = {
+      get: vi.fn().mockResolvedValue(data),
+      post: vi.fn().mockImplementation(async (_url, submitted) => {
+        data.model.pause_partial_qb_pack = submitted.pause_partial_qb_pack
+        return { success: true, message: '设置已保存' }
+      }),
+    }
+    const wrapper = mount(Config, {
+      props: { api }, global: { components: { ...components, VSwitch: Switch } },
+    })
+    await flushPromises()
+
+    const toggle = wrapper.find('button[aria-label="qB 部分合集全选并暂停添加"]')
+    expect(toggle.attributes('aria-pressed')).toBe('true')
+    await toggle.trigger('click')
+    await wrapper.findAll('button').find(item => item.text() === '保存设置').trigger('click')
+    await flushPromises()
+
+    expect(applyCalls(api)[0][1]).toMatchObject({
+      operation: 'save', enabled: true, pause_partial_qb_pack: false,
+    })
+    expect(toggle.attributes('aria-pressed')).toBe('false')
+    wrapper.unmount()
+  })
+
   it('submits an explicitly selected whole torrent without confirming subscription rules', async () => {
     const data = candidateSnapshot()
     const candidate = data.conf[0].content.find(item => item.props?.model === 'candidate').props.items[0]
