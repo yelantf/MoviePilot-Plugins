@@ -594,7 +594,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；qB 部分合集默认全选并暂停标记。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.34"
+    plugin_version = "1.9.35"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -660,6 +660,24 @@ class SubscribeOverwatcher(_PluginBase):
                 self._state = {"baseline": None, "entries": {}}
             if not isinstance(self._state.get("entries"), dict):
                 self._state["entries"] = {}
+            old_daily = self._state.pop("partial_pause_daily", None)
+            if old_daily is not None:
+                if "partial_pause_pending" not in self._state:
+                    pending = {"count": 0, "items": []}
+                    if isinstance(old_daily, dict) and old_daily.get("date") != self._state.get("partial_pause_last_sent"):
+                        count = old_daily.get("count")
+                        items = old_daily.get("items")
+                        pending["count"] = count if isinstance(count, int) and count >= 0 else 0
+                        if isinstance(items, list):
+                            pending["items"] = [
+                                {**item, "sequence": index}
+                                for index, item in enumerate(items[-20:], start=1) if isinstance(item, dict)
+                            ]
+                            self._state["partial_pause_sequence"] = max(
+                                (item["sequence"] for item in pending["items"]), default=0,
+                            )
+                    self._state["partial_pause_pending"] = pending
+                self._save_state()
             if "site_holds" in self._state:
                 self._state.pop("site_holds", None)
                 self._save_state()
@@ -1195,20 +1213,24 @@ class SubscribeOverwatcher(_PluginBase):
             "episodes": episodes[:32],
             "episode_count": len(episodes),
         }
-        day = now.date().isoformat()
         with self._lock:
-            daily = self._state.get("partial_pause_daily")
-            if not isinstance(daily, dict) or daily.get("date") != day:
-                daily = {"date": day, "count": 0, "items": []}
-            count = daily.get("count")
-            daily["count"] = (count if isinstance(count, int) and count >= 0 else 0) + 1
-            items = daily.get("items")
-            daily["items"] = ([*items, item] if isinstance(items, list) else [item])[-20:]
-            self._state["partial_pause_daily"] = daily
+            pending = self._state.get("partial_pause_pending")
+            if not isinstance(pending, dict):
+                pending = {"count": 0, "items": []}
+            sequence = self._state.get("partial_pause_sequence")
+            sequence = (sequence if isinstance(sequence, int) and sequence >= 0 else 0) + 1
+            item["sequence"] = sequence
+            item["added_at"] = now.isoformat(timespec="minutes")
+            count = pending.get("count")
+            pending["count"] = (count if isinstance(count, int) and count >= 0 else 0) + 1
+            items = pending.get("items")
+            pending["items"] = ([*items, item] if isinstance(items, list) else [item])[-20:]
+            self._state["partial_pause_pending"] = pending
+            self._state["partial_pause_sequence"] = sequence
             try:
                 self._save_state()
             except Exception:
-                logger.exception("剧集守门员无法持久保存今日暂停合集记录")
+                logger.exception("剧集守门员无法持久保存待汇总的暂停合集记录")
         try:
             self.post_message(
                 mtype=MessageType.Subscribe,
@@ -3328,10 +3350,10 @@ class SubscribeOverwatcher(_PluginBase):
                 col(switch("enabled", "接管新增剧集订阅"), sm=6),
                 col(switch("confirm_full_pack", "全集种子也需确认"), sm=6),
                 col(switch("daily_notice", "每天推送待确认与部分合集暂停汇总"), sm=6),
-                col(select("notice_hour", "待确认日报小时", [
+                col(select("notice_hour", "每日通知小时", [
                     {"title": f"{hour:02d}", "value": hour} for hour in range(24)
                 ]), cols=6, sm=3),
-                col(select("notice_minute", "待确认日报分钟", [
+                col(select("notice_minute", "每日通知分钟", [
                     {"title": f"{minute:02d}", "value": minute} for minute in range(60)
                 ]), cols=6, sm=3),
             ),
@@ -3618,21 +3640,25 @@ class SubscribeOverwatcher(_PluginBase):
 
     def notify_paused_partial_daily(self) -> None:
         """
-        每天汇总本地日新添加的暂停合集；同日重复触发只发送一次。
+        每天汇总上次日报后新添加的暂停合集；同日重复触发只发送一次。
         """
         if not self._enabled or not self._daily_notice:
             return
-        day = _local_now().date().isoformat()
+        now = _local_now()
+        day = now.date().isoformat()
         with self._lock:
             if self._state.get("partial_pause_last_sent") == day or self._partial_daily_inflight == day:
                 return
-            daily = self._state.get("partial_pause_daily")
-            if not isinstance(daily, dict) or daily.get("date") != day:
-                daily = {}
-            count = daily.get("count")
+            pending = self._state.get("partial_pause_pending")
+            if not isinstance(pending, dict):
+                pending = {}
+            count = pending.get("count")
             count = count if isinstance(count, int) and count >= 0 else 0
-            saved_items = daily.get("items")
+            saved_items = pending.get("items")
             items = copy.deepcopy(saved_items[-10:]) if isinstance(saved_items, list) else []
+            sequence = self._state.get("partial_pause_sequence")
+            sequence = sequence if isinstance(sequence, int) and sequence >= 0 else 0
+            last_sent_at = self._state.get("partial_pause_last_sent_at") or self._state.get("partial_pause_last_sent")
             self._partial_daily_inflight = day
         lines = []
         for index, item in enumerate(items, start=max(1, count - len(items) + 1)):
@@ -3647,7 +3673,10 @@ class SubscribeOverwatcher(_PluginBase):
                 )
             except (KeyError, TypeError, ValueError):
                 continue
-        text = f"{day} 截至本次通知，今日暂停添加 {count} 个部分合集种子。"
+        end_at = now.strftime("%Y-%m-%d %H:%M")
+        start_at = str(last_sent_at)[:16].replace("T", " ") if last_sent_at else ""
+        window = f"{start_at} 至 {end_at}" if start_at else f"截至 {end_at}"
+        text = f"{window}，暂停添加 {count} 个部分合集种子。"
         if lines:
             if count > len(lines):
                 text += f"\n仅列出最近 {len(lines)} 个："
@@ -3655,7 +3684,7 @@ class SubscribeOverwatcher(_PluginBase):
         elif count:
             text += "\n明细记录不可用，请到 qB 查看任务。"
         else:
-            text += "\n今日暂无新暂停添加的部分合集种子。"
+            text += "\n本次统计区间没有新暂停添加的部分合集种子。"
         text += "\n任务后续是否仍暂停，请以 qB 当前状态为准。"
         try:
             self.post_message(
@@ -3669,7 +3698,21 @@ class SubscribeOverwatcher(_PluginBase):
                 self._partial_daily_inflight = None
             return
         with self._lock:
+            pending = self._state.get("partial_pause_pending")
+            if not isinstance(pending, dict):
+                pending = {"count": 0, "items": []}
+            current_count = pending.get("count")
+            current_count = current_count if isinstance(current_count, int) and current_count >= 0 else 0
+            pending["count"] = max(0, current_count - count)
+            current_items = pending.get("items")
+            pending["items"] = [
+                item for item in current_items
+                if isinstance(item, dict) and isinstance(item.get("sequence"), int)
+                and item["sequence"] > sequence
+            ] if isinstance(current_items, list) else []
+            self._state["partial_pause_pending"] = pending
             self._state["partial_pause_last_sent"] = day
+            self._state["partial_pause_last_sent_at"] = now.isoformat(timespec="minutes")
             try:
                 self._save_state()
             except Exception:
@@ -3699,7 +3742,7 @@ class SubscribeOverwatcher(_PluginBase):
             services.append({
                 "id": "partial_pause_daily_notice", "name": "推送部分合集暂停日报",
                 "trigger": "cron", "func": self.notify_paused_partial_daily,
-                "kwargs": {"hour": 23, "minute": 59},
+                "kwargs": {"hour": self._notice_hour, "minute": self._notice_minute},
             })
         return services
 
