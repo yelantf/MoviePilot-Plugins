@@ -10,6 +10,8 @@ from packaging.version import InvalidVersion, Version
 
 from app.application.torrent.download import TorrentHelper
 
+PARTIAL_PACK_TAG = "剧集守门员-部分合集"
+
 
 def needs_manual_selection(
     content: Union[Path, str, bytes], episodes: set[int],
@@ -114,6 +116,8 @@ def add_paused_qb_download(
     default_tag = str(settings.TORRENT_TAG or "").strip()
     if default_tag and default_tag not in tags:
         tags.append(default_tag)
+    if PARTIAL_PACK_TAG not in tags:
+        tags.append(PARTIAL_PACK_TAG)
     tags.append(temporary_tag)
     torrent_hash = None
     try:
@@ -155,7 +159,7 @@ def add_paused_qb_download(
             return None, None, None, f"qB 任务 {torrent_hash} 暂停请求未确认，请手动检查"
         return (
             actual_downloader, torrent_hash, server.get_content_layout(),
-            f"添加下载成功，任务 {torrent_hash} 保持暂停，请在 qB 手动选集后启动",
+            f"添加下载成功，任务 {torrent_hash} 保持暂停且默认全选，请在 qB 核对文件后启动",
         )
     finally:
         server.delete_torrents_tag(torrent_hash, temporary_tag)

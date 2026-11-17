@@ -5169,6 +5169,7 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
 
     assert result[1] == torrent_hash
     assert "保持暂停" in result[3]
+    assert "默认全选" in result[3]
     add_options = server.qbc.torrents_add.call_args.kwargs
     assert add_options["is_paused"] is True
     assert add_options["save_path"] == "/downloads"
@@ -5176,9 +5177,12 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
     assert add_options["use_download_path"] is False
     assert add_options["category"] == "TV"
     assert "MoviePilot" in add_options["tags"]
+    assert "剧集守门员-部分合集" in add_options["tags"]
+    assert "file_priorities" not in add_options
     server.stop_torrents.assert_called_once_with(torrent_hash)
     server.start_torrents.assert_not_called()
     server.set_files.assert_not_called()
+    server.qbc.torrents_file_priority.assert_not_called()
     assert callback(
         b"torrent-content", Path("/downloads"), "cookie-secret",
         episodes={2}, category="TV", downloader="qb",
