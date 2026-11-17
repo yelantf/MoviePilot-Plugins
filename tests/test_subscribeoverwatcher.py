@@ -5122,7 +5122,11 @@ def _paused_download_host(monkeypatch, plugin_host):
 
     server = Mock()
     server.get_torrents.return_value = ([], False)
-    server.add_torrent.return_value = (True, [torrent_hash])
+    server.qbc.app_web_api_version.return_value = "2.11.0"
+    server.qbc.torrents_add.return_value = {"added_torrent_ids": [torrent_hash]}
+    server._category = True
+    server._sequentail = False
+    server._first_last_piece = False
     server.stop_torrents.return_value = True
     server.get_content_layout.return_value = "Original"
     qb_module = SimpleNamespace(
@@ -5165,9 +5169,13 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
 
     assert result[1] == torrent_hash
     assert "保持暂停" in result[3]
-    assert server.add_torrent.call_args.kwargs["is_paused"] is True
-    assert server.add_torrent.call_args.kwargs["download_dir"] == "/downloads"
-    assert "MoviePilot" in server.add_torrent.call_args.kwargs["tag"]
+    add_options = server.qbc.torrents_add.call_args.kwargs
+    assert add_options["is_paused"] is True
+    assert add_options["save_path"] == "/downloads"
+    assert add_options["use_auto_torrent_management"] is False
+    assert add_options["use_download_path"] is False
+    assert add_options["category"] == "TV"
+    assert "MoviePilot" in add_options["tags"]
     server.stop_torrents.assert_called_once_with(torrent_hash)
     server.start_torrents.assert_not_called()
     server.set_files.assert_not_called()
@@ -5175,7 +5183,7 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
         b"torrent-content", Path("/downloads"), "cookie-secret",
         episodes={2}, category="TV", downloader="qb",
     ) is None
-    assert server.add_torrent.call_count == 1
+    assert server.qbc.torrents_add.call_count == 1
 
     rules.select_torrent_files.return_value = ([0, 1], [], {1, 2})
     _mark_paused_subscription(plugin, context, {1, 2})
@@ -5183,7 +5191,7 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
         b"torrent-content", Path("/downloads"), "cookie-secret",
         episodes={1, 2}, category="TV", downloader="qb",
     ) is None
-    assert server.add_torrent.call_count == 1
+    assert server.qbc.torrents_add.call_count == 1
 
     manual = _mark_paused_subscription(plugin, context, {2})
     manual.event_data.origin = "Manual"
@@ -5192,7 +5200,7 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
         b"torrent-content", Path("/downloads"), "cookie-secret",
         episodes={2}, category="TV", downloader="qb",
     ) is None
-    assert server.add_torrent.call_count == 1
+    assert server.qbc.torrents_add.call_count == 1
 
     cancelled = _mark_paused_subscription(plugin, context, {2})
     cancelled.event_data.cancel = True
@@ -5201,7 +5209,7 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
         b"torrent-content", Path("/downloads"), "cookie-secret",
         episodes={2}, category="TV", downloader="qb",
     ) is None
-    assert server.add_torrent.call_count == 1
+    assert server.qbc.torrents_add.call_count == 1
 
 
 def test_plugin_module_keeps_existing_qb_task_untouched(plugin_host, monkeypatch):
@@ -5217,7 +5225,42 @@ def test_plugin_module_keeps_existing_qb_task_untouched(plugin_host, monkeypatch
 
     assert result[1] == torrent_hash
     assert result[3] == "下载任务已存在"
-    server.add_torrent.assert_not_called()
+    server.qbc.torrents_add.assert_not_called()
+    server.stop_torrents.assert_not_called()
+    server.set_files.assert_not_called()
+
+
+def test_plugin_module_rejects_qb_without_per_torrent_download_path(plugin_host, monkeypatch):
+    """旧版 qB 不支持逐种子关闭临时路径时，不添加可能移动文件的合集。"""
+    plugin, context, server, _rules, _module, _torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    server.qbc.app_web_api_version.return_value = "2.8.3"
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[:3] == (None, None, None)
+    assert "2.8.4" in result[3]
+    server.qbc.torrents_add.assert_not_called()
+    server.start_torrents.assert_not_called()
+
+
+def test_plugin_module_preserves_duplicate_added_during_qb_request(plugin_host, monkeypatch):
+    """查询后被别处添加的同 Hash 任务不会被插件暂停或重设文件。"""
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    server.get_torrents.side_effect = [([], False), ([{"hash": torrent_hash}], False)]
+    server.qbc.torrents_add.side_effect = RuntimeError("duplicate")
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[1] == torrent_hash
+    assert result[3] == "下载任务已存在"
     server.stop_torrents.assert_not_called()
     server.set_files.assert_not_called()
 
@@ -5233,7 +5276,7 @@ def test_plugin_module_keeps_magnet_paused_without_metadata_start(plugin_host, m
     )
 
     assert result[1] == torrent_hash
-    assert server.add_torrent.call_args.kwargs["is_paused"] is True
+    assert server.qbc.torrents_add.call_args.kwargs["is_paused"] is True
     server.start_torrents.assert_not_called()
     server.set_files.assert_not_called()
 
@@ -5241,7 +5284,7 @@ def test_plugin_module_keeps_magnet_paused_without_metadata_start(plugin_host, m
 def test_plugin_module_failure_cannot_fall_through_to_auto_start(plugin_host, monkeypatch):
     """暂停添加失败返回非空错误元组，阻止宿主 qB 模块接着自动启动。"""
     plugin, context, server, _rules, _module, _torrent_hash = _paused_download_host(monkeypatch, plugin_host)
-    server.add_torrent.return_value = (False, [])
+    server.qbc.torrents_add.return_value = "Fails."
     _mark_paused_subscription(plugin, context, {2})
 
     result = plugin.get_module()["download"](
@@ -5265,13 +5308,13 @@ def test_plugin_module_failure_cannot_fall_through_to_auto_start(plugin_host, mo
     )
     assert unrecognized[:3] == (None, None, None)
     assert unrecognized[3]
-    assert server.add_torrent.call_count == 1
+    assert server.qbc.torrents_add.call_count == 1
 
 
 def test_plugin_module_resolves_legacy_qb_add_without_returned_hash(plugin_host, monkeypatch):
     """旧版 qB 添加响应没有任务 ID 时，按临时标签找回暂停任务。"""
     plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
-    server.add_torrent.return_value = (True, [])
+    server.qbc.torrents_add.return_value = "Ok."
     server.get_torrent_id_by_tag.return_value = torrent_hash
     _mark_paused_subscription(plugin, context, {2})
 

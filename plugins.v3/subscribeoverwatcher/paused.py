@@ -6,6 +6,8 @@ import secrets
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from packaging.version import InvalidVersion, Version
+
 from app.application.torrent.download import TorrentHelper
 
 
@@ -72,7 +74,7 @@ def add_paused_qb_download(
     cookie: str, category: Optional[str], label: Optional[str], downloader: Optional[str],
 ) -> tuple[Optional[str], Optional[str], Optional[str], str]:
     """
-    通过宿主已配置的 qB 客户端添加暂停任务，不修改文件优先级或启动任务。
+    通过宿主已配置的 qB 客户端添加暂停任务，固定保存路径并保留分类。
 
     :param module: 当前运行的 qB 模块，仅复用路径映射与默认实例名
     :param server: 由该模块取得的 qB 客户端
@@ -97,6 +99,16 @@ def add_paused_qb_download(
     if existing:
         return actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS
 
+    client = server.qbc
+    if client is None:
+        return None, None, None, "qB 客户端未连接，本次未添加部分合集"
+    try:
+        web_api_version = Version(str(client.app_web_api_version()))
+    except (InvalidVersion, TypeError, ValueError):
+        return None, None, None, "无法确认 qB Web API 版本，本次未添加部分合集"
+    if web_api_version < Version("2.8.4"):
+        return None, None, None, "qB Web API 版本低于 2.8.4，无法为该种子单独关闭临时下载路径"
+
     temporary_tag = f"sow-{secrets.token_hex(6)}"
     tags = [tag.strip() for tag in (label or "").split(",") if tag.strip()]
     default_tag = str(settings.TORRENT_TAG or "").strip()
@@ -105,14 +117,31 @@ def add_paused_qb_download(
     tags.append(temporary_tag)
     torrent_hash = None
     try:
-        added, identifiers = server.add_torrent(
-            content=content,
-            download_dir=module.normalize_path(download_dir, downloader),
-            is_paused=True,
-            tag=tags,
-            cookie=cookie,
-            category=category,
-            ignore_category_check=False,
+        try:
+            # qB 仅在手动路径管理模式下尊重逐种子的临时路径开关；分类仍单独保留。
+            response = client.torrents_add(
+                urls=content if isinstance(content, str) else None,
+                torrent_files=content if isinstance(content, bytes) else None,
+                save_path=module.normalize_path(download_dir, downloader),
+                is_paused=True,
+                tags=tags,
+                cookie=cookie,
+                category=category if getattr(server, "_category", False) is True else None,
+                use_auto_torrent_management=False,
+                use_download_path=False,
+                is_sequential_download=getattr(server, "_sequentail", False),
+                is_first_last_piece_priority=getattr(server, "_first_last_piece", False),
+            )
+        except Exception:
+            existing = _existing_hash(server, expected_hashes)
+            if existing:
+                return actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS
+            raise
+        details = response if callable(getattr(response, "get", None)) else {}
+        identifiers = details.get("added_torrent_ids") or []
+        added = (
+            response.strip().startswith("Ok") if isinstance(response, str)
+            else bool(identifiers or details.get("success_count") or details.get("pending_count"))
         )
         if not added:
             existing = _existing_hash(server, expected_hashes)

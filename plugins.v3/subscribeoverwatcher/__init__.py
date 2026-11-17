@@ -568,7 +568,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；qB 部分合集暂停供手动选集。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.31"
+    plugin_version = "1.9.32"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
