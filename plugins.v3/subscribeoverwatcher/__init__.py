@@ -563,9 +563,9 @@ class SubscribeOverwatcher(_PluginBase):
     """
 
     plugin_name = "剧集守门员"
-    plugin_desc = "剧集订阅可预览规则、一次性整包下载；部分合集在 qB 中暂停供手动选集。"
+    plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.29"
+    plugin_version = "1.9.30"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -1055,27 +1055,6 @@ class SubscribeOverwatcher(_PluginBase):
                     data.reason = previous_reason
         except Exception:
             logger.exception(f"查询订阅 {sid} 的确认状态失败，保持下载拦截")
-
-    @eventmanager.register(ChainEventType.ResourceDownload, priority=1100)
-    def pause_partial_subscription(self, event: Optional[Event] = None) -> None:
-        """
-        守门员放行后要求 qB 将部分视频合集保留暂停，供用户手动选集。
-
-        宿主读取种子文件后才判断是否包含目标外的视频；插件不修改下载目录。
-
-        :param event: 已经过订阅确认闸门的下载前链式事件
-        """
-        if not self._enabled or event is None or event.event_data is None:
-            return
-        data = event.event_data
-        if data.cancel or _subscription_id(getattr(data, "origin", None)) is None or not data.episodes:
-            return
-        media = getattr(getattr(data, "context", None), "media_info", None)
-        if media is not None and getattr(media, "type", None) not in (MediaType.TV, MediaType.TV.value):
-            return
-        options = data.options if isinstance(data.options, dict) else {}
-        options["pause_on_partial"] = True
-        data.options = options
 
     def _schedule_scan(self, subscription_ids: Optional[list[int]] = None) -> None:
         """
