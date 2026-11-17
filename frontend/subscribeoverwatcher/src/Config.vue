@@ -17,7 +17,7 @@
                 <v-switch v-model="form.confirm_full_pack" label="全集种子也需确认" density="comfortable" hide-details />
               </v-col>
               <v-col cols="12" sm="6">
-                <v-switch v-model="form.daily_notice" label="每天推送待确认与部分合集暂停汇总" density="comfortable" hide-details />
+                <v-switch v-model="form.daily_notice" label="每天推送待确认与 qB 部分合集任务汇总" density="comfortable" hide-details />
               </v-col>
               <v-col cols="6" sm="3">
                 <v-select v-model="form.notice_hour" label="每日通知小时" :items="options.notice_hour"
@@ -30,7 +30,7 @@
             </v-row>
             <v-alert type="info" variant="tonal" density="compact" class="mt-3">
               开启全集确认后，新剧集暂停；关闭后仍拦截分集下载，只允许符合原规则的整季资源自动下载。
-              目标季候选每 4 小时更新。部分合集成功暂停添加后会立即按订阅类型通知；每日按上方设置的时间，以插件类型汇总上次日报以来的记录。
+              目标季候选每 4 小时更新。部分合集成功暂停添加后会立即按订阅类型通知；每日按上方设置的时间，以插件类型汇总 qB 中仍存在的标记任务。
             </v-alert>
           </v-card-text>
           <v-card-actions class="px-4 pb-4">

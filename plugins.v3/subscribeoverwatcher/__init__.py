@@ -33,7 +33,7 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .directory import directory_choices, preview_download_path, selected_directory_root
 from .cache import MAX_CACHE_ENTRIES, SearchCacheStore
-from .paused import add_paused_qb_download, needs_manual_selection
+from .paused import PARTIAL_PACK_TAG, add_paused_qb_download, needs_manual_selection
 from .preview import (
     SUBSCRIPTION_RULE_OPTIONS, candidate_default_rules, display_draft_rules, editor_draft_rules,
     normalize_draft_rules, parse_episode_selection, preview_resource,
@@ -594,7 +594,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；qB 部分合集默认全选并暂停标记。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.35"
+    plugin_version = "1.9.36"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -660,23 +660,13 @@ class SubscribeOverwatcher(_PluginBase):
                 self._state = {"baseline": None, "entries": {}}
             if not isinstance(self._state.get("entries"), dict):
                 self._state["entries"] = {}
-            old_daily = self._state.pop("partial_pause_daily", None)
-            if old_daily is not None:
-                if "partial_pause_pending" not in self._state:
-                    pending = {"count": 0, "items": []}
-                    if isinstance(old_daily, dict) and old_daily.get("date") != self._state.get("partial_pause_last_sent"):
-                        count = old_daily.get("count")
-                        items = old_daily.get("items")
-                        pending["count"] = count if isinstance(count, int) and count >= 0 else 0
-                        if isinstance(items, list):
-                            pending["items"] = [
-                                {**item, "sequence": index}
-                                for index, item in enumerate(items[-20:], start=1) if isinstance(item, dict)
-                            ]
-                            self._state["partial_pause_sequence"] = max(
-                                (item["sequence"] for item in pending["items"]), default=0,
-                            )
-                    self._state["partial_pause_pending"] = pending
+            old_pause_keys = (
+                "partial_pause_daily", "partial_pause_pending",
+                "partial_pause_sequence", "partial_pause_last_sent_at",
+            )
+            if any(key in self._state for key in old_pause_keys):
+                for key in old_pause_keys:
+                    self._state.pop(key, None)
                 self._save_state()
             if "site_holds" in self._state:
                 self._state.pop("site_holds", None)
@@ -1184,14 +1174,14 @@ class SubscribeOverwatcher(_PluginBase):
             return None, None, None, "剧集守门员无法确认部分合集的暂停状态，本次未自动启动"
         if added:
             try:
-                self._record_paused_partial(marker, result[0], result[1])
+                self._notify_paused_partial(marker, result[0], result[1])
             except Exception:
-                logger.exception("剧集守门员记录或通知暂停合集失败；已添加的任务仍保持暂停")
+                logger.exception("剧集守门员通知暂停合集失败；已添加的任务仍保持暂停")
         return result
 
-    def _record_paused_partial(self, marker: dict[str, Any], downloader: str, torrent_hash: str) -> None:
+    def _notify_paused_partial(self, marker: dict[str, Any], downloader: str, torrent_hash: str) -> None:
         """
-        记录本地日暂停添加事件，并通过订阅消息提醒人工核对。
+        通过订阅消息提醒人工核对新添加并暂停的部分合集。
         """
         sid = marker["subscription_id"]
         try:
@@ -1199,7 +1189,6 @@ class SubscribeOverwatcher(_PluginBase):
         except Exception:
             logger.exception(f"剧集守门员读取订阅 {sid} 失败，使用下载事件中的标题通知")
             subscribe = None
-        now = _local_now()
         episodes = sorted(marker["episodes"])
         season = getattr(subscribe, "season", None) or marker["season"] or 1
         item = {
@@ -1213,24 +1202,6 @@ class SubscribeOverwatcher(_PluginBase):
             "episodes": episodes[:32],
             "episode_count": len(episodes),
         }
-        with self._lock:
-            pending = self._state.get("partial_pause_pending")
-            if not isinstance(pending, dict):
-                pending = {"count": 0, "items": []}
-            sequence = self._state.get("partial_pause_sequence")
-            sequence = (sequence if isinstance(sequence, int) and sequence >= 0 else 0) + 1
-            item["sequence"] = sequence
-            item["added_at"] = now.isoformat(timespec="minutes")
-            count = pending.get("count")
-            pending["count"] = (count if isinstance(count, int) and count >= 0 else 0) + 1
-            items = pending.get("items")
-            pending["items"] = ([*items, item] if isinstance(items, list) else [item])[-20:]
-            self._state["partial_pause_pending"] = pending
-            self._state["partial_pause_sequence"] = sequence
-            try:
-                self._save_state()
-            except Exception:
-                logger.exception("剧集守门员无法持久保存待汇总的暂停合集记录")
         try:
             self.post_message(
                 mtype=MessageType.Subscribe,
@@ -3349,7 +3320,7 @@ class SubscribeOverwatcher(_PluginBase):
             row(
                 col(switch("enabled", "接管新增剧集订阅"), sm=6),
                 col(switch("confirm_full_pack", "全集种子也需确认"), sm=6),
-                col(switch("daily_notice", "每天推送待确认与部分合集暂停汇总"), sm=6),
+                col(switch("daily_notice", "每天推送待确认与 qB 部分合集任务汇总"), sm=6),
                 col(select("notice_hour", "每日通知小时", [
                     {"title": f"{hour:02d}", "value": hour} for hour in range(24)
                 ]), cols=6, sm=3),
@@ -3638,9 +3609,68 @@ class SubscribeOverwatcher(_PluginBase):
             text=text,
         )
 
+    def _current_qb_partial_tasks(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """
+        从所有 qB 实例读取仍存在且带部分合集标签的任务。
+
+        :return: 当前任务快照及无法查询的实例名称
+        """
+        try:
+            module = self.chain.modulemanager.get_running_module("QbittorrentModule")
+            instances = module.get_instances() if module is not None else None
+        except Exception:
+            logger.exception("剧集守门员读取 qB 下载器实例失败")
+            return [], ["qB 下载模块不可用"]
+        if not instances:
+            return [], ["没有可用的 qB 下载器实例"]
+        tasks = []
+        failures = []
+        seen = set()
+        paused_states = {"paused", "pauseddl", "pausedup", "stoppeddl", "stoppedup"}
+        for downloader, server in instances.items():
+            name = _notice_value(downloader, "默认 qB", 40)
+            try:
+                torrents, error = server.get_torrents(tags=PARTIAL_PACK_TAG)
+            except Exception:
+                logger.exception(f"剧集守门员查询 qB 实例 {name} 的部分合集任务失败")
+                failures.append(name)
+                continue
+            if error:
+                failures.append(name)
+                continue
+            for torrent in torrents or []:
+                tags = {tag.strip() for tag in str(torrent.get("tags") or "").split(",")}
+                if PARTIAL_PACK_TAG not in tags:
+                    continue
+                torrent_hash = str(torrent.get("hash") or "").lower()
+                key = (downloader, torrent_hash)
+                if torrent_hash and key in seen:
+                    continue
+                seen.add(key)
+                state = _notice_value(torrent.get("state"), "未知", 30)
+                try:
+                    progress = min(100, max(0, round(float(torrent.get("progress") or 0) * 100)))
+                except (TypeError, ValueError, OverflowError):
+                    progress = 0
+                try:
+                    added_on = int(torrent.get("added_on") or 0)
+                except (TypeError, ValueError):
+                    added_on = 0
+                tasks.append({
+                    "downloader": name,
+                    "name": _notice_value(torrent.get("name"), "未命名任务", 80),
+                    "hash": torrent_hash[:12] or "未知",
+                    "state": state,
+                    "paused": state.lower() in paused_states,
+                    "progress": progress,
+                    "added_on": added_on,
+                })
+        tasks.sort(key=lambda item: item["added_on"], reverse=True)
+        return tasks, failures
+
     def notify_paused_partial_daily(self) -> None:
         """
-        每天汇总上次日报后新添加的暂停合集；同日重复触发只发送一次。
+        每天汇总 qB 中仍存在的部分合集任务；同日成功查询只发送一次。
         """
         if not self._enabled or not self._daily_notice:
             return
@@ -3649,76 +3679,53 @@ class SubscribeOverwatcher(_PluginBase):
         with self._lock:
             if self._state.get("partial_pause_last_sent") == day or self._partial_daily_inflight == day:
                 return
-            pending = self._state.get("partial_pause_pending")
-            if not isinstance(pending, dict):
-                pending = {}
-            count = pending.get("count")
-            count = count if isinstance(count, int) and count >= 0 else 0
-            saved_items = pending.get("items")
-            items = copy.deepcopy(saved_items[-10:]) if isinstance(saved_items, list) else []
-            sequence = self._state.get("partial_pause_sequence")
-            sequence = sequence if isinstance(sequence, int) and sequence >= 0 else 0
-            last_sent_at = self._state.get("partial_pause_last_sent_at") or self._state.get("partial_pause_last_sent")
             self._partial_daily_inflight = day
-        lines = []
-        for index, item in enumerate(items, start=max(1, count - len(items) + 1)):
-            try:
-                lines.append(
-                    f"{index}. #{item['subscription_id']} {_notice_value(item['name'], '未知剧集', 60)}"
-                    f" S{item['season']:02d} · {_notice_value(item['site'], '未知站点', 30)}"
-                    f" · {_notice_value(item['title'], '未知资源', 80)}"
-                    f" · {_notice_value(item['downloader'], 'qB', 30)}"
-                    f" · {_notice_episodes(item['episodes'], item['episode_count'])}"
-                    f" · Hash {str(item['hash'])[:12]}"
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-        end_at = now.strftime("%Y-%m-%d %H:%M")
-        start_at = str(last_sent_at)[:16].replace("T", " ") if last_sent_at else ""
-        window = f"{start_at} 至 {end_at}" if start_at else f"截至 {end_at}"
-        text = f"{window}，暂停添加 {count} 个部分合集种子。"
-        if lines:
-            if count > len(lines):
-                text += f"\n仅列出最近 {len(lines)} 个："
-            text += "\n" + "\n".join(lines)
-        elif count:
-            text += "\n明细记录不可用，请到 qB 查看任务。"
+        try:
+            tasks, failures = self._current_qb_partial_tasks()
+        except Exception:
+            logger.exception("剧集守门员汇总 qB 部分合集任务失败")
+            tasks, failures = [], ["qB 任务查询异常"]
+        paused = sum(item["paused"] for item in tasks)
+        if failures:
+            text = (
+                f"截至 {now.strftime('%Y-%m-%d %H:%M')}，qB 查询不完整；"
+                f"已查到 {len(tasks)} 个带“{PARTIAL_PACK_TAG}”标签的任务，"
+                f"其中 {paused} 个处于暂停状态。"
+            )
         else:
-            text += "\n本次统计区间没有新暂停添加的部分合集种子。"
-        text += "\n任务后续是否仍暂停，请以 qB 当前状态为准。"
+            text = (
+                f"截至 {now.strftime('%Y-%m-%d %H:%M')}，qB 中有 {len(tasks)} 个带"
+                f"“{PARTIAL_PACK_TAG}”标签的任务，其中 {paused} 个处于暂停状态。"
+            )
+        for index, item in enumerate(tasks[:20], start=1):
+            status = "暂停" if item["paused"] else item["state"]
+            text += (
+                f"\n{index}. {item['downloader']} · {item['name']} · {status}"
+                f" · {item['progress']}% · Hash {item['hash']}"
+            )
+        if len(tasks) > 20:
+            text += f"\n另有 {len(tasks) - 20} 个未列出，请在 qB 按标签查看。"
+        if failures:
+            text += "\n以下 qB 实例查询失败，以上数量不包含它们：" + "、".join(failures)
         try:
             self.post_message(
                 mtype=MessageType.Plugin,
-                title="剧集守门员：部分合集暂停日报",
+                title="剧集守门员：qB 部分合集任务日报",
                 text=text,
             )
         except Exception:
-            logger.exception("剧集守门员发送部分合集暂停日报失败")
+            logger.exception("剧集守门员发送 qB 部分合集任务日报失败")
             with self._lock:
                 self._partial_daily_inflight = None
             return
         with self._lock:
-            pending = self._state.get("partial_pause_pending")
-            if not isinstance(pending, dict):
-                pending = {"count": 0, "items": []}
-            current_count = pending.get("count")
-            current_count = current_count if isinstance(current_count, int) and current_count >= 0 else 0
-            pending["count"] = max(0, current_count - count)
-            current_items = pending.get("items")
-            pending["items"] = [
-                item for item in current_items
-                if isinstance(item, dict) and isinstance(item.get("sequence"), int)
-                and item["sequence"] > sequence
-            ] if isinstance(current_items, list) else []
-            self._state["partial_pause_pending"] = pending
-            self._state["partial_pause_last_sent"] = day
-            self._state["partial_pause_last_sent_at"] = now.isoformat(timespec="minutes")
-            try:
-                self._save_state()
-            except Exception:
-                logger.exception("剧集守门员无法持久保存部分合集日报发送日期")
-            finally:
-                self._partial_daily_inflight = None
+            if not failures:
+                self._state["partial_pause_last_sent"] = day
+                try:
+                    self._save_state()
+                except Exception:
+                    logger.exception("剧集守门员无法持久保存 qB 任务日报发送日期")
+            self._partial_daily_inflight = None
 
     def get_service(self) -> list[dict[str, Any]]:
         """注册进度检查、候选扫描及两类每日通知。"""
@@ -3740,7 +3747,7 @@ class SubscribeOverwatcher(_PluginBase):
                 "kwargs": {"hour": self._notice_hour, "minute": self._notice_minute},
             })
             services.append({
-                "id": "partial_pause_daily_notice", "name": "推送部分合集暂停日报",
+                "id": "partial_pause_daily_notice", "name": "推送 qB 部分合集任务日报",
                 "trigger": "cron", "func": self.notify_paused_partial_daily,
                 "kwargs": {"hour": self._notice_hour, "minute": self._notice_minute},
             })
