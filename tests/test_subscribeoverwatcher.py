@@ -12,6 +12,7 @@ import re
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -411,6 +412,7 @@ def plugin_host(monkeypatch, tmp_path):
         "app.sdk.logging": {"logger": SimpleNamespace(
             info=lambda message, *_args: logs.append(("info", str(message))),
             warning=lambda message, *_args: logs.append(("warning", str(message))),
+            error=lambda message, *_args: logs.append(("error", str(message))),
             exception=lambda message, *_args: logs.append(("exception", str(message))),
         )},
         "app.sdk.scheduler": {"add_plugin_once_job": add_job, "remove_plugin_once_job": remove_job},
@@ -424,6 +426,7 @@ def plugin_host(monkeypatch, tmp_path):
     # 搜索适配器继承当前夹具的宿主替身，不能跨场景复用上一个宿主的基类。
     monkeypatch.delitem(sys.modules, f"{name}.search", raising=False)
     monkeypatch.delitem(sys.modules, f"{name}.cache", raising=False)
+    monkeypatch.delitem(sys.modules, f"{name}.paused", raising=False)
     spec = importlib.util.spec_from_file_location(
         name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)],
     )
@@ -5090,3 +5093,194 @@ def test_disk_write_failure_keeps_new_memory_result_without_restoring_old_disk_r
     plugin._remember_search(host.subscriptions[2], [newest], [], "新搜索", "新时间")
     assert next(iter(plugin._preview_search_cache.values()))["contexts"] == [newest]
     assert list(plugin.get_data_path().joinpath("search-cache").iterdir()) == []
+
+
+def _paused_download_host(monkeypatch, plugin_host):
+    """
+    为模块扩展点装配隔离的种子规则、qB 实例和订阅下载上下文。
+    """
+    torrent_hash = "a" * 40
+    domain_package = ModuleType("app.domain")
+    domain_package.__path__ = []
+    torrent_rules = ModuleType("app.domain.torrent")
+    torrent_rules.is_magnet_link = lambda content: content.startswith("magnet:") if isinstance(content, str) else False
+    torrent_rules.download_hashes = lambda _content: frozenset({torrent_hash})
+    torrent_rules.select_torrent_files = Mock(return_value=([1], [0], {2}))
+    domain_package.torrent = torrent_rules
+    monkeypatch.setitem(sys.modules, "app.domain", domain_package)
+    monkeypatch.setitem(sys.modules, "app.domain.torrent", torrent_rules)
+    config = ModuleType("app.sdk.config")
+    config.settings = SimpleNamespace(RMT_MEDIAEXT=[".mkv"], TORRENT_TAG="MoviePilot")
+    monkeypatch.setitem(sys.modules, "app.sdk.config", config)
+    download_schema = ModuleType("app.schemas.download")
+    download_schema.DOWNLOAD_TASK_ALREADY_EXISTS = "下载任务已存在"
+    monkeypatch.setitem(sys.modules, "app.schemas.download", download_schema)
+    monkeypatch.setattr(
+        plugin_host.module.TorrentHelper, "get_fileinfo_from_torrent_content",
+        lambda _self, _content: ("", ["Show.S01E01.mkv", "Show.S01E02.mkv"]), raising=False,
+    )
+
+    server = Mock()
+    server.get_torrents.return_value = ([], False)
+    server.add_torrent.return_value = (True, [torrent_hash])
+    server.stop_torrents.return_value = True
+    server.get_content_layout.return_value = "Original"
+    qb_module = SimpleNamespace(
+        get_instance=Mock(return_value=server),
+        normalize_path=Mock(side_effect=lambda path, _downloader: path.as_posix()),
+        get_default_config_name=Mock(return_value="qb"),
+    )
+    plugin_host.subscriptions[1] = _subscribe(1)
+    plugin = plugin_host.module.SubscribeOverwatcher()
+    plugin.chain = SimpleNamespace(modulemanager=SimpleNamespace(
+        get_running_module=Mock(return_value=qb_module),
+    ))
+    plugin.init_plugin({"enabled": True})
+    context = _context("Show.S01", episodes=(1, 2))
+    context.media_info = SimpleNamespace(type=plugin_host.module.MediaType.TV, category="TV")
+    context.torrent_info.site_downloader = "qb"
+    return plugin, context, server, torrent_rules, qb_module, torrent_hash
+
+
+def _mark_paused_subscription(plugin, context, episodes):
+    """给同一调用上下文标记获准提交的订阅目标集数。"""
+    event = _download_event(1, context=context, episodes=episodes)
+    event.event_data.downloader = None
+    plugin.mark_partial_subscription(event)
+    return event
+
+
+def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_host, monkeypatch):
+    """
+    只用既有模块扩展点添加暂停任务；普通下载与全选种子走宿主原流程。
+    """
+    plugin, context, server, rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    callback = plugin.get_module()["download"]
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = callback(
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[1] == torrent_hash
+    assert "保持暂停" in result[3]
+    assert server.add_torrent.call_args.kwargs["is_paused"] is True
+    assert server.add_torrent.call_args.kwargs["download_dir"] == "/downloads"
+    assert "MoviePilot" in server.add_torrent.call_args.kwargs["tag"]
+    server.stop_torrents.assert_called_once_with(torrent_hash)
+    server.start_torrents.assert_not_called()
+    server.set_files.assert_not_called()
+    assert callback(
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    ) is None
+    assert server.add_torrent.call_count == 1
+
+    rules.select_torrent_files.return_value = ([0, 1], [], {1, 2})
+    _mark_paused_subscription(plugin, context, {1, 2})
+    assert callback(
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={1, 2}, category="TV", downloader="qb",
+    ) is None
+    assert server.add_torrent.call_count == 1
+
+    manual = _mark_paused_subscription(plugin, context, {2})
+    manual.event_data.origin = "Manual"
+    plugin.mark_partial_subscription(manual)
+    assert callback(
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    ) is None
+    assert server.add_torrent.call_count == 1
+
+    cancelled = _mark_paused_subscription(plugin, context, {2})
+    cancelled.event_data.cancel = True
+    plugin.mark_partial_subscription(cancelled)
+    assert callback(
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    ) is None
+    assert server.add_torrent.call_count == 1
+
+
+def test_plugin_module_keeps_existing_qb_task_untouched(plugin_host, monkeypatch):
+    """同 Hash 已有任务只返回复用标志，不暂停、改优先级或重新添加。"""
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    server.get_torrents.return_value = ([{"hash": torrent_hash}], False)
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[1] == torrent_hash
+    assert result[3] == "下载任务已存在"
+    server.add_torrent.assert_not_called()
+    server.stop_torrents.assert_not_called()
+    server.set_files.assert_not_called()
+
+
+def test_plugin_module_keeps_magnet_paused_without_metadata_start(plugin_host, monkeypatch):
+    """缺少文件清单的磁力订阅直接以暂停状态添加，不启动获取元数据。"""
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = plugin.get_module()["download"](
+        f"magnet:?xt=urn:btih:{torrent_hash}", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[1] == torrent_hash
+    assert server.add_torrent.call_args.kwargs["is_paused"] is True
+    server.start_torrents.assert_not_called()
+    server.set_files.assert_not_called()
+
+
+def test_plugin_module_failure_cannot_fall_through_to_auto_start(plugin_host, monkeypatch):
+    """暂停添加失败返回非空错误元组，阻止宿主 qB 模块接着自动启动。"""
+    plugin, context, server, _rules, _module, _torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    server.add_torrent.return_value = (False, [])
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[:3] == (None, None, None)
+    assert result[3]
+    server.start_torrents.assert_not_called()
+    server.set_files.assert_not_called()
+
+    monkeypatch.setattr(
+        plugin_host.module.TorrentHelper, "get_fileinfo_from_torrent_content",
+        lambda _self, _content: ("", []),
+    )
+    _mark_paused_subscription(plugin, context, {2})
+    unrecognized = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert unrecognized[:3] == (None, None, None)
+    assert unrecognized[3]
+    assert server.add_torrent.call_count == 1
+
+
+def test_plugin_module_resolves_legacy_qb_add_without_returned_hash(plugin_host, monkeypatch):
+    """旧版 qB 添加响应没有任务 ID 时，按临时标签找回暂停任务。"""
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, plugin_host)
+    server.add_torrent.return_value = (True, [])
+    server.get_torrent_id_by_tag.return_value = torrent_hash
+    _mark_paused_subscription(plugin, context, {2})
+
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+
+    assert result[1] == torrent_hash
+    assert server.get_torrent_id_by_tag.call_args.kwargs["tags"].startswith("sow-")
+    server.stop_torrents.assert_called_once_with(torrent_hash)
+    server.start_torrents.assert_not_called()

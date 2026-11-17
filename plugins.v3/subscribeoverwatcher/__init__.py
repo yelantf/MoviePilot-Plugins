@@ -9,7 +9,9 @@ import json
 import threading
 import time
 from collections import Counter
+from contextvars import ContextVar
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from app.application.torrent.download import TorrentHelper
@@ -30,6 +32,7 @@ from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
 
 from .directory import directory_choices, preview_download_path, selected_directory_root
 from .cache import MAX_CACHE_ENTRIES, SearchCacheStore
+from .paused import add_paused_qb_download, needs_manual_selection
 from .preview import (
     SUBSCRIPTION_RULE_OPTIONS, candidate_default_rules, display_draft_rules, editor_draft_rules,
     normalize_draft_rules, parse_episode_selection, preview_resource,
@@ -563,9 +566,9 @@ class SubscribeOverwatcher(_PluginBase):
     """
 
     plugin_name = "剧集守门员"
-    plugin_desc = "剧集订阅可预览规则、一次性整包下载；订阅进度满后自动保留规则恢复。"
+    plugin_desc = "剧集订阅可预览规则、一次性整包下载；qB 部分合集暂停供手动选集。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.30"
+    plugin_version = "1.9.31"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -589,6 +592,10 @@ class SubscribeOverwatcher(_PluginBase):
         self._search_cache_store: Optional[SearchCacheStore] = None
         self._search_cache_loaded = False
         self._enabled = False
+        # 下载前事件与插件模块运行于同一调用上下文；标记只允许消费一次。
+        self._partial_guard: ContextVar[Optional[dict[str, Any]]] = ContextVar(
+            f"subscribeoverwatcher_partial_guard_{id(self)}", default=None,
+        )
         self._confirm_full_pack = True
         self._daily_notice = True
         self._notice_hour = 9
@@ -1055,6 +1062,75 @@ class SubscribeOverwatcher(_PluginBase):
                     data.reason = previous_reason
         except Exception:
             logger.exception(f"查询订阅 {sid} 的确认状态失败，保持下载拦截")
+
+    @eventmanager.register(ChainEventType.ResourceDownload, priority=1100)
+    def mark_partial_subscription(self, event: Optional[Event] = None) -> None:
+        """
+        仅为确认闸门放行的电视剧订阅标记本次下载模块调用。
+
+        每个资源事件先清除旧标记，避免种子准备失败后误作用于下一条资源。
+
+        :param event: 带订阅来源及目标集数的下载前事件
+        """
+        self._partial_guard.set(None)
+        if not self._enabled or event is None or event.event_data is None:
+            return
+        data = event.event_data
+        if data.cancel or _subscription_id(getattr(data, "origin", None)) is None or not data.episodes:
+            return
+        context = getattr(data, "context", None)
+        media = getattr(context, "media_info", None)
+        torrent = getattr(context, "torrent_info", None)
+        if media is None or torrent is None or getattr(media, "type", None) not in (MediaType.TV, MediaType.TV.value):
+            return
+        self._partial_guard.set({
+            "episodes": frozenset(data.episodes),
+            "downloader": data.downloader or torrent.site_downloader,
+            "category": media.category,
+            "cookie": torrent.site_cookie,
+            "claimed": False,
+        })
+
+    def _guarded_download(
+        self, content: Any, download_dir: Path, cookie: str,
+        episodes: Optional[set[int]] = None, category: Optional[str] = None,
+        label: Optional[str] = None, downloader: Optional[str] = None,
+        custom_words: Optional[str] = None, episode_selection: Any = None,
+    ) -> Optional[tuple[Optional[str], Optional[str], Optional[str], str]]:
+        """
+        在宿主 qB 模块前接管本次订阅的部分合集，其他任务返回空结果继续原流程。
+
+        :return: 暂停添加结果、明确的失败结果，或由宿主处理的 None
+        """
+        marker = self._partial_guard.get()
+        if not self._enabled or marker is None:
+            return None
+        with self._lock:
+            if marker["claimed"]:
+                return None
+            marker["claimed"] = True
+        if (
+            not episodes or frozenset(episodes) != marker["episodes"]
+            or downloader != marker["downloader"]
+            or category != marker["category"]
+            or cookie != marker["cookie"]
+        ):
+            return None
+        try:
+            module = self.chain.modulemanager.get_running_module("QbittorrentModule")
+            if module is None:
+                return None
+            server = module.get_instance(downloader)
+            if server is None:
+                return None
+            if not needs_manual_selection(content, set(episodes), custom_words, episode_selection):
+                return None
+            return add_paused_qb_download(
+                module, server, content, download_dir, cookie, category, label, downloader,
+            )
+        except Exception as error:
+            logger.error(f"剧集守门员处理部分合集失败：{type(error).__name__}；本次未自动启动")
+            return None, None, None, "剧集守门员无法确认部分合集的暂停状态，本次未自动启动"
 
     def _schedule_scan(self, subscription_ids: Optional[list[int]] = None) -> None:
         """
@@ -2846,6 +2922,14 @@ class SubscribeOverwatcher(_PluginBase):
         返回插件是否正在接管新剧集订阅。
         """
         return self._enabled
+
+    def get_module(self) -> Optional[dict[str, Any]]:
+        """
+        通过宿主现有模块扩展点，在 qB 自动选集前处理订阅部分合集。
+
+        :return: 插件启用时提供的下载方法；停用时不注册
+        """
+        return {"download": self._guarded_download} if self._enabled else None
 
     @staticmethod
     def get_render_mode() -> tuple[str, str]:
