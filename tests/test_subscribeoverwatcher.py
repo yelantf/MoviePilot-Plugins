@@ -10,9 +10,11 @@ import importlib.util
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -390,6 +392,7 @@ def plugin_host(monkeypatch, tmp_path):
         "app.db.oper.subscribe": {"SubscribeOper": SubscribeOper},
         "app.db.oper.systemconfig": {"SystemConfigOper": SystemConfigOper},
         "app.plugins": {"_PluginBase": PluginBase},
+        "app.sdk.config": {"settings": SimpleNamespace(TZ="Asia/Shanghai")},
         "app.schemas.media": {"build_media_key": build_media_key,
                               "resolve_media_identity": resolve_media_identity},
         "app.schemas.mediaserver": {"NotExistMediaInfo": NotExistMediaInfo},
@@ -400,7 +403,7 @@ def plugin_host(monkeypatch, tmp_path):
                                          TransferComplete="transfer.complete"),
             "MediaSource": lambda value: value,
             "MediaType": SimpleNamespace(TV=SimpleNamespace(value="电视剧")),
-            "MessageType": SimpleNamespace(Plugin="plugin"),
+            "MessageType": SimpleNamespace(Plugin="plugin", Subscribe="subscribe"),
             "SystemConfigKey": SimpleNamespace(
                 IndexerSites="IndexerSites",
                 UserFilterRuleGroups="UserFilterRuleGroups", CustomFilterRules="CustomFilterRules",
@@ -1383,6 +1386,7 @@ def test_daily_notice_reports_zero_and_respects_switch(plugin_host):
         "candidate_refresh", "subscription_progress_check",
     }
     plugin.notify_pending_subscriptions()
+    plugin.notify_paused_partial_daily()
     assert len(plugin_host.messages) == 1
 
 
@@ -5110,7 +5114,7 @@ def _paused_download_host(monkeypatch, plugin_host):
     monkeypatch.setitem(sys.modules, "app.domain", domain_package)
     monkeypatch.setitem(sys.modules, "app.domain.torrent", torrent_rules)
     config = ModuleType("app.sdk.config")
-    config.settings = SimpleNamespace(RMT_MEDIAEXT=[".mkv"], TORRENT_TAG="MoviePilot")
+    config.settings = SimpleNamespace(RMT_MEDIAEXT=[".mkv"], TORRENT_TAG="MoviePilot", TZ="Asia/Shanghai")
     monkeypatch.setitem(sys.modules, "app.sdk.config", config)
     download_schema = ModuleType("app.schemas.download")
     download_schema.DOWNLOAD_TASK_ALREADY_EXISTS = "下载任务已存在"
@@ -5183,11 +5187,25 @@ def test_plugin_module_adds_partial_qb_pack_paused_without_host_option(plugin_ho
     server.start_torrents.assert_not_called()
     server.set_files.assert_not_called()
     server.qbc.torrents_file_priority.assert_not_called()
+    assert plugin_host.messages == [{
+        "mtype": "subscribe",
+        "title": "剧集守门员：部分合集已暂停",
+        "text": (
+            "订阅：#1 样例剧 S01\n资源：Show.S01\n站点：样例站\n"
+            "下载器：qb\n目标集数：E02\n任务 Hash：" + torrent_hash + "\n"
+            "种子已添加并保持暂停，默认选中全部文件。请在 qB 核对保存路径和文件后启动。"
+        ),
+    }]
+    daily = plugin_host.storage["gate_state"]["partial_pause_daily"]
+    assert daily["count"] == 1 and daily["items"][0]["hash"] == torrent_hash
+    assert "cookie-secret" not in json.dumps(daily)
+    assert "secret.example" not in json.dumps(daily)
     assert callback(
         b"torrent-content", Path("/downloads"), "cookie-secret",
         episodes={2}, category="TV", downloader="qb",
     ) is None
     assert server.qbc.torrents_add.call_count == 1
+    assert len(plugin_host.messages) == 1
 
     rules.select_torrent_files.return_value = ([0, 1], [], {1, 2})
     _mark_paused_subscription(plugin, context, {1, 2})
@@ -5232,6 +5250,140 @@ def test_plugin_module_keeps_existing_qb_task_untouched(plugin_host, monkeypatch
     server.qbc.torrents_add.assert_not_called()
     server.stop_torrents.assert_not_called()
     server.set_files.assert_not_called()
+    assert plugin_host.messages == []
+
+
+def test_partial_pause_digest_uses_plugin_type_and_survives_restart(plugin_host, monkeypatch):
+    """当日成功暂停记录跨重启保留，日报同日只发一次且次日零条也发送。"""
+    host = plugin_host
+    local_time = [datetime(2026, 11, 17, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))]
+    monkeypatch.setattr(host.module, "_local_now", lambda: local_time[0])
+    plugin, context, _server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, host)
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[1] == torrent_hash
+    assert host.messages[0]["mtype"] == "subscribe"
+
+    restarted = host.module.SubscribeOverwatcher()
+    restarted.init_plugin({"enabled": True})
+    service = {item["id"]: item for item in restarted.get_service()}["partial_pause_daily_notice"]
+    assert service["trigger"] == "cron"
+    assert service["kwargs"] == {"hour": 23, "minute": 59}
+    service["func"]()
+    assert host.messages[1]["mtype"] == "plugin"
+    assert host.messages[1]["title"] == "剧集守门员：部分合集暂停日报"
+    assert "2026-11-17 截至本次通知，今日暂停添加 1 个" in host.messages[1]["text"]
+    assert f"#1 样例剧 S01 · 样例站 · Show.S01 · qb · E02 · Hash {torrent_hash[:12]}" in host.messages[1]["text"]
+    service["func"]()
+    assert len(host.messages) == 2
+
+    again = host.module.SubscribeOverwatcher()
+    again.init_plugin({"enabled": True})
+    again.notify_paused_partial_daily()
+    assert len(host.messages) == 2
+    local_time[0] = datetime(2026, 11, 18, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    again.notify_paused_partial_daily()
+    assert host.messages[2]["mtype"] == "plugin"
+    assert "今日暂停添加 0 个" in host.messages[2]["text"]
+    assert "今日暂无新暂停添加" in host.messages[2]["text"]
+
+
+def test_partial_pause_immediate_notice_ignores_daily_switch(plugin_host, monkeypatch):
+    """关闭两份日报不影响新任务成功暂停后的订阅通知。"""
+    host = plugin_host
+    plugin, context, _server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, host)
+    plugin.init_plugin({"enabled": True, "daily_notice": False})
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[1] == torrent_hash
+    assert [message["mtype"] for message in host.messages] == ["subscribe"]
+    assert "partial_pause_daily_notice" not in {item["id"] for item in plugin.get_service()}
+    plugin.notify_paused_partial_daily()
+    assert len(host.messages) == 1
+
+
+def test_partial_pause_notice_failure_keeps_added_torrent_success(plugin_host, monkeypatch):
+    """通知渠道异常不改变已添加并暂停的种子的下载结果。"""
+    host = plugin_host
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, host)
+    monkeypatch.setattr(plugin, "post_message", Mock(side_effect=RuntimeError("notify down")))
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[1] == torrent_hash and "保持暂停" in result[3]
+    assert host.storage["gate_state"]["partial_pause_daily"]["count"] == 1
+    assert host.messages == []
+    server.start_torrents.assert_not_called()
+
+
+def test_partial_pause_state_failure_keeps_added_torrent_success(plugin_host, monkeypatch):
+    """日报记录持久化失败时仍发即时通知并保留暂停添加成功结果。"""
+    host = plugin_host
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, host)
+    monkeypatch.setattr(plugin, "save_data", Mock(side_effect=RuntimeError("storage down")))
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[1] == torrent_hash and "保持暂停" in result[3]
+    assert [message["mtype"] for message in host.messages] == ["subscribe"]
+    server.start_torrents.assert_not_called()
+
+
+def test_partial_pause_digest_retries_after_notice_failure(plugin_host, monkeypatch):
+    """日报发送失败不写入当日已发送标记，可再次调用补发。"""
+    host = plugin_host
+    local_time = datetime(2026, 11, 17, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    monkeypatch.setattr(host.module, "_local_now", lambda: local_time)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+    original_post = plugin.post_message
+    monkeypatch.setattr(plugin, "post_message", Mock(side_effect=RuntimeError("notify down")))
+    plugin.notify_paused_partial_daily()
+    assert host.messages == []
+    assert host.storage["gate_state"].get("partial_pause_last_sent") is None
+    monkeypatch.setattr(plugin, "post_message", original_post)
+    plugin.notify_paused_partial_daily()
+    assert len(host.messages) == 1 and host.messages[0]["mtype"] == "plugin"
+
+
+def test_partial_pause_unconfirmed_stop_has_no_notice(plugin_host, monkeypatch):
+    """qB 暂停未确认时不把种子记入成功暂停通知和日报。"""
+    host = plugin_host
+    plugin, context, server, _rules, _module, _torrent_hash = _paused_download_host(monkeypatch, host)
+    server.stop_torrents.return_value = False
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[:3] == (None, None, None)
+    assert host.messages == []
+    assert "partial_pause_daily" not in host.storage["gate_state"]
+
+
+def test_partial_pause_tag_cleanup_failure_does_not_hide_success(plugin_host, monkeypatch):
+    """临时标签清理异常不会让已暂停的种子失去成功结果和通知。"""
+    host = plugin_host
+    plugin, context, server, _rules, _module, torrent_hash = _paused_download_host(monkeypatch, host)
+    server.delete_torrents_tag.side_effect = RuntimeError("tag cleanup down")
+    _mark_paused_subscription(plugin, context, {2})
+    result = plugin.get_module()["download"](
+        b"torrent-content", Path("/downloads"), "cookie-secret",
+        episodes={2}, category="TV", downloader="qb",
+    )
+    assert result[1] == torrent_hash and "保持暂停" in result[3]
+    assert [message["mtype"] for message in host.messages] == ["subscribe"]
+    assert any("清理 qB 临时标签失败" in message for _level, message in host.logs)
 
 
 def test_plugin_module_rejects_qb_without_per_torrent_download_path(plugin_host, monkeypatch):

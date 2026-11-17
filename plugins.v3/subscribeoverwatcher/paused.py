@@ -9,6 +9,7 @@ from typing import Any, Optional, Union
 from packaging.version import InvalidVersion, Version
 
 from app.application.torrent.download import TorrentHelper
+from app.sdk.logging import logger
 
 PARTIAL_PACK_TAG = "剧集守门员-部分合集"
 
@@ -74,7 +75,7 @@ def _existing_hash(server: Any, expected_hashes: frozenset[str]) -> Optional[str
 def add_paused_qb_download(
     module: Any, server: Any, content: Union[str, bytes], download_dir: Path,
     cookie: str, category: Optional[str], label: Optional[str], downloader: Optional[str],
-) -> tuple[Optional[str], Optional[str], Optional[str], str]:
+) -> tuple[tuple[Optional[str], Optional[str], Optional[str], str], bool]:
     """
     通过宿主已配置的 qB 客户端添加暂停任务，固定保存路径并保留分类。
 
@@ -86,7 +87,7 @@ def add_paused_qb_download(
     :param category: 下载器分类
     :param label: 下载任务标签
     :param downloader: 下载器实例名称
-    :return: 与宿主下载模块相同的结果元组
+    :return: 宿主下载结果及是否新添加并确认暂停
     :raises RuntimeError: 无法确认种子身份或查询已有任务
     """
     from app.domain import torrent as torrent_rules
@@ -99,17 +100,17 @@ def add_paused_qb_download(
     actual_downloader = downloader or module.get_default_config_name()
     existing = _existing_hash(server, expected_hashes)
     if existing:
-        return actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS
+        return (actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS), False
 
     client = server.qbc
     if client is None:
-        return None, None, None, "qB 客户端未连接，本次未添加部分合集"
+        return (None, None, None, "qB 客户端未连接，本次未添加部分合集"), False
     try:
         web_api_version = Version(str(client.app_web_api_version()))
     except (InvalidVersion, TypeError, ValueError):
-        return None, None, None, "无法确认 qB Web API 版本，本次未添加部分合集"
+        return (None, None, None, "无法确认 qB Web API 版本，本次未添加部分合集"), False
     if web_api_version < Version("2.8.4"):
-        return None, None, None, "qB Web API 版本低于 2.8.4，无法为该种子单独关闭临时下载路径"
+        return (None, None, None, "qB Web API 版本低于 2.8.4，无法为该种子单独关闭临时下载路径"), False
 
     temporary_tag = f"sow-{secrets.token_hex(6)}"
     tags = [tag.strip() for tag in (label or "").split(",") if tag.strip()]
@@ -139,7 +140,7 @@ def add_paused_qb_download(
         except Exception:
             existing = _existing_hash(server, expected_hashes)
             if existing:
-                return actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS
+                return (actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS), False
             raise
         details = response if callable(getattr(response, "get", None)) else {}
         identifiers = details.get("added_torrent_ids") or []
@@ -150,16 +151,19 @@ def add_paused_qb_download(
         if not added:
             existing = _existing_hash(server, expected_hashes)
             if existing:
-                return actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS
-            return None, None, None, "qB 未接受暂停种子任务"
+                return (actual_downloader, existing, server.get_content_layout(), DOWNLOAD_TASK_ALREADY_EXISTS), False
+            return (None, None, None, "qB 未接受暂停种子任务"), False
         torrent_hash = next(iter(identifiers or []), None) or server.get_torrent_id_by_tag(tags=temporary_tag)
         if not torrent_hash:
-            return None, None, None, "qB 已接受种子但任务 Hash 未确认，请手动检查暂停状态"
+            return (None, None, None, "qB 已接受种子但任务 Hash 未确认，请手动检查暂停状态"), False
         if not server.stop_torrents(torrent_hash):
-            return None, None, None, f"qB 任务 {torrent_hash} 暂停请求未确认，请手动检查"
+            return (None, None, None, f"qB 任务 {torrent_hash} 暂停请求未确认，请手动检查"), False
         return (
             actual_downloader, torrent_hash, server.get_content_layout(),
             f"添加下载成功，任务 {torrent_hash} 保持暂停且默认全选，请在 qB 核对文件后启动",
-        )
+        ), True
     finally:
-        server.delete_torrents_tag(torrent_hash, temporary_tag)
+        try:
+            server.delete_torrents_tag(torrent_hash, temporary_tag)
+        except Exception:
+            logger.warning("剧集守门员清理 qB 临时标签失败，请在下载器中检查")

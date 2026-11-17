@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from app.application.torrent.download import TorrentHelper
 from app.application.site.sites import SitesHelper
@@ -52,6 +53,31 @@ def _utc_now() -> str:
     返回适合排序和展示的 UTC 时间。
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _local_now() -> datetime:
+    """
+    按 MoviePilot 配置的时区计算通知所属日期。
+    """
+    from app.sdk.config import settings
+
+    return datetime.now(ZoneInfo(settings.TZ))
+
+
+def _notice_value(value: Any, fallback: str, limit: int) -> str:
+    """
+    压平资源文字并限制通知及持久记录的长度。
+    """
+    normalized = " ".join(str(value or "").split())
+    return normalized[:limit - 1] + "…" if len(normalized) > limit else normalized or fallback
+
+
+def _notice_episodes(episodes: list[int], count: int) -> str:
+    """
+    显示目标集数，长列表只展示前十二集。
+    """
+    label = "、".join(f"E{number:02d}" for number in episodes[:12]) or "未知"
+    return f"{label} 等 {count} 集" if count > 12 else label
 
 
 def _search_diagnostics_snapshot(diagnostics: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -568,7 +594,7 @@ class SubscribeOverwatcher(_PluginBase):
     plugin_name = "剧集守门员"
     plugin_desc = "剧集订阅可预览规则、一次性整包下载；qB 部分合集默认全选并暂停标记。"
     plugin_icon = "icon.svg"
-    plugin_version = "1.9.33"
+    plugin_version = "1.9.34"
     plugin_author = "yelantf"
     plugin_label = "订阅管理"
     plugin_config_prefix = "subscribeoverwatcher_"
@@ -600,6 +626,7 @@ class SubscribeOverwatcher(_PluginBase):
         self._daily_notice = True
         self._notice_hour = 9
         self._notice_minute = 0
+        self._partial_daily_inflight: Optional[str] = None
         self._state: dict[str, Any] = {"baseline": None, "entries": {}}
         self._subscribes = SubscribeOper()
 
@@ -1076,7 +1103,8 @@ class SubscribeOverwatcher(_PluginBase):
         if not self._enabled or event is None or event.event_data is None:
             return
         data = event.event_data
-        if data.cancel or _subscription_id(getattr(data, "origin", None)) is None or not data.episodes:
+        sid = _subscription_id(getattr(data, "origin", None))
+        if data.cancel or sid is None or not data.episodes:
             return
         context = getattr(data, "context", None)
         media = getattr(context, "media_info", None)
@@ -1084,10 +1112,15 @@ class SubscribeOverwatcher(_PluginBase):
         if media is None or torrent is None or getattr(media, "type", None) not in (MediaType.TV, MediaType.TV.value):
             return
         self._partial_guard.set({
+            "subscription_id": sid,
             "episodes": frozenset(data.episodes),
             "downloader": data.downloader or torrent.site_downloader,
             "category": media.category,
             "cookie": torrent.site_cookie,
+            "media_title": getattr(media, "title", None),
+            "season": getattr(getattr(context, "meta_info", None), "begin_season", None),
+            "torrent_title": getattr(torrent, "title", None),
+            "site_name": getattr(torrent, "site_name", None),
             "claimed": False,
         })
 
@@ -1125,12 +1158,72 @@ class SubscribeOverwatcher(_PluginBase):
                 return None
             if not needs_manual_selection(content, set(episodes), custom_words, episode_selection):
                 return None
-            return add_paused_qb_download(
+            result, added = add_paused_qb_download(
                 module, server, content, download_dir, cookie, category, label, downloader,
             )
         except Exception as error:
             logger.error(f"剧集守门员处理部分合集失败：{type(error).__name__}；本次未自动启动")
             return None, None, None, "剧集守门员无法确认部分合集的暂停状态，本次未自动启动"
+        if added:
+            try:
+                self._record_paused_partial(marker, result[0], result[1])
+            except Exception:
+                logger.exception("剧集守门员记录或通知暂停合集失败；已添加的任务仍保持暂停")
+        return result
+
+    def _record_paused_partial(self, marker: dict[str, Any], downloader: str, torrent_hash: str) -> None:
+        """
+        记录本地日暂停添加事件，并通过订阅消息提醒人工核对。
+        """
+        sid = marker["subscription_id"]
+        try:
+            subscribe = self._subscribes.get(sid)
+        except Exception:
+            logger.exception(f"剧集守门员读取订阅 {sid} 失败，使用下载事件中的标题通知")
+            subscribe = None
+        now = _local_now()
+        episodes = sorted(marker["episodes"])
+        season = getattr(subscribe, "season", None) or marker["season"] or 1
+        item = {
+            "subscription_id": sid,
+            "name": _notice_value(getattr(subscribe, "name", None) or marker["media_title"], "未知剧集", 80),
+            "season": int(season),
+            "title": _notice_value(marker["torrent_title"], "未知资源", 100),
+            "site": _notice_value(marker["site_name"], "未知站点", 40),
+            "downloader": _notice_value(downloader, "qB", 40),
+            "hash": _notice_value(torrent_hash, "未知", 64),
+            "episodes": episodes[:32],
+            "episode_count": len(episodes),
+        }
+        day = now.date().isoformat()
+        with self._lock:
+            daily = self._state.get("partial_pause_daily")
+            if not isinstance(daily, dict) or daily.get("date") != day:
+                daily = {"date": day, "count": 0, "items": []}
+            count = daily.get("count")
+            daily["count"] = (count if isinstance(count, int) and count >= 0 else 0) + 1
+            items = daily.get("items")
+            daily["items"] = ([*items, item] if isinstance(items, list) else [item])[-20:]
+            self._state["partial_pause_daily"] = daily
+            try:
+                self._save_state()
+            except Exception:
+                logger.exception("剧集守门员无法持久保存今日暂停合集记录")
+        try:
+            self.post_message(
+                mtype=MessageType.Subscribe,
+                title="剧集守门员：部分合集已暂停",
+                text=(
+                    f"订阅：#{sid} {item['name']} S{item['season']:02d}\n"
+                    f"资源：{item['title']}\n站点：{item['site']}\n"
+                    f"下载器：{item['downloader']}\n"
+                    f"目标集数：{_notice_episodes(item['episodes'], item['episode_count'])}\n"
+                    f"任务 Hash：{item['hash']}\n"
+                    "种子已添加并保持暂停，默认选中全部文件。请在 qB 核对保存路径和文件后启动。"
+                ),
+            )
+        except Exception:
+            logger.exception("剧集守门员发送部分合集订阅通知失败")
 
     def _schedule_scan(self, subscription_ids: Optional[list[int]] = None) -> None:
         """
@@ -3234,11 +3327,11 @@ class SubscribeOverwatcher(_PluginBase):
             row(
                 col(switch("enabled", "接管新增剧集订阅"), sm=6),
                 col(switch("confirm_full_pack", "全集种子也需确认"), sm=6),
-                col(switch("daily_notice", "每天推送待确认订阅汇总"), sm=6),
-                col(select("notice_hour", "通知小时", [
+                col(switch("daily_notice", "每天推送待确认与部分合集暂停汇总"), sm=6),
+                col(select("notice_hour", "待确认日报小时", [
                     {"title": f"{hour:02d}", "value": hour} for hour in range(24)
                 ]), cols=6, sm=3),
-                col(select("notice_minute", "通知分钟", [
+                col(select("notice_minute", "待确认日报分钟", [
                     {"title": f"{minute:02d}", "value": minute} for minute in range(60)
                 ]), cols=6, sm=3),
             ),
@@ -3523,8 +3616,69 @@ class SubscribeOverwatcher(_PluginBase):
             text=text,
         )
 
+    def notify_paused_partial_daily(self) -> None:
+        """
+        每天汇总本地日新添加的暂停合集；同日重复触发只发送一次。
+        """
+        if not self._enabled or not self._daily_notice:
+            return
+        day = _local_now().date().isoformat()
+        with self._lock:
+            if self._state.get("partial_pause_last_sent") == day or self._partial_daily_inflight == day:
+                return
+            daily = self._state.get("partial_pause_daily")
+            if not isinstance(daily, dict) or daily.get("date") != day:
+                daily = {}
+            count = daily.get("count")
+            count = count if isinstance(count, int) and count >= 0 else 0
+            saved_items = daily.get("items")
+            items = copy.deepcopy(saved_items[-10:]) if isinstance(saved_items, list) else []
+            self._partial_daily_inflight = day
+        lines = []
+        for index, item in enumerate(items, start=max(1, count - len(items) + 1)):
+            try:
+                lines.append(
+                    f"{index}. #{item['subscription_id']} {_notice_value(item['name'], '未知剧集', 60)}"
+                    f" S{item['season']:02d} · {_notice_value(item['site'], '未知站点', 30)}"
+                    f" · {_notice_value(item['title'], '未知资源', 80)}"
+                    f" · {_notice_value(item['downloader'], 'qB', 30)}"
+                    f" · {_notice_episodes(item['episodes'], item['episode_count'])}"
+                    f" · Hash {str(item['hash'])[:12]}"
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        text = f"{day} 截至本次通知，今日暂停添加 {count} 个部分合集种子。"
+        if lines:
+            if count > len(lines):
+                text += f"\n仅列出最近 {len(lines)} 个："
+            text += "\n" + "\n".join(lines)
+        elif count:
+            text += "\n明细记录不可用，请到 qB 查看任务。"
+        else:
+            text += "\n今日暂无新暂停添加的部分合集种子。"
+        text += "\n任务后续是否仍暂停，请以 qB 当前状态为准。"
+        try:
+            self.post_message(
+                mtype=MessageType.Plugin,
+                title="剧集守门员：部分合集暂停日报",
+                text=text,
+            )
+        except Exception:
+            logger.exception("剧集守门员发送部分合集暂停日报失败")
+            with self._lock:
+                self._partial_daily_inflight = None
+            return
+        with self._lock:
+            self._state["partial_pause_last_sent"] = day
+            try:
+                self._save_state()
+            except Exception:
+                logger.exception("剧集守门员无法持久保存部分合集日报发送日期")
+            finally:
+                self._partial_daily_inflight = None
+
     def get_service(self) -> list[dict[str, Any]]:
-        """注册订阅进度检查、候选扫描和每日待确认订阅通知。"""
+        """注册进度检查、候选扫描及两类每日通知。"""
         if not self._enabled:
             return []
         services = [{
@@ -3541,6 +3695,11 @@ class SubscribeOverwatcher(_PluginBase):
                 "id": "pending_daily_notice", "name": "推送待确认剧集日报",
                 "trigger": "cron", "func": self.notify_pending_subscriptions,
                 "kwargs": {"hour": self._notice_hour, "minute": self._notice_minute},
+            })
+            services.append({
+                "id": "partial_pause_daily_notice", "name": "推送部分合集暂停日报",
+                "trigger": "cron", "func": self.notify_paused_partial_daily,
+                "kwargs": {"hour": 23, "minute": 59},
             })
         return services
 
