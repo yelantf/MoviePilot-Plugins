@@ -501,8 +501,50 @@ def _download_event(sid, context=None, episodes=None):
     origin = "Subscribe|" + json.dumps({"id": sid})
     return SimpleNamespace(event_data=SimpleNamespace(
         origin=origin, context=context, episodes=episodes,
-        cancel=False, source="原处理器", reason="原原因",
+        cancel=False, source="原处理器", reason="原原因", options={},
     ))
+
+
+def test_released_subscription_marks_partial_pack_for_manual_qb_selection(plugin_host):
+    """
+    守门员放行的剧集订阅要求 qB 暂停部分合集；取消或非剧集请求不标记。
+    """
+    host = plugin_host
+    host.subscriptions[1] = _subscribe(1)
+    plugin = host.module.SubscribeOverwatcher()
+    plugin.init_plugin({"enabled": True})
+
+    historical = _download_event(1, episodes={2})
+    historical.event_data.options["save_path"] = "/downloads"
+    plugin.intercept_download(historical)
+    plugin.pause_partial_subscription(historical)
+    assert historical.event_data.cancel is False
+    assert historical.event_data.options == {"save_path": "/downloads", "pause_on_partial": True}
+
+    host.subscriptions[2] = _subscribe(2)
+    pending = _download_event(2, episodes={2})
+    plugin.intercept_download(pending)
+    plugin.pause_partial_subscription(pending)
+    assert pending.event_data.cancel is True
+    assert pending.event_data.options == {}
+
+    plugin.on_subscribe_added(SimpleNamespace(event_data={"subscribe_id": 2}))
+    success, _message = plugin.approve_subscription("2")
+    assert success is True
+    approved = _download_event(2, episodes={2})
+    plugin.intercept_download(approved)
+    plugin.pause_partial_subscription(approved)
+    assert approved.event_data.cancel is False
+    assert approved.event_data.options == {"pause_on_partial": True}
+
+    movie = _download_event(1, episodes={2})
+    movie.event_data.context = SimpleNamespace(media_info=SimpleNamespace(type="电影"))
+    plugin.pause_partial_subscription(movie)
+    assert movie.event_data.options == {}
+
+    empty = _download_event(1)
+    plugin.pause_partial_subscription(empty)
+    assert empty.event_data.options == {}
 
 
 def _form_field(plugin, model):
